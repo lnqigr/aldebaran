@@ -1,0 +1,3 @@
+tic_id,disposition,fpp_percent,refined_period_days,fitted_rp_earth,impact_param_b,secondary_snr_sigma,flux_contam_percent,neb_capable_neighbors,sectors_stitched
+167812449,SUSPECT / GRAZING OR CONTAMINATED,99.9,4.235624,20.46,0.861,23.16,0.54,0,"95,96,97,98"
+404797151,SUSPECT / GRAZING OR CONTAMINATED,99.9,3.563532,5.87,0.5,9.9,113.81,13,"95,96,97,98"

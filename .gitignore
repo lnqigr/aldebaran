@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+*.fits
+tess_results/scanned_tics.txt
+tess_results/known_catalog_cache.txt
+tess_results/*.log
