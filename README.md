@@ -1,4 +1,4 @@
-# Aldebaran: Two-Tier Photometric & Pixel-Level Exoplanet Vetting Pipeline for TESS (v8.0)
+# Aldebaran: End-to-End Photometric Discovery, Vetting & Archival Forensic Pipeline for TESS (v8.x)
 
 **Aldebaran** is an automated, high-throughput digital signal processing (DSP) and astrophysical falsification pipeline designed to detect low-SNR transiting exoplanets in archival and newly released sectors of the NASA TESS Extended Mission (2-minute SPOC cadence).
 
@@ -67,12 +67,32 @@ The pipeline is engineered to probe the detection grey zone ($6.0 \le \text{SDE}
 │     - Top-Right: Full stitched multi-sector light curve with epochs     │
 │     - Bottom-Left: Odd/Even phase overlays & full-orbit secondary scan  │
 │     - Bottom-Right: Gaia DR3 120" neighbor map with NEB critical radii  │
+└────────────────────────────────────┬────────────────────────────────────┘
+                                     │ scientific_dossier_summary.csv
+                                     ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│              TIER 3: CTOI Packager & Prioritizer (ctoi_packager.py)     │
+├─────────────────────────────────────────────────────────────────────────┤
+│  • Empirical Mass Forecasting (Chen & Kipping 2017; Wolfgang et al. 2016)│
+│  • Radial Velocity Semi-Amplitude K Calculation (ESPRESSO / MAROON-X)   │
+│  • Atmospheric Follow-Up Metrics (Kempton et al. 2018 TSM & ESM)        │
+│  • Automated NASA ExoFOP CTOI Pipe-Delimited Batch Upload CSV           │
+└────────────────────────────────────┬────────────────────────────────────┘
+                                     │
+                                     ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│     HISTORICAL ARCHIVAL FORENSICS: Antares Detective (antares.py)       │
+├─────────────────────────────────────────────────────────────────────────┤
+│  • Multi-Year Archival Drill across SPOC (2-min), QLP (200s), TGLC (1800s)│
+│  • High-Precision Coherent Ephemeris Locking Across 7+ Year Baselines   │
+│  • Cross-Pipeline Gaia-PSF Deblending Consistency (TGLC vs QLP vs SPOC) │
+│  • 6-Panel Diagnostic Dossier with Secular Mission-Year Stability       │
 └─────────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
 
-## Key Features in v8.0
+## Key Features in v8.x
 
 1. **Distributed PBS Job Array Sharding (`qsub -J 1-8`)**:
    Enables parallel execution across 8 independent compute nodes without inter-process file locks. Workers autonomously map `PBS_ARRAY_INDEX` to sequential TESS sectors (`[106, 105, 104, 103, 102, 101, 100, 99]`) and write to isolated subdirectories (`tess_results/sector_<sec>/`).
@@ -84,6 +104,10 @@ The pipeline is engineered to probe the detection grey zone ($6.0 \le \text{SDE}
    Gathers reports and scanned star registries from all array shards, deduplicates duplicate candidates by highest SDE, and hands off the unified catalog directly to Pleiades Tier-2.
 5. **Dynamic Transit Zoom & Error Bars (Pleiades v2.2)**:
    Diagnostic dossiers now automatically zoom into the transit depth window ($[1.0 - 3.5 \cdot \text{depth}, 1.0 + 2.0 \cdot \text{depth}]$) and render phase-binned $\pm 1\sigma$ error bars, providing clear visual discrimination of transit ingress, egress, and bottom flat-floor curvature.
+6. **Tier-3 CTOI Packaging & Atmospheric Ranking (`ctoi_packager.py`)**:
+   Automatically produces NASA ExoFOP CTOI pipe-delimited upload tables and ranks surviving candidates by RV semi-amplitude $K$ and JWST/HST Transmission/Emission Spectroscopy Metrics (TSM, ESM).
+7. **Antares Multi-Year Archival Drill (`antares.py`)**:
+   Targeted forensic detective for top candidates across all historical TESS sectors (2018–2026), stitching SPOC, QLP, and TGLC PSF-deblended light curves over 7+ year baselines with coherent ephemeris locking.
 
 ---
 
@@ -125,8 +149,14 @@ pip install -r requirements.txt
 # 2. Run Tier-1 screening
 python aldebaran.py
 
-# 3. Run Tier-2 deep vetting on detected candidates
+# 3. Run Tier-2 deep physical vetting on detected candidates
 python pleiades.py
+
+# 4. Run Tier-3 CTOI packaging, RV K calculation & atmospheric ranking
+python ctoi_packager.py
+
+# 5. Run Antares multi-year archival forensic drill on a specific candidate
+python antares.py --tic 46314221
 ```
 
 ### HPC End-to-End Automated Array Execution (MetaCentrum)
