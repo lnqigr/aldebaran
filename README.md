@@ -1,4 +1,4 @@
-# Aldebaran: Two-Tier Photometric & Pixel-Level Exoplanet Vetting Pipeline for TESS
+# Aldebaran: Two-Tier Photometric & Pixel-Level Exoplanet Vetting Pipeline for TESS (v8.0)
 
 **Aldebaran** is an automated, high-throughput digital signal processing (DSP) and astrophysical falsification pipeline designed to detect low-SNR transiting exoplanets in archival and newly released sectors of the NASA TESS Extended Mission (2-minute SPOC cadence).
 
@@ -8,49 +8,98 @@ The pipeline is engineered to probe the detection grey zone ($6.0 \le \text{SDE}
 
 ## Pipeline Architecture
 
-### Tier 1: High-Throughput Multi-Core Screening (`aldebaran.py` v7.7)
-1. **Catalog Cross-Matching**: Automatically queries Caltech/IPAC TAP servers and ExoFOP to exclude known NASA TOIs, Community TOIs (CTOIs), and confirmed exoplanets (`pscomppars`).
-2. **Quality & Downlink Gap Sanitization**: Enforces strict `QUALITY == 0` bitwise filtering and trims $\pm 0.10\text{ d}$ thermal/scattered-light ramps around spacecraft momentum dumps and Earth-downlink gaps ($\Delta t > 0.04\text{ d}$).
-3. **Piecewise Iterative Detrending**: Applies upper $3\sigma$ flare clipping and piecewise Savitzky-Golay high-pass filtering independently across continuous observation segments, masking candidate transit windows to prevent self-subtraction.
-4. **Kovács (2002) Whitened Signal Residue SDE**: Converts Astropy quadratic log-likelihood power ($0.5 \cdot \text{SNR}^2$) into linear Signal Residue ($SR = \sqrt{2 \cdot \text{Power}}$), removes the low-frequency $1/f$ baseline ramp via a 501-point running median filter, and normalizes by MAD. Drops false-alarm rate at $\text{SDE} \ge 6.0$ on pure noise from 100% down to 1.0%.
-5. **Multi-Peak Box Least Squares (BLS)**: Starts duration grid at $0.045\text{ d}$ ($1.08\text{ h}$) to prevent noise boundary collapse, evaluating the top 3 distinct peaks per star.
-6. **Multi-Stage Falsification Cascade**:
-   * **Cascade 0 (Aperture Crowding)**: Rejects blended fields using SPOC `CROWDSAP` ($< 0.70$) without redundant double dilution division.
-   * **Cascade 1 (SDE & Duty Cycle)**: Enforces whitened $\text{SDE} \ge 6.0$ and Keplerian duty cycle bounds ($T_{\text{dur}} / P \le 0.095$).
-   * **Cascade 2 (Baseline Morphology & Grazing V-Shape)**: Scales out-of-transit bin scatter to transit duration ($\text{SNR}_{\text{integrated}} \ge 5.5\sigma$), limits phase-folded shoulder bumps ($\le 35\%$), and rejects sharp V-shaped grazing profiles.
-   * **Cascade 3 (Multiplicity, Odd/Even & Transit Consistency)**: Requires $\ge 3$ distinct transits, tests odd/even symmetry ($< 2.8\sigma$), and enforces individual transit consistency ($\ge 60\%$ of observed transit epochs must exhibit a real negative flux deficit).
-   * **Cascade 4 (Full-Orbit Secondary Eclipse Scan)**: Scans all out-of-transit orbital phases $\phi \in [0.06, 0.94]$ with a sliding box, applying analytical Šidák-Bonferroni trials-factor correction to detect eccentric eclipsing binaries ($e > 0.1$) at $\alpha = 0.001$ false-alarm rate.
-   * **Cascade 5 (Astrometric Centroid Stability)**: Performs Welch's t-test on centroid coordinates to reject off-target shifts ($> 2.0\text{ arcsec}$ at $p < 0.001$).
-   * **Cascade 6 (Stellar Density, Gaia DR3 RUWE & Keplerian Duration Bounds)**: Queries TIC v8.2 and Gaia DR3 to reject evolved giants ($R_* > 1.75 R_\odot$), unresolved binaries ($\text{RUWE} > 1.4$), and non-planetary radii ($R_p > 15 R_\oplus$). Enforces physical Keplerian duration limits accounting for $1\sigma$ stellar uncertainties (`e_rad`, `e_mass`) and orbital eccentricities $e \le 0.30$ ($0.35\times$ lower bound, $1.38\times$ upper bound).
-   * **Cascade 7 (Target Pixel File Difference Imaging)**: Downloads calibrated pixel stamps (`TPF`), verifies that peak flux deficit lies strictly inside the SPOC aperture mask, and rejects pointing-drift dipoles.
-   * **Cascade 8 (Multi-Epoch Archival Verification)**: Queries prior TESS sectors across multi-year baselines and verifies persistent detection ($> 2.4\sigma$) in independent archival epochs.
-7. **Cache & Disk Protection**: `AUTO_PURGE_CACHE = True` automatically deletes raw FITS files of non-candidates, maintaining disk usage near 0 MB. Dual-stream logging outputs milestone events to `tess_results/pipeline_events.log`.
+```
+                    NASA TESS 2-Minute SPOC Cadence
+                                   │
+                                   ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│               TIER 1: High-Throughput Screening (aldebaran.py v8.0)     │
+├─────────────────────────────────────────────────────────────────────────┤
+│  • Catalog Cross-Match (ExoFOP, TOIs, CTOIs, Confirmed Planets)         │
+│  • Bitwise Quality Filtering (QUALITY == 0) & Gap Ramp Trimming         │
+│  • Piecewise Iterative Savitzky-Golay Filtering with Transit Masking    │
+│  • Whitened Signal Residue SDE (Kovács et al. 2002, 501-pt Median/MAD)  │
+│  • Multi-Peak BLS Period Search (0.045 d <= Dur <= 0.18 d, Top 3 Peaks)│
+│  • 9-Stage Astrophysical Falsification Cascade:                         │
+│     0. Aperture Dilution: SPOC CROWDSAP >= 0.70                         │
+│     1. Detection & Duty Cycle: SDE >= 6.0, T_dur / P <= 0.095           │
+│     2. Transit Profile: Integrated SNR >= 5.5σ, Shoulder <= 35%,        │
+│        U-shape check (rejects sharp V-shaped grazing binaries)          │
+│     3. Multiplicity & Consistency: N_transits >= 3, Odd/Even < 2.8σ,   │
+│        Epoch Consistency (>= 60% with negative flux deficit)            │
+│     4. Dual-Zone Secondary Eclipse Scan:                                │
+│        - Circular (|Δφ| <= 0.04): 1 hypothesis, SNR > 3.1σ              │
+│        - Eccentric (|Δφ| > 0.04): Šidák-Bonferroni SNR > z_crit         │
+│        - Depth floor: >= 100 ppm & >= 10% primary depth                 │
+│     5. Astrometric Centroid Stability: Welch's t-test (< 2.0 arcsec)    │
+│     6. Stellar Density & Keplerian Bounds: TIC v8.2 / Gaia DR3 RUWE     │
+│        (RUWE <= 1.4, R_* <= 1.75 R_sun, 0.35*T_min <= Dur <= 1.38*T_max)│
+│     7. Target Pixel Stamp (TPF): Difference image aperture localization │
+│     8. Multi-Epoch Archival Check: Multi-year baseline persistence      │
+│        (> 2.4σ) & multi-sector secondary eclipse verification           │
+│  • Zero-Lock PBS Array Sharding & Scratch Invalidation (~0 MB Cache)   │
+└────────────────────────────────────┬────────────────────────────────────┘
+                                     │ candidates_report.csv
+                                     ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│             MULTI-NODE SHARD REDUCER (merge_shards.py v8.0)             │
+├─────────────────────────────────────────────────────────────────────────┤
+│  • Aggregates all tess_results/sector_*/candidates_report.csv shards   │
+│  • Deduplicates multi-sector detections prioritizing highest Kovács SDE │
+│  • Merges scanned_tics.txt registries across parallel nodes             │
+│  • Automatically triggers Pleiades Tier-2 deep vetting on merged catalog│
+└────────────────────────────────────┬────────────────────────────────────┘
+                                     │
+                                     ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│               TIER 2: Deep Physical Vetting (pleiades.py v2.2)          │
+├─────────────────────────────────────────────────────────────────────────┤
+│  • Multi-Sector Detrending & Stitched Baseline Normalization            │
+│  • 300-Ring Concentric Limb-Darkened Mandel-Agol Model Integration      │
+│  • Full-Orbit Eccentric Secondary Eclipse Scan                          │
+│  • Astrophysical Catalog Cross-Match:                                   │
+│     - VizieR TESS Eclipsing Binary Catalogue (Prša et al. 2022)         │
+│     - Gaia DR3 Non-Single Star (NSS) Two-Body Orbit Solutions (SB1/SB2) │
+│  • Gaia DR3 Field Contamination & Nearby Eclipsing Binary (NEB) Scoring │
+│  • 4-Panel Publication Dossiers with Transit Depth Zoom & Error Bars:   │
+│     - Top-Left:  Phase-folded LC zoomed to [1 - 3.5*d, 1 + 2*d] with   │
+│                  analytical 300-ring fit & ±1σ binned error bars        │
+│     - Top-Right: Full stitched multi-sector light curve with epochs     │
+│     - Bottom-Left: Odd/Even phase overlays & full-orbit secondary scan  │
+│     - Bottom-Right: Gaia DR3 120" neighbor map with NEB critical radii  │
+└─────────────────────────────────────────────────────────────────────────┘
+```
 
 ---
 
-### Tier 2: Deep Physical Vetting (`pleiades.py` v2.2)
-Surviving candidates are processed through `pleiades.py`:
-* **Tukey Biweight Detrending**: Multi-sector stitching using a Wotan-style time-windowed Tukey biweight slider.
-* **300-Ring Annular Limb-Darkened Transit Model**: Sub-ppm accurate numerical integration of Mandel-Agol transit profiles using 300 concentric stellar rings with Claret quadratic limb darkening ($u_1, u_2$). Zero staircase or discretization artifacts.
-* **Full-Orbit Secondary Eclipse Scan**: Exhaustive scan across all out-of-transit phases for eccentric secondary eclipses.
-* **Astrophysical Binary Catalog Cross-Matching**: Automated cross-match against the VizieR TESS Eclipsing Binary Catalogue (Prša et al. 2022, `J/ApJS/258/16/tess-ebs`) and Gaia DR3 Non-Single Star (NSS) Two-Body Orbit Table (`gaiadr3.nss_two_body_orbit`).
-* **Gaia DR3 Neighborhood Flux Contamination**: Models TESS PSF overlap for all Gaia DR3 stars within $120\text{ arcsec}$, identifies nearby eclipsing binary (NEB) capable sources, and computes a composite Heuristic False Positive Risk Score.
-* **4-Panel Publication Dossiers**: Saves high-resolution diagnostic plots to `tess_results/deep_vetting/dossier_TIC_*.png`.
+## Key Features in v8.0
+
+1. **Distributed PBS Job Array Sharding (`qsub -J 1-8`)**:
+   Enables parallel execution across 8 independent compute nodes without inter-process file locks. Workers autonomously map `PBS_ARRAY_INDEX` to sequential TESS sectors (`[106, 105, 104, 103, 102, 101, 100, 99]`) and write to isolated subdirectories (`tess_results/sector_<sec>/`).
+2. **Dual-Zone Full-Orbit Secondary Eclipse Scan**:
+   Differentiates between circular orbits ($|\phi - 0.50| \le 0.04$) evaluated as a single hypothesis test at $\text{SNR} > 3.1\sigma$ and eccentric orbits ($|\phi - 0.50| > 0.04$) evaluated with analytical Šidák-Bonferroni correction ($\alpha = 0.001$, $\text{SNR} > z_{\text{crit}}$). Enforces a 100 ppm floor and $\ge 10\%$ of primary depth to avoid rejecting real planets due to stellar variability.
+3. **Multi-Sector Archival Secondary Scan**:
+   Filter 8 (`verify_multi_epoch`) now executes a secondary eclipse scan across the combined archival baseline to eliminate faint occulting stellar companions that only become statistically significant when multiple sectors are stacked.
+4. **Automated Shard Aggregation (`merge_shards.py`)**:
+   Gathers reports and scanned star registries from all array shards, deduplicates duplicate candidates by highest SDE, and hands off the unified catalog directly to Pleiades Tier-2.
+5. **Dynamic Transit Zoom & Error Bars (Pleiades v2.2)**:
+   Diagnostic dossiers now automatically zoom into the transit depth window ($[1.0 - 3.5 \cdot \text{depth}, 1.0 + 2.0 \cdot \text{depth}]$) and render phase-binned $\pm 1\sigma$ error bars, providing clear visual discrimination of transit ingress, egress, and bottom flat-floor curvature.
 
 ---
 
 ## Test Suite (`tests/`)
 
 Aldebaran includes an automated validation and regression suite:
-* `tests/test_ssl_check.py`: Tests connectivity to ExoFOP, MAST, NASA Exoplanet Archive, and Gaia TAP.
-* `tests/test_ring_accuracy.py`: Benchmarks 300-ring Mandel-Agol model accuracy vs. reference integration.
-* `tests/test_binary_catalogs.py`: Verifies VizieR TESS EB and Gaia DR3 NSS catalog cross-matching.
-* `tests/test_kovacs_sde.py`: Validates Kovács whitened SDE noise suppression and planet recovery.
-* `tests/test_secondary_scan.py`: Verifies full-orbit eccentric secondary eclipse detection.
+* `tests/test_ssl_check.py`: Tests connectivity to ExoFOP, MAST, NASA Exoplanet Archive, and Gaia TAP across certificate stores.
+* `tests/test_ring_accuracy.py`: Benchmarks 300-ring Mandel-Agol numerical integration accuracy against a 20,000-ring continuous reference.
+* `tests/test_binary_catalogs.py`: Verifies VizieR TESS EB and Gaia DR3 NSS catalog cross-matching against benchmark targets.
+* `tests/test_kovacs_sde.py`: Validates Kovács whitened SDE noise suppression on pure white noise and planet recovery.
+* `tests/test_secondary_scan.py`: Validates dual-zone full-orbit secondary eclipse detection and Šidák-Bonferroni false-alarm thresholds.
+* `tests/test_tess_eb_fetch.py`: Validates direct TAPVizieR and Astroquery ingestion of the Prša et al. (2022) catalog.
 
 Run all tests:
 ```bash
-python -c "import subprocess, sys; [subprocess.run([sys.executable, t], check=True) for t in ['tests/test_ssl_check.py', 'tests/test_ring_accuracy.py', 'tests/test_binary_catalogs.py', 'tests/test_kovacs_sde.py', 'tests/test_secondary_scan.py']]"
+python -c "import subprocess, sys; [subprocess.run([sys.executable, t], check=True) for t in ['tests/test_ssl_check.py', 'tests/test_ring_accuracy.py', 'tests/test_binary_catalogs.py', 'tests/test_kovacs_sde.py', 'tests/test_secondary_scan.py', 'tests/test_tess_eb_fetch.py']]"
 ```
 
 ---
@@ -58,15 +107,31 @@ python -c "import subprocess, sys; [subprocess.run([sys.executable, t], check=Tr
 ## HPC & Cluster Execution (MetaCentrum)
 
 For large-scale runs across tens of thousands of stars, PBS Pro scripts are available:
-* `run_aldebaran.pbs`: PBS script optimized for MetaCentrum HPC with Job Arrays and local NVMe `$SCRATCHDIR` I/O.
-* See `README_METACENTRUM.md` for complete submission instructions.
+* `run_aldebaran.pbs`: PBS script optimized for MetaCentrum HPC with Job Arrays (`qsub -J 1-8`) and local NVMe `$SCRATCHDIR` I/O (8 CPUs, 16 GB RAM, 35 GB local scratch, 6h walltime).
+* `merge_shards.py`: Reducer script to merge shard outputs after array execution.
+* See [README_METACENTRUM.md](README_METACENTRUM.md) for full deployment and monitoring instructions.
 
 ---
 
 ## Quickstart
 
+### Local Execution (Single Machine)
 ```bash
+# 1. Install dependencies
 pip install -r requirements.txt
+
+# 2. Run Tier-1 screening
 python aldebaran.py
+
+# 3. Run Tier-2 deep vetting on detected candidates
 python pleiades.py
+```
+
+### HPC Distributed Array Execution (MetaCentrum)
+```bash
+# 1. Submit parallel 8-node job array (Sectors 99-106, ~100k targets)
+qsub -J 1-8 run_aldebaran.pbs
+
+# 2. After jobs complete, aggregate shards and trigger Tier-2 vetting
+python merge_shards.py
 ```

@@ -1,6 +1,6 @@
-# MetaCentrum HPC Guide for Aldebaran TESS Pipeline
+# MetaCentrum HPC Guide for Aldebaran TESS Pipeline (v8.0)
 
-This guide explains how to deploy and execute the **Aldebaran** exoplanet search pipeline on the Czech National Grid Organization (**MetaCentrum** / CESNET) using PBS Pro.
+This guide explains how to deploy and execute the **Aldebaran** exoplanet search pipeline on the Czech National Grid Organization (**MetaCentrum** / CESNET e-INFRA CZ) using PBS Pro.
 
 ---
 
@@ -14,11 +14,17 @@ ssh your_username@tarkil.metacentrum.cz
 ```
 
 ### Step 2: Clone or Update the Project
-On the frontend node, navigate to your persistent storage directory and clone your repository:
+On the frontend node, navigate to your persistent storage directory and clone or update your repository:
 ```bash
 cd /storage/praha1/home/$USER   # or /storage/brno2/home/$USER
 git clone https://github.com/lnqigr/aldebaran.git exoplanet_search
 cd exoplanet_search
+```
+
+If you already have the repository cloned:
+```bash
+cd exoplanet_search
+git pull origin main
 ```
 
 Make the PBS script executable:
@@ -30,30 +36,34 @@ chmod +x run_aldebaran.pbs
 
 ## 2. Submitting Jobs via PBS Pro
 
-### Standard Production Job (16 Cores, 32 GB RAM, 40 GB NVMe Scratch, 24h Walltime)
-To submit a production run:
+### Standard Production Job (8 Cores, 16 GB RAM, 35 GB NVMe Scratch, 6h Walltime)
+To submit a single-sector production run:
 ```bash
 qsub run_aldebaran.pbs
 ```
-PBS will return a unique Job ID, for example: `1234567.meta-pbs.metacentrum.cz`.
+PBS will return a unique Job ID, for example: `1234567.pbs-m1.metacentrum.cz`.
 
-By default, the script scans up to 12,000 targets (`ALDEBARAN_MAX_TARGETS=12000`) on 16 CPU cores.
+By default, the script scans up to 15,000 targets (`ALDEBARAN_MAX_TARGETS=15000`) on 8 CPU cores. This hardware footprint matches NASA MAST download throughput without CPU over-allocation or fairshare penalty.
 
 ### Customizing Batch Size via Environment Variables
 You can override the target count without editing any files:
 ```bash
+# Scan a smaller test batch (e.g. 500 targets):
+qsub -v ALDEBARAN_MAX_TARGETS=500 run_aldebaran.pbs
+
 # Scan a full sector (e.g. 15,000 targets):
 qsub -v ALDEBARAN_MAX_TARGETS=15000 run_aldebaran.pbs
 ```
 
 ### High-Throughput Distributed Array (8 Nodes, 8 Sectors, ~100,000 Targets)
-To scan up to 8 fresh TESS sectors (Sectors 99 through 106) simultaneously in ~2 hours:
+To scan up to 8 fresh TESS sectors (Sectors 106, 105, 104, 103, 102, 101, 100, 99) simultaneously in ~2 hours:
 ```bash
 qsub -J 1-8 run_aldebaran.pbs
 ```
 Each node in the array:
 * Gets 8 dedicated CPU cores, 16 GB RAM, and 35 GB local NVMe scratch.
-* Automatically processes its own assigned sector in zero-lock isolated storage (`tess_results/sector_<sec>/`).
+* Automatically processes its own assigned sector from `PREFERRED_SECTORS` in zero-lock isolated storage (`tess_results/sector_<sec>/`).
+* Desynchronizes MAST API calls with an initial jitter delay (`sleep $(( (PBS_ARRAY_INDEX * 3) % 20 ))`).
 * After the array finishes, run the aggregator to merge all sectors into a unified candidate catalog and trigger Tier-2 Pleiades deep vetting:
 ```bash
 python merge_shards.py
@@ -63,23 +73,31 @@ python merge_shards.py
 
 ## 3. Monitoring & Managing Jobs
 
-* **View running jobs:**
+* **View running jobs / array summary:**
   ```bash
   qstat -u $USER
   ```
-* **View detailed job telemetry (node name, memory and CPU usage):**
+* **View all individual tasks in a running array:**
+  ```bash
+  qstat -t <JOB_ID>[]
+  ```
+* **View detailed job telemetry (node name, memory, and CPU usage):**
   ```bash
   qstat -f <JOB_ID>
   ```
 * **Follow live log output of a running job:**
   ```bash
+  # Single job:
   tail -f aldebaran_tess.o<JOB_ID>
+
+  # Array task (e.g. worker index 1):
+  tail -f aldebaran_tess.o<JOB_ID>-1
   ```
 * **Cancel / kill a running job gracefully:**
   ```bash
   qdel <JOB_ID>
   ```
-  > **Safe Sync Protection:** Even if a job is cancelled with `qdel` or hits the 24-hour walltime limit, `run_aldebaran.pbs` traps the `SIGTERM` signal, lets `aldebaran.py` finalize its Run Summary, syncs all reports and dossiers back to `/storage/.../tess_results/`, and only then cleans local scratch.
+  > **Safe Sync Protection:** Even if a job is cancelled with `qdel` or hits the 6-hour walltime limit, `run_aldebaran.pbs` traps the `SIGTERM` signal, lets `aldebaran.py` finalize its Run Summary, syncs all reports and dossiers back to `/storage/.../tess_results/`, and only then cleans local scratch.
 
 ---
 
