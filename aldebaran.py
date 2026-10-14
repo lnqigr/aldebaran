@@ -41,13 +41,20 @@ from astroquery.mast import Observations, Catalogs
 PIPELINE_VERSION = "v7.7"
 AUTO_PURGE_CACHE = True       # Automatically deletes raw FITS files of non-candidates to keep cache at ~0 MB
 
+# Lightkurve does NOT read a LIGHTKURVE_CACHE_DIR env var by itself; apply it explicitly so HPC jobs
+# keep all FITS downloads on node-local scratch (re-executed in every spawned/forked worker on import).
+if os.environ.get("LIGHTKURVE_CACHE_DIR"):
+    os.makedirs(os.environ["LIGHTKURVE_CACHE_DIR"], exist_ok=True)
+    lk.conf.cache_dir = os.environ["LIGHTKURVE_CACHE_DIR"]
+
 # Finishes Sector 98 first, then automatically advances to newest released sectors (106 down to 80)
 PREFERRED_SECTORS = [
     98, 106, 105, 104, 103, 102, 101, 100, 99,
     97, 96, 95, 94, 93, 92, 91, 90, 89, 88, 87, 86, 85, 84, 83, 82, 81, 80
 ]
-MAX_TARGETS = 1000        # Number of stars to scan per run
-MAX_WORKERS = 16          # Optimal for i9-14900HX without triggering NASA MAST HTTP rate-limits
+# Both values can be overridden from the PBS script (ALDEBARAN_MAX_TARGETS / ALDEBARAN_WORKERS)
+MAX_TARGETS = int(os.environ.get("ALDEBARAN_MAX_TARGETS", 1000))   # Number of stars to scan per run
+MAX_WORKERS = int(os.environ.get("ALDEBARAN_WORKERS", 16))         # 16 is optimal for i9-14900HX without MAST rate-limits
 MAX_PEAKS_PER_STAR = 3    # Inspect top 3 distinct BLS peaks per star before rejecting
 PRIORITY_TICS = []        # Add specific TIC IDs here to force-test them first
 
@@ -158,11 +165,16 @@ def get_known_exoplanet_tics() -> set:
 
 def purge_target_cache(tic_id: str):
     """Removes cached FITS light curves and TPFs for a processed target to keep disk usage near 0 MB."""
-    cache_root = os.path.join(os.path.expanduser("~"), ".cache", "lightkurve")
+    try:
+        cache_root = lk.config.get_cache_dir()
+    except Exception:
+        cache_root = os.path.join(os.path.expanduser("~"), ".cache", "lightkurve")
     if not os.path.exists(cache_root):
         return
     padded_tic = str(tic_id).zfill(16)
-    for pattern in [f"*{padded_tic}*", f"*{tic_id}*"]:
+    # MAST filenames always embed the zero-padded 16-digit TIC; an unpadded substring pattern
+    # (e.g. "*674490*") would also match other targets being processed by parallel workers.
+    for pattern in [f"*-{padded_tic}-*"]:
         for path in glob.glob(os.path.join(cache_root, "**", pattern), recursive=True):
             try:
                 if os.path.isdir(path):
@@ -792,6 +804,21 @@ def verify_multi_epoch(
 
 
 def analyze_single_target(tic_id: str, sector: int, min_period: float = 0.8, max_period: float = 13.0) -> tuple:
+    """
+    Worker entrypoint. Guarantees the per-target FITS cache is purged on EVERY non-candidate
+    exit path (early REJECT_CROWDSAP / REJECT_RUWE / ... returns previously skipped the purge,
+    leaving ~65% of downloads on disk and overflowing scratch quotas on HPC nodes).
+    """
+    result = None
+    try:
+        result = _analyze_single_target_impl(tic_id, sector, min_period, max_period)
+        return result
+    finally:
+        if AUTO_PURGE_CACHE and (result is None or result[1] != "CANDIDATE"):
+            purge_target_cache(tic_id)
+
+
+def _analyze_single_target_impl(tic_id: str, sector: int, min_period: float = 0.8, max_period: float = 13.0) -> tuple:
     try:
         search_res = lk.search_lightcurve(f"TIC {tic_id}", mission="TESS", author="SPOC", sector=sector, exptime=120)
         if len(search_res) == 0:
@@ -1157,6 +1184,17 @@ def analyze_single_target(tic_id: str, sector: int, min_period: float = 0.8, max
 
 
 if __name__ == "__main__":
+    import signal
+    _MAIN_PID = os.getpid()
+
+    def _handle_sigterm(signum, frame):
+        # PBS sends SIGTERM on walltime / qdel: reuse the Ctrl+C path so the Run Summary is still written.
+        if os.getpid() == _MAIN_PID:
+            raise KeyboardInterrupt
+        os._exit(143)
+
+    signal.signal(signal.SIGTERM, _handle_sigterm)
+
     start_banner = f"=== ALDEBARAN PIPELINE {PIPELINE_VERSION} STARTED (Workers={MAX_WORKERS}, Batch={MAX_TARGETS}) ==="
     write_log("=" * 70, print_to_console=False)
     write_log(start_banner)

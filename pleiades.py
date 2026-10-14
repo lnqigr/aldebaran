@@ -27,6 +27,9 @@ os.environ["PYTHONWARNINGS"] = "ignore::UserWarning"
 warnings.filterwarnings("ignore", category=UserWarning)
 
 PIPELINE_VERSION = "v2.2"
+if os.environ.get("LIGHTKURVE_CACHE_DIR"):
+    os.makedirs(os.environ["LIGHTKURVE_CACHE_DIR"], exist_ok=True)
+    lk.conf.cache_dir = os.environ["LIGHTKURVE_CACHE_DIR"]
 INPUT_CSV = os.path.join("tess_results", "candidates_report.csv")
 VET_DIR = os.path.join("tess_results", "deep_vetting")
 os.makedirs(VET_DIR, exist_ok=True)

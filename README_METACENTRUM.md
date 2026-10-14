@@ -30,27 +30,28 @@ chmod +x run_aldebaran.pbs
 
 ## 2. Submitting Jobs via PBS Pro
 
-### Standard Single Job (16 Cores, 32 GB RAM, 40 GB NVMe Scratch)
-To submit a single run (scans 2500 targets by default):
+### Standard Production Job (16 Cores, 32 GB RAM, 40 GB NVMe Scratch, 24h Walltime)
+To submit a production run:
 ```bash
 qsub run_aldebaran.pbs
 ```
 PBS will return a unique Job ID, for example: `1234567.meta-pbs.metacentrum.cz`.
 
----
+By default, the script scans up to 12,000 targets (`ALDEBARAN_MAX_TARGETS=12000`) on 16 CPU cores.
 
-## 3. High-Throughput Parallel Scanning (Job Arrays)
-
-To process **10,000 to 50,000 stars** simultaneously across independent physical compute nodes:
+### Customizing Batch Size via Environment Variables
+You can override the target count without editing any files:
 ```bash
-# Launches 5 parallel nodes concurrently:
-qsub -J 1-5 run_aldebaran.pbs
+# Scan a full sector (e.g. 15,000 targets):
+qsub -v ALDEBARAN_MAX_TARGETS=15000 run_aldebaran.pbs
 ```
-Each node gets its own dedicated 16 CPU cores, 32 GB RAM, and local high-speed NVMe scratch storage. Each worker node safely appends scanned TICs to `tess_results/scanned_tics.txt` and records candidates to `tess_results/candidates_report.csv`.
+
+> **Note on Multi-Node Job Arrays (`-J`):**
+> Do not submit with `qsub -J` yet. Running concurrent nodes on the same sector without a shared target dispatcher causes workers to process overlapping targets and conflict on result synchronization. Full multi-node coordinated partitioning will be introduced in v8.0.
 
 ---
 
-## 4. Monitoring & Managing Jobs
+## 3. Monitoring & Managing Jobs
 
 * **View running jobs:**
   ```bash
@@ -64,15 +65,17 @@ Each node gets its own dedicated 16 CPU cores, 32 GB RAM, and local high-speed N
   ```bash
   tail -f aldebaran_tess.o<JOB_ID>
   ```
-* **Cancel / kill a running job:**
+* **Cancel / kill a running job gracefully:**
   ```bash
   qdel <JOB_ID>
   ```
+  > **Safe Sync Protection:** Even if a job is cancelled with `qdel` or hits the 24-hour walltime limit, `run_aldebaran.pbs` traps the `SIGTERM` signal, lets `aldebaran.py` finalize its Run Summary, syncs all reports and dossiers back to `/storage/.../tess_results/`, and only then cleans local scratch.
 
 ---
 
-## 5. Storage Architecture & Quotas
+## 4. Storage Architecture & Quotas
 
 MetaCentrum enforces strict quotas on the shared `/storage/...` network filesystem.
-* **Why `$SCRATCHDIR` is critical:** The `run_aldebaran.pbs` script automatically routes all raw FITS downloads from NASA MAST into the compute node's fast local NVMe (`$SCRATCHDIR`).
+* **Why `$SCRATCHDIR` is critical:** The `run_aldebaran.pbs` script automatically routes all raw FITS downloads from NASA MAST, pip cache, and astropy/matplotlib caches into the compute node's fast local NVMe (`$SCRATCHDIR`).
 * **Zero Quota Bloat:** Upon job completion or cancellation, the local scratch disk is automatically wiped (`clean_scratch`), and only the final lightweight results (`candidates_report.csv`, `.png` plots, and `.log` files) are synced back to your persistent folder.
+* **Periodic Backup:** In addition to exit/signal traps, the script performs an automatic background sync every 20 minutes to guard against hard node crashes.

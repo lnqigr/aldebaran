@@ -1,78 +1,150 @@
 #!/bin/bash
 # ==============================================================================
-# ALDEBARAN TESS PIPELINE - METACENTRUM PBS PRO BATCH SCRIPT
+# ALDEBARAN TESS PIPELINE - METACENTRUM PBS PRO BATCH SCRIPT (SAFE SYNC EDITION)
 # ==============================================================================
+# Single-node job. Job arrays (qsub -J) are NOT supported yet: all array members would
+# scan the same targets and overwrite each other's candidates_report.csv on sync-back.
+#
+# Measured throughput (Sector 98, 16 workers): ~4.0 s/star wall-clock (MAST-download bound,
+# not CPU bound) -> ~900 stars/hour. 12000 stars ~ 13-14 h, hence walltime=24h.
 #PBS -N aldebaran_tess
 #PBS -l select=1:ncpus=16:mem=32gb:scratch_local=40gb
-#PBS -l walltime=06:00:00
+#PBS -l walltime=24:00:00
 #PBS -m ae
 #PBS -j oe
 
-# 1. Error trap: guarantees local node NVMe scratch is cleaned on job completion or cancel
-trap 'clean_scratch' EXIT
+export ALDEBARAN_MAX_TARGETS="${ALDEBARAN_MAX_TARGETS:-12000}"
+export ALDEBARAN_WORKERS="${PBS_NCPUS:-16}"
+
+if [ -n "${PBS_ARRAY_INDEX:-}" ]; then
+    echo "[!] Job arrays are not supported yet (duplicate targets + result overwrite). Submit without -J."
+    exit 2
+fi
+
+# ------------------------------------------------------------------------------
+# 1. Safe sync & cleanup. Runs exactly once on normal exit, crash, walltime SIGTERM or qdel.
+# ------------------------------------------------------------------------------
+SYNCED=0
+PY_PID=""
+SYNC_LOOP_PID=""
+
+sync_results() {
+    if [ -d "$SCRATCHDIR/tess_results" ]; then
+        mkdir -p "$PBS_O_WORKDIR/tess_results"
+        cp -rf "$SCRATCHDIR/tess_results"/. "$PBS_O_WORKDIR/tess_results/" 2>/dev/null || true
+    fi
+}
+
+sync_and_clean() {
+    [ "$SYNCED" -eq 1 ] && return
+    SYNCED=1
+    echo "======================================================================"
+    echo "[TRAP] Final result synchronization at: $(date)"
+    [ -n "$SYNC_LOOP_PID" ] && kill "$SYNC_LOOP_PID" 2>/dev/null
+    sync_results
+    echo "[TRAP] Reports, logs and dossiers synced to: $PBS_O_WORKDIR/tess_results"
+    clean_scratch
+    echo "[TRAP] Local scratch cleaned."
+    echo "======================================================================"
+}
+
+on_signal() {
+    echo "[TRAP] Termination signal received (walltime / qdel). Stopping pipeline..."
+    # Forward SIGTERM so aldebaran.py writes its Run Summary, give it a few seconds.
+    [ -n "$PY_PID" ] && kill -TERM "$PY_PID" 2>/dev/null && sleep 5
+    sync_and_clean
+    exit 143   # IMPORTANT: without exit, bash would resume the next step on a wiped scratch
+}
+
+trap sync_and_clean EXIT
+trap on_signal TERM INT
+
+# Runs a Python step in the background and waits on it, so bash can react to SIGTERM
+# immediately (bash defers traps while a FOREGROUND child is running).
+run_py() {
+    python "$@" &
+    PY_PID=$!
+    wait "$PY_PID"
+    local rc=$?
+    PY_PID=""
+    return $rc
+}
 
 echo "======================================================================"
 echo "Starting Aldebaran TESS Job on MetaCentrum node: $(hostname)"
-echo "Job ID: $PBS_JOBID"
-echo "PBS Array Index (if applicable): ${PBS_ARRAY_INDEX:-None}"
+echo "Job ID: $PBS_JOBID | Workers: $ALDEBARAN_WORKERS | Batch: $ALDEBARAN_MAX_TARGETS"
 echo "PBS Working Directory: $PBS_O_WORKDIR"
 echo "Local Scratch Directory: $SCRATCHDIR"
 echo "Start time: $(date)"
 echo "======================================================================"
 
-# 2. Load Python module on MetaCentrum
-# MetaCentrum provides modern Python modules via Lmod
-module load python/python-3.11.4-gcc-10.2.1-l4o3l4h 2>/dev/null || module load python-3.11 2>/dev/null || module load python3 2>/dev/null
+# ------------------------------------------------------------------------------
+# 2. Python >= 3.10 is required (PEP 604 "dict | None" annotations in pleiades.py)
+# ------------------------------------------------------------------------------
+# Check available names on a frontend with:  module avail python
+module add python/3.11 2>/dev/null || module add python 2>/dev/null || true
+if ! python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3, 10) else 1)'; then
+    echo "[!] python3 >= 3.10 required, found: $(python3 --version 2>&1). Fix the 'module add' line."
+    exit 3
+fi
+echo "Python: $(python3 --version)"
 
-# 3. Direct high-throughput I/O and Lightkurve FITS caching to fast local NVMe ($SCRATCHDIR)
-export LIGHTKURVE_CACHE_DIR="$SCRATCHDIR/lightkurve_cache"
-export ASTROPY_CACHE_DIR="$SCRATCHDIR/astropy_cache"
-export MPLCONFIGDIR="$SCRATCHDIR/matplotlib_cache"
-mkdir -p "$LIGHTKURVE_CACHE_DIR" "$ASTROPY_CACHE_DIR" "$MPLCONFIGDIR"
+# ------------------------------------------------------------------------------
+# 3. All caches on node-local NVMe scratch (nothing is written to the shared $HOME quota).
+#    LIGHTKURVE_CACHE_DIR is applied inside aldebaran.py / pleiades.py via lk.conf.cache_dir.
+#    No symlinks in $HOME: concurrent jobs on other nodes would fight over them.
+# ------------------------------------------------------------------------------
+export XDG_CACHE_HOME="$SCRATCHDIR/.cache"
+export PIP_CACHE_DIR="$SCRATCHDIR/.cache/pip"
+export LIGHTKURVE_CACHE_DIR="$SCRATCHDIR/.cache/lightkurve"
+export ASTROPY_CACHE_DIR="$SCRATCHDIR/.cache/astropy"
+export MPLCONFIGDIR="$SCRATCHDIR/.cache/matplotlib"
+mkdir -p "$XDG_CACHE_HOME" "$PIP_CACHE_DIR" "$LIGHTKURVE_CACHE_DIR" "$ASTROPY_CACHE_DIR" "$MPLCONFIGDIR"
 
-# 4. Copy project code to local scratch to avoid shared NFS / AFS disk latency
-cp -r "$PBS_O_WORKDIR"/*.py "$SCRATCHDIR/"
-cp -r "$PBS_O_WORKDIR"/requirements*.txt "$SCRATCHDIR/" 2>/dev/null || true
-cp -r "$PBS_O_WORKDIR"/PROJECT_CONTEXT.md "$SCRATCHDIR/" 2>/dev/null || true
-
-# Copy persistent cache of catalog TICs and scanned history to scratch
+# ------------------------------------------------------------------------------
+# 4. Copy code AND the whole existing tess_results (history, catalog cache, previous
+#    candidates_report.csv, logs) so new results are appended, never overwritten.
+# ------------------------------------------------------------------------------
+cp "$PBS_O_WORKDIR"/*.py "$SCRATCHDIR/"
+cp "$PBS_O_WORKDIR"/requirements.txt "$SCRATCHDIR/" 2>/dev/null || true
 mkdir -p "$SCRATCHDIR/tess_results"
-if [ -f "$PBS_O_WORKDIR/tess_results/known_catalog_cache.txt" ]; then
-    cp "$PBS_O_WORKDIR/tess_results/known_catalog_cache.txt" "$SCRATCHDIR/tess_results/"
+if [ -d "$PBS_O_WORKDIR/tess_results" ]; then
+    cp -rf "$PBS_O_WORKDIR/tess_results"/. "$SCRATCHDIR/tess_results/" 2>/dev/null || true
 fi
-if [ -f "$PBS_O_WORKDIR/tess_results/scanned_tics.txt" ]; then
-    cp "$PBS_O_WORKDIR/tess_results/scanned_tics.txt" "$SCRATCHDIR/tess_results/"
-fi
-
 cd "$SCRATCHDIR" || exit 1
 
-# 5. Virtual environment setup on local scratch
-VENV_DIR="$SCRATCHDIR/venv"
+# ------------------------------------------------------------------------------
+# 5. Virtual environment on scratch (node-local build avoids glibc mismatches)
+# ------------------------------------------------------------------------------
 echo "[1/4] Setting up Python virtual environment in scratch..."
-python3 -m venv "$VENV_DIR"
-source "$VENV_DIR/bin/activate"
+python3 -m venv "$SCRATCHDIR/venv"
+source "$SCRATCHDIR/venv/bin/activate"
+pip install --upgrade pip --no-cache-dir --quiet
+if [ -f requirements.txt ]; then
+    pip install --no-cache-dir --quiet -r requirements.txt certifi
+else
+    pip install --no-cache-dir --quiet numpy scipy astropy pandas lightkurve astroquery matplotlib requests urllib3 certifi
+fi
 
-pip install --upgrade pip --quiet
-pip install numpy scipy astropy pandas lightkurve matplotlib requests urllib3 certifi --quiet
+# Belt-and-braces: periodic sync every 20 min, in case the node dies hard (no trap possible).
+( while true; do sleep 1200; sync_results; done ) &
+SYNC_LOOP_PID=$!
 
-# 6. Execute Aldebaran Tier-1 screening
+# ------------------------------------------------------------------------------
+# 6. Tier-1 screening
+# ------------------------------------------------------------------------------
 echo "[2/4] Launching Aldebaran Tier-1 Pipeline..."
-python aldebaran.py
+run_py aldebaran.py
 
-# 7. Execute Tier-2 Deep Vetting if candidates were detected
-if [ -f "tess_results/candidates_report.csv" ]; then
+# ------------------------------------------------------------------------------
+# 7. Tier-2 deep vetting if any candidates exist
+# ------------------------------------------------------------------------------
+if [ -s "tess_results/candidates_report.csv" ]; then
     echo "[3/4] Candidates found! Launching Pleiades Tier-2 Deep Vetting..."
-    python pleiades.py
+    run_py pleiades.py
 else
     echo "[3/4] No candidates found in this batch. Tier-2 vetting skipped."
 fi
 
-# 8. Copy results, reports, dossiers, and updated histories back to persistent storage
-echo "[4/4] Syncing results back to $PBS_O_WORKDIR/tess_results..."
-mkdir -p "$PBS_O_WORKDIR/tess_results"
-cp -ru "$SCRATCHDIR/tess_results"/* "$PBS_O_WORKDIR/tess_results/" 2>/dev/null || cp -r "$SCRATCHDIR/tess_results"/* "$PBS_O_WORKDIR/tess_results/"
-
-echo "======================================================================"
-echo "Job finished successfully at: $(date)"
-echo "Output files synced back to: $PBS_O_WORKDIR/tess_results"
-echo "======================================================================"
+# Final sync + scratch cleanup are performed by the EXIT trap.
+echo "[4/4] Pipeline execution finished at: $(date)"
