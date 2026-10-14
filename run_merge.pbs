@@ -1,0 +1,42 @@
+#!/bin/bash
+# ==============================================================================
+# ALDEBARAN v8.0 - TIER-2 MERGE & DEEP VETTING REDUCER SCRIPT
+# ==============================================================================
+#PBS -N merge_shards
+#PBS -l select=1:ncpus=4:mem=16gb:scratch_local=15gb
+#PBS -l walltime=02:00:00
+#PBS -m ae
+#PBS -j oe
+
+echo "======================================================================"
+echo "Starting Aldebaran Shard Merge & Pleiades Vetting on $(hostname)"
+echo "Job ID: $PBS_JOBID"
+echo "Start time: $(date)"
+echo "======================================================================"
+
+cd "$PBS_O_WORKDIR" || exit 1
+
+module add python/3.11 2>/dev/null || module add python 2>/dev/null || true
+
+export XDG_CACHE_HOME="$SCRATCHDIR/.cache"
+export PIP_CACHE_DIR="$SCRATCHDIR/.cache/pip"
+export LIGHTKURVE_CACHE_DIR="$SCRATCHDIR/.cache/lightkurve"
+export ASTROPY_CACHE_DIR="$SCRATCHDIR/.cache/astropy"
+export MPLCONFIGDIR="$SCRATCHDIR/.cache/matplotlib"
+mkdir -p "$XDG_CACHE_HOME" "$PIP_CACHE_DIR" "$LIGHTKURVE_CACHE_DIR" "$ASTROPY_CACHE_DIR" "$MPLCONFIGDIR"
+
+python3 -m venv "$SCRATCHDIR/venv"
+source "$SCRATCHDIR/venv/bin/activate"
+pip install --upgrade pip --no-cache-dir --quiet
+if [ -f requirements.txt ]; then
+    pip install --no-cache-dir --quiet -r requirements.txt certifi
+else
+    pip install --no-cache-dir --quiet numpy scipy astropy pandas lightkurve astroquery matplotlib requests urllib3 certifi
+fi
+
+python merge_shards.py
+
+clean_scratch
+echo "======================================================================"
+echo "Merge and Pleiades vetting completed at: $(date)"
+echo "======================================================================"

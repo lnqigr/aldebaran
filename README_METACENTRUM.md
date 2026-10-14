@@ -64,12 +64,23 @@ Each node in the array:
 * Gets 8 dedicated CPU cores, 16 GB RAM, and 35 GB local NVMe scratch.
 * Automatically processes its own assigned sector from `PREFERRED_SECTORS` in zero-lock isolated storage (`tess_results/sector_<sec>/`).
 * Desynchronizes MAST API calls with an initial jitter delay (`sleep $(( (PBS_ARRAY_INDEX * 3) % 20 ))`).
-* After the array finishes, run the aggregator to merge all sectors into a unified candidate catalog and trigger Tier-2 Pleiades deep vetting:
+
+### Fully Automated "Before Sleep" Workflow (`submit_all.sh`)
+To queue the entire end-to-end pipeline (Tier-1 array screening + automatic Tier-2 Pleiades deep vetting) with a single command:
 ```bash
-python merge_shards.py
+chmod +x submit_all.sh run_merge.pbs
+./submit_all.sh
 ```
 
+### Attaching the Auto-Reducer to an Already-Running Array
+If you already submitted an array (e.g. `24683990`), schedule the reducer to wait for it:
+```bash
+qsub -W depend=afterany:24683990.pbs-m1 run_merge.pbs
+```
+The reducer job will sit in `Hold` (`H`), and the instant the final array worker finishes, PBS will launch `run_merge.pbs`, deduplicating candidates and generating all Pleiades diagnostic dossiers.
+
 ---
+
 
 ## 3. Monitoring & Managing Jobs
 
