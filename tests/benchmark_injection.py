@@ -48,9 +48,9 @@ def generate_realistic_tess_baseline(n_sectors: int = 1, seed: int = 42, sigma_2
     """
     rng = np.random.default_rng(seed)
     cad_days = 120.0 / 86400.0
-    t_Orbit1 = np.arange(0.15, 13.15, cad_days)
-    t_Orbit2 = np.arange(14.25, 27.25, cad_days)
-    t = np.concatenate([t_Orbit1, t_Orbit2])
+    t_orbit1 = np.arange(0.15, 13.15, cad_days)
+    t_orbit2 = np.arange(14.25, 27.25, cad_days)
+    t = np.concatenate([t_orbit1, t_orbit2])
 
     white_noise = rng.normal(0.0, sigma_2min_ppm * 1e-6, size=len(t))
     # Correlated quasi-periodic stellar variability (P_rot ~ 6.4 d) + red granulation
@@ -74,15 +74,15 @@ def inject_physical_transit(
     b_impact: float = 0.30
 ) -> tuple[np.ndarray, float, float]:
     """Injects a limb-darkened transit signal into flux array f and returns (f_injected, depth_ppm, dur_days)."""
-    G_SI = 6.67430e-11
-    M_SUN = 1.98847e30
-    R_SUN = 6.957e8
-    R_EARTH = 6.371e6
+    g_si = 6.67430e-11
+    m_sun_val = 1.98847e30
+    r_sun_val = 6.957e8
+    r_earth_val = 6.371e6
 
-    rp_rs = (rp_earth * R_EARTH) / (r_star_sun * R_SUN)
+    rp_rs = (rp_earth * r_earth_val) / (r_star_sun * r_sun_val)
     p_sec = p_days * 86400.0
-    a_m = (G_SI * (m_star_sun * M_SUN) * (p_sec ** 2) / (4.0 * np.pi ** 2)) ** (1.0 / 3.0)
-    a_rs = a_m / (r_star_sun * R_SUN)
+    a_m = (g_si * (m_star_sun * m_sun_val) * (p_sec ** 2) / (4.0 * np.pi ** 2)) ** (1.0 / 3.0)
+    a_rs = a_m / (r_star_sun * r_sun_val)
     half_chord = np.sqrt(max(1e-4, (1.0 + rp_rs) ** 2 - b_impact ** 2))
     dur_days = float((p_days / np.pi) * np.arcsin(min(0.99, half_chord / a_rs)))
     dur_days = max(0.040, dur_days)
@@ -145,7 +145,7 @@ def run_injection_recovery_suite(n_trials_per_cell: int = 8):
                 sde_det = float(sde_arr[best_idx])
                 sde_list.append(sde_det)
 
-                # Recovery criterion: SDE >= 6.0 and period matches injected P (or 1:2 / 2:1 harmonic) within 1.5%
+                # Recovery criterion: SDE >= 6.0 and period matches injected P within 1.5%
                 p_match = (
                     abs(p_det - p_val) / p_val < 0.015
                     or abs(p_det - 0.5 * p_val) / (0.5 * p_val) < 0.015
@@ -201,4 +201,5 @@ def run_injection_recovery_suite(n_trials_per_cell: int = 8):
 
 
 if __name__ == "__main__":
-    run_injection_recovery_suite(n_trials_per_cell=8)
+    trials = int(sys.argv[1]) if len(sys.argv) > 1 else 8
+    run_injection_recovery_suite(n_trials_per_cell=trials)
