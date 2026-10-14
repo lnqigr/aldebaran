@@ -1,0 +1,78 @@
+#!/bin/bash
+# ==============================================================================
+# ALDEBARAN TESS PIPELINE - METACENTRUM PBS PRO BATCH SCRIPT
+# ==============================================================================
+#PBS -N aldebaran_tess
+#PBS -l select=1:ncpus=16:mem=32gb:scratch_local=40gb
+#PBS -l walltime=06:00:00
+#PBS -m ae
+#PBS -j oe
+
+# 1. Error trap: guarantees local node NVMe scratch is cleaned on job completion or cancel
+trap 'clean_scratch' EXIT
+
+echo "======================================================================"
+echo "Starting Aldebaran TESS Job on MetaCentrum node: $(hostname)"
+echo "Job ID: $PBS_JOBID"
+echo "PBS Array Index (if applicable): ${PBS_ARRAY_INDEX:-None}"
+echo "PBS Working Directory: $PBS_O_WORKDIR"
+echo "Local Scratch Directory: $SCRATCHDIR"
+echo "Start time: $(date)"
+echo "======================================================================"
+
+# 2. Load Python module on MetaCentrum
+# MetaCentrum provides modern Python modules via Lmod
+module load python/python-3.11.4-gcc-10.2.1-l4o3l4h 2>/dev/null || module load python-3.11 2>/dev/null || module load python3 2>/dev/null
+
+# 3. Direct high-throughput I/O and Lightkurve FITS caching to fast local NVMe ($SCRATCHDIR)
+export LIGHTKURVE_CACHE_DIR="$SCRATCHDIR/lightkurve_cache"
+export ASTROPY_CACHE_DIR="$SCRATCHDIR/astropy_cache"
+export MPLCONFIGDIR="$SCRATCHDIR/matplotlib_cache"
+mkdir -p "$LIGHTKURVE_CACHE_DIR" "$ASTROPY_CACHE_DIR" "$MPLCONFIGDIR"
+
+# 4. Copy project code to local scratch to avoid shared NFS / AFS disk latency
+cp -r "$PBS_O_WORKDIR"/*.py "$SCRATCHDIR/"
+cp -r "$PBS_O_WORKDIR"/requirements*.txt "$SCRATCHDIR/" 2>/dev/null || true
+cp -r "$PBS_O_WORKDIR"/PROJECT_CONTEXT.md "$SCRATCHDIR/" 2>/dev/null || true
+
+# Copy persistent cache of catalog TICs and scanned history to scratch
+mkdir -p "$SCRATCHDIR/tess_results"
+if [ -f "$PBS_O_WORKDIR/tess_results/known_catalog_cache.txt" ]; then
+    cp "$PBS_O_WORKDIR/tess_results/known_catalog_cache.txt" "$SCRATCHDIR/tess_results/"
+fi
+if [ -f "$PBS_O_WORKDIR/tess_results/scanned_tics.txt" ]; then
+    cp "$PBS_O_WORKDIR/tess_results/scanned_tics.txt" "$SCRATCHDIR/tess_results/"
+fi
+
+cd "$SCRATCHDIR" || exit 1
+
+# 5. Virtual environment setup on local scratch
+VENV_DIR="$SCRATCHDIR/venv"
+echo "[1/4] Setting up Python virtual environment in scratch..."
+python3 -m venv "$VENV_DIR"
+source "$VENV_DIR/bin/activate"
+
+pip install --upgrade pip --quiet
+pip install numpy scipy astropy pandas lightkurve matplotlib requests urllib3 certifi --quiet
+
+# 6. Execute Aldebaran Tier-1 screening
+echo "[2/4] Launching Aldebaran Tier-1 Pipeline..."
+python aldebaran.py
+
+# 7. Execute Tier-2 Deep Vetting if candidates were detected
+if [ -f "tess_results/candidates_report.csv" ]; then
+    echo "[3/4] Candidates found! Launching Pleiades Tier-2 Deep Vetting..."
+    python pleiades.py
+else
+    echo "[3/4] No candidates found in this batch. Tier-2 vetting skipped."
+fi
+
+# 8. Copy results, reports, dossiers, and updated histories back to persistent storage
+echo "[4/4] Syncing results back to $PBS_O_WORKDIR/tess_results..."
+mkdir -p "$PBS_O_WORKDIR/tess_results"
+cp -ru "$SCRATCHDIR/tess_results"/* "$PBS_O_WORKDIR/tess_results/" 2>/dev/null || cp -r "$SCRATCHDIR/tess_results"/* "$PBS_O_WORKDIR/tess_results/"
+
+echo "======================================================================"
+echo "Job finished successfully at: $(date)"
+echo "Output files synced back to: $PBS_O_WORKDIR/tess_results"
+echo "======================================================================"

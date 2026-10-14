@@ -33,11 +33,13 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from scipy import stats
 from scipy.signal import medfilt, savgol_filter
+from scipy.ndimage import median_filter
 from astropy.timeseries import BoxLeastSquares
 import lightkurve as lk
 from astroquery.mast import Observations, Catalogs
 
-PIPELINE_VERSION = "v7.5"
+PIPELINE_VERSION = "v7.7"
+AUTO_PURGE_CACHE = True       # Automatically deletes raw FITS files of non-candidates to keep cache at ~0 MB
 
 # Finishes Sector 98 first, then automatically advances to newest released sectors (106 down to 80)
 PREFERRED_SECTORS = [
@@ -54,6 +56,7 @@ HISTORY_FILE = os.path.join(OUTPUT_DIR, "scanned_tics.txt")
 CATALOG_CACHE_FILE = os.path.join(OUTPUT_DIR, "known_catalog_cache.txt")
 REPORT_FILE = os.path.join(OUTPUT_DIR, "candidates_report.csv")
 LOG_FILE = os.path.join(OUTPUT_DIR, "pipeline_run.log")
+EVENTS_LOG_FILE = os.path.join(OUTPUT_DIR, "pipeline_events.log")
 
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
@@ -63,6 +66,12 @@ def write_log(message: str, print_to_console: bool = True):
     if print_to_console:
         print(message, flush=True)
     with open(LOG_FILE, "a", encoding="utf-8") as f:
+        f.write(f"[{timestamp}] {message}\n")
+
+
+def write_event(message: str):
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    with open(EVENTS_LOG_FILE, "a", encoding="utf-8") as f:
         f.write(f"[{timestamp}] {message}\n")
 
 
@@ -136,7 +145,8 @@ def get_known_exoplanet_tics() -> set:
     return known_tics
 
 
-def purge_corrupted_cache(tic_id: str):
+def purge_target_cache(tic_id: str):
+    """Removes cached FITS light curves and TPFs for a processed target to keep disk usage near 0 MB."""
     cache_root = os.path.join(os.path.expanduser("~"), ".cache", "lightkurve")
     if not os.path.exists(cache_root):
         return
@@ -150,6 +160,10 @@ def purge_corrupted_cache(tic_id: str):
                     os.remove(path)
             except Exception:
                 pass
+
+
+def purge_corrupted_cache(tic_id: str):
+    purge_target_cache(tic_id)
 
 
 def safe_download(search_obj, tic_id: str, download_all: bool = False):
@@ -235,10 +249,12 @@ def select_latest_sector_and_targets(sector_list: list, limit: int) -> tuple:
         if tic not in final_queue:
             final_queue.append(tic)
 
-    write_log(
-        f"[5/5] Locked onto Sector {chosen_sector} | Total SPOC stars: {raw_count} | "
-        f"Unsearched & not in TOI/CTOI/Confirmed: {len(available_tics)} | Queued: {min(limit, len(final_queue))}\n"
+    lock_msg = (
+        f"Sector {chosen_sector} locked | Total SPOC: {raw_count} | "
+        f"Unsearched: {len(available_tics)} | Queued: {min(limit, len(final_queue))}"
     )
+    write_log(f"[5/5] {lock_msg}\n")
+    write_event(lock_msg)
     return chosen_sector, final_queue[:limit]
 
 
@@ -261,7 +277,11 @@ def calc_max_keplerian_duration_hours(p_days: float, r_star_sun: float, m_star_s
 
 
 def get_stellar_and_gaia_params(tic_id: str) -> dict:
-    result = {"r_star": np.nan, "m_star": np.nan, "teff": np.nan, "ruwe": np.nan, "has_params": False}
+    result = {
+        "r_star": np.nan, "e_r_star": np.nan,
+        "m_star": np.nan, "e_m_star": np.nan,
+        "teff": np.nan, "ruwe": np.nan, "has_params": False
+    }
     try:
         tic_data = Catalogs.query_criteria(catalog="Tic", ID=int(tic_id))
         if len(tic_data) == 0:
@@ -270,12 +290,17 @@ def get_stellar_and_gaia_params(tic_id: str) -> dict:
         row = tic_data[0]
         r_val = float(to_numpy(row["rad"]))
         t_val = float(to_numpy(row["Teff"]))
+        er_val = float(to_numpy(row["e_rad"])) if "e_rad" in row.colnames else np.nan
         m_val = float(to_numpy(row["mass"])) if "mass" in row.colnames else np.nan
+        em_val = float(to_numpy(row["e_mass"])) if "e_mass" in row.colnames else np.nan
         
         if np.isfinite(r_val) and r_val > 0 and np.isfinite(t_val) and t_val > 0:
             result["r_star"] = r_val
+            result["e_r_star"] = er_val if (np.isfinite(er_val) and er_val > 0) else (0.10 * r_val)
             result["teff"] = t_val
-            result["m_star"] = m_val if (np.isfinite(m_val) and m_val > 0) else (r_val ** 1.1)
+            m_clean = m_val if (np.isfinite(m_val) and m_val > 0) else (r_val ** 1.1)
+            result["m_star"] = m_clean
+            result["e_m_star"] = em_val if (np.isfinite(em_val) and em_val > 0) else (0.12 * m_clean)
             result["has_params"] = True
             
         ra = float(to_numpy(row["ra"]))
@@ -297,6 +322,116 @@ def get_stellar_and_gaia_params(tic_id: str) -> dict:
     except Exception:
         pass
     return result
+
+
+def compute_keplerian_duration_bounds_hours(
+    p_days: float, r_star: float, e_r_star: float, m_star: float, e_m_star: float, rp_rs: float
+) -> tuple[float, float, float]:
+    """
+    Returns (nominal_circular_max_hr, strict_lower_bound_hr, eccentric_upper_bound_hr)
+    accounting for 1-sigma TIC stellar uncertainties (e_rad, e_mass) and e <= 0.30 eccentricity.
+    """
+    nom_max_hr = calc_max_keplerian_duration_hours(p_days, r_star, m_star, rp_rs)
+    
+    r_upper = r_star + max(e_r_star, 0.08 * r_star)
+    m_lower = max(0.08, m_star - max(e_m_star, 0.10 * m_star))
+    upper_circ_hr = calc_max_keplerian_duration_hours(p_days, r_upper, m_lower, rp_rs)
+    
+    r_lower = max(0.08, r_star - max(e_r_star, 0.08 * r_star))
+    m_upper = m_star + max(e_m_star, 0.10 * m_star)
+    lower_circ_hr = calc_max_keplerian_duration_hours(p_days, r_lower, m_upper, rp_rs)
+    
+    # 0.35x lower bound (grazing b <= 0.93 + periastron e <= 0.30)
+    # 1.38x upper bound on 1-sigma upper stellar radius (apastron e <= 0.30)
+    return nom_max_hr, 0.35 * lower_circ_hr, 1.38 * upper_circ_hr
+
+
+def compute_whitened_kovacs_sde(power_arr: np.ndarray, window_pts: int = 501) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Converts Astropy quadratic log-likelihood power (0.5 * dChi^2) into linear Signal Residue (SR),
+    removes the low-frequency 1/f periodogram ramp via a running median filter, and normalizes by MAD.
+    Returns: (sde_array, whitened_sr_array)
+    """
+    sr = np.sqrt(2.0 * np.maximum(0.0, np.asarray(power_arr, dtype=np.float64)))
+    win = min(window_pts, (len(sr) // 4) * 2 + 1)
+    if win >= 11:
+        local_baseline = median_filter(sr, size=win, mode="nearest")
+    else:
+        local_baseline = np.nanmedian(sr)
+        
+    sr_whitened = sr - local_baseline
+    med_w = float(np.nanmedian(sr_whitened))
+    mad_w = float(1.4826 * np.nanmedian(np.abs(sr_whitened - med_w)) + 1e-12)
+    sde_arr = (sr_whitened - med_w) / mad_w
+    return sde_arr, sr_whitened
+
+
+def scan_full_orbit_secondary_eclipse(
+    t: np.ndarray,
+    flat_f: np.ndarray,
+    period: float,
+    t0: float,
+    dur: float,
+    primary_depth_ppm: float
+) -> tuple[bool, float, float, float, float]:
+    """
+    Scans all out-of-transit orbital phases phi in [min_phi, 1 - min_phi] using a sliding
+    box of width 0.85 * dur to detect eccentric secondary eclipses (e > 0.1).
+    Applies Sidak-Bonferroni trials-factor correction for alpha = 0.001 false-alarm rate.
+    Returns: (is_eb_flag, max_sec_snr, max_sec_depth_ppm, best_sec_phase, z_crit_threshold)
+    """
+    phase_0to1 = ((t - t0) % period) / period
+    dur_phase = dur / period
+    min_phi = max(0.06, 1.6 * dur_phase)
+    
+    if min_phi >= 0.45:
+        return False, 0.0, 0.0, 0.5, 4.0
+        
+    oot_mask = (phase_0to1 >= min_phi) & (phase_0to1 <= (1.0 - min_phi))
+    if np.sum(oot_mask) < 50:
+        return False, 0.0, 0.0, 0.5, 4.0
+        
+    oot_baseline = float(np.nanmedian(flat_f[oot_mask]))
+    oot_noise = float(1.4826 * np.nanmedian(np.abs(flat_f[oot_mask] - oot_baseline)) + 1e-12)
+    
+    # Number of independent duration-wide windows across the out-of-transit orbit
+    n_indep_win = max(5, int((1.0 - 2.0 * min_phi) / max(dur_phase, 0.005)))
+    # Sidak-Bonferroni critical sigma for alpha = 0.001 family-wise false-alarm rate
+    z_crit = float(stats.norm.isf(0.001 / n_indep_win))
+    
+    # Evaluate sliding box on a half-duration-spaced phase grid
+    n_steps = max(20, n_indep_win * 2)
+    trial_phases = np.linspace(min_phi + 0.5 * dur_phase, 1.0 - min_phi - 0.5 * dur_phase, n_steps)
+    half_box = 0.425 * dur_phase
+    
+    ph_oot = phase_0to1[oot_mask]
+    f_oot = flat_f[oot_mask]
+    sort_idx = np.argsort(ph_oot)
+    ph_sorted = ph_oot[sort_idx]
+    f_sorted = f_oot[sort_idx]
+    
+    left_idx = np.searchsorted(ph_sorted, trial_phases - half_box, side="left")
+    right_idx = np.searchsorted(ph_sorted, trial_phases + half_box, side="right")
+    
+    max_snr = 0.0
+    max_depth_ppm = 0.0
+    best_phi = 0.5
+    
+    for phi_c, l_i, r_i in zip(trial_phases, left_idx, right_idx):
+        n_pts = r_i - l_i
+        if n_pts < 5:
+            continue
+        dip_ppm = float((oot_baseline - np.nanmean(f_sorted[l_i:r_i])) * 1e6)
+        err_ppm = (oot_noise * 1e6) / np.sqrt(n_pts)
+        snr = dip_ppm / max(err_ppm, 1.0)
+        if snr > max_snr:
+            max_snr = snr
+            max_depth_ppm = dip_ppm
+            best_phi = float(phi_c)
+            
+    # Flag as eccentric EB if SNR exceeds trials-corrected threshold AND depth >= 12% of primary
+    is_eb = (max_snr > z_crit) and (max_depth_ppm > 220.0) and (max_depth_ppm >= 0.12 * primary_depth_ppm)
+    return is_eb, max_snr, max_depth_ppm, best_phi, z_crit
 
 
 def extract_and_stitch_arrays(lc_collection, edge_trim_days: float = 0.10) -> tuple:
@@ -674,16 +809,15 @@ def analyze_single_target(tic_id: str, sector: int, min_period: float = 0.8, max
             
         freqs = np.linspace(1.0 / max_p, 1.0 / min_period, 9000)
         periods = (1.0 / freqs)[::-1]
-        durations = np.linspace(0.035, 0.18, 12)
+        # Start durations at 0.045d (1.08h) to prevent BLS grid boundary collapse
+        durations = np.linspace(0.045, 0.18, 12)
         
         bls_model = BoxLeastSquares(t, flat_f_init, dy=flat_ferr_init)
         bls_res = bls_model.power(periods, durations)
         
-        power_arr = np.asarray(bls_res.power, dtype=np.float64)
-        med_power = float(np.nanmedian(power_arr))
-        mad_power = float(1.4826 * np.nanmedian(np.abs(power_arr - med_power)) + 1e-12)
-        
-        top_peak_indices = get_top_distinct_bls_peaks(periods, power_arr, max_peaks=MAX_PEAKS_PER_STAR)
+        # Kovács et al. (2002) whitened linear Signal Residue SDE
+        sde_arr, _ = compute_whitened_kovacs_sde(bls_res.power, window_pts=501)
+        top_peak_indices = get_top_distinct_bls_peaks(periods, sde_arr, max_peaks=MAX_PEAKS_PER_STAR)
         
         star_info_cache = None
         first_reject_code = "EMPTY_LOW_SDE"
@@ -693,7 +827,7 @@ def analyze_single_target(tic_id: str, sector: int, min_period: float = 0.8, max
             best_p = float(bls_res.period[peak_idx])
             best_t0 = float(bls_res.transit_time[peak_idx])
             best_dur = float(bls_res.duration[peak_idx])
-            sde = float((power_arr[peak_idx] - med_power) / mad_power)
+            sde = float(sde_arr[peak_idx])
             
             # Filter 1: Signal Detection Efficiency (SDE >= 6.0) & Duty Cycle
             if sde < 6.0:
@@ -725,7 +859,9 @@ def analyze_single_target(tic_id: str, sector: int, min_period: float = 0.8, max
             out_tr = np.abs(phase) > (0.65 * best_dur)
             baseline = float(np.nanmedian(flat_f[out_tr]))
             depth_ppm = float((baseline - np.nanmean(flat_f[in_tr])) * 1e6)
-            true_depth_ppm = depth_ppm / max(crowdsap, 0.1)
+            # SPOC PDCSAP light curves are already corrected for aperture crowding (CROWDSAP).
+            # Do NOT divide by crowdsap again to prevent double dilution overcorrection.
+            true_depth_ppm = depth_ppm
             
             base_telemetry = f"[Peak#{rank_idx} | SDE={sde:.1f} | P={best_p:.4f}d | Depth={depth_ppm:.0f}ppm]"
             
@@ -802,20 +938,34 @@ def analyze_single_target(tic_id: str, sector: int, min_period: float = 0.8, max
                     first_reject_code = "REJECT_ODD_EVEN"
                     first_reject_msg = f"REJECT {base_telemetry}: Odd/Even asymmetry ({odd_even_sigma:.1f} sigma) -> EB / Gap Alias"
                 continue
+
+            # Robust individual transit consistency: require >= 60% of observed transit events to show a flux deficit
+            # Rejects random white/red noise clusters in faint stars (e.g. TIC 674490)
+            tr_orbits = np.unique(orbit_num[in_tr])
+            neg_transits = sum(
+                1 for orb in tr_orbits
+                if np.sum((orbit_num == orb) & in_tr) >= 2
+                and np.nanmean(flat_f[(orbit_num == orb) & in_tr]) < baseline
+            )
+            consistency_frac = neg_transits / max(len(tr_orbits), 1)
+            if len(tr_orbits) >= 4 and consistency_frac < 0.60:
+                if rank_idx == 1:
+                    first_reject_code = "REJECT_INCONSISTENT_TRANSITS"
+                    first_reject_msg = f"REJECT {base_telemetry}: Inconsistent individual transits ({neg_transits}/{len(tr_orbits)} show dip) -> Noise cluster"
+                continue
                 
-            # Phase 0.5 Secondary Eclipse Test (rejects self-luminous EBs like TIC 167812449 in Tier 1)
-            phase_0to1 = ((t - best_t0) % best_p) / best_p
-            sec_mask = np.abs(phase_0to1 - 0.5) < (0.45 * best_dur / best_p)
-            oot_sec_mask = (np.abs(phase_0to1 - 0.5) > (0.75 * best_dur / best_p)) & (np.abs(phase_0to1 - 0.5) < (2.5 * best_dur / best_p))
-            if np.sum(sec_mask) >= 5 and np.sum(oot_sec_mask) >= 20:
-                sec_depth_ppm = float((np.nanmedian(flat_f[oot_sec_mask]) - np.nanmean(flat_f[sec_mask])) * 1e6)
-                sec_err_ppm = float(np.nanstd(flat_f[oot_sec_mask]) / np.sqrt(np.sum(sec_mask)) * 1e6)
-                sec_snr = sec_depth_ppm / max(sec_err_ppm, 1.0)
-                if sec_snr > 3.2 and sec_depth_ppm > 220:
-                    if rank_idx == 1:
-                        first_reject_code = "REJECT_SECONDARY_ECLIPSE"
-                        first_reject_msg = f"REJECT {base_telemetry}: Secondary eclipse at Phase 0.5 ({sec_depth_ppm:.0f}ppm, {sec_snr:.1f}sigma) -> Self-luminous EB"
-                    continue
+            # Secondary Eclipse Test (full out-of-transit scan for eccentric EBs with Sidak-Bonferroni trials correction)
+            is_sec_eb, sec_snr, sec_depth_ppm, sec_phi, z_crit = scan_full_orbit_secondary_eclipse(
+                t, flat_f, best_p, best_t0, best_dur, depth_ppm
+            )
+            if is_sec_eb:
+                if rank_idx == 1:
+                    first_reject_code = "REJECT_SECONDARY_ECLIPSE"
+                    first_reject_msg = (
+                        f"REJECT {base_telemetry}: Secondary eclipse at Phase {sec_phi:.2f} "
+                        f"({sec_depth_ppm:.0f}ppm, {sec_snr:.1f}sigma > z_crit={z_crit:.1f}) -> Eccentric EB"
+                    )
+                continue
                 
             # Filter 4: Astrometric centroid stability
             dx_in, dx_out = dx[in_tr], dx[out_tr]
@@ -858,13 +1008,20 @@ def analyze_single_target(tic_id: str, sector: int, min_period: float = 0.8, max
                     first_reject_msg = f"REJECT {ext_telemetry}: Radius out of planetary bounds ({r_planet_earth:.1f} R_E > 15 R_E -> EBLM/Star)"
                 continue
                 
-            # Keplerian Transit Duration vs Stellar Density Check (catches blends like TIC 404797151)
-            max_kepler_dur_hr = calc_max_keplerian_duration_hours(best_p, r_star, m_star, rp_rs)
+            # Keplerian Transit Duration vs Stellar Density Check (accounting for e <= 0.30 and 1-sigma stellar errors)
+            nom_max_dur_hr, min_kepler_dur_hr, max_kepler_dur_hr = compute_keplerian_duration_bounds_hours(
+                best_p, r_star, star_info_cache["e_r_star"], m_star, star_info_cache["e_m_star"], rp_rs
+            )
             obs_dur_hr = best_dur * 24.0
-            if obs_dur_hr > 1.25 * max_kepler_dur_hr:
+            if obs_dur_hr > max_kepler_dur_hr:
                 if rank_idx == 1:
-                    first_reject_code = "REJECT_KEPLER_DURATION"
-                    first_reject_msg = f"REJECT {ext_telemetry}: Duration ({obs_dur_hr:.2f}h) exceeds Keplerian limit ({max_kepler_dur_hr:.2f}h) -> Blend/Subgiant"
+                    first_reject_code = "REJECT_KEPLER_DURATION_LONG"
+                    first_reject_msg = f"REJECT {ext_telemetry}: Duration ({obs_dur_hr:.2f}h) exceeds Keplerian limit ({max_kepler_dur_hr:.2f}h, nom={nom_max_dur_hr:.2f}h) -> Blend/Subgiant"
+                continue
+            if obs_dur_hr < min_kepler_dur_hr:
+                if rank_idx == 1:
+                    first_reject_code = "REJECT_KEPLER_DURATION_SHORT"
+                    first_reject_msg = f"REJECT {ext_telemetry}: Duration ({obs_dur_hr:.2f}h) is unphysically short (Keplerian min={min_kepler_dur_hr:.2f}h, nom={nom_max_dur_hr:.2f}h) -> Glitch/Pulsation"
                 continue
 
             # Filter 6: Pixel-level TPF localization & strict dipole rejection
@@ -892,11 +1049,12 @@ def analyze_single_target(tic_id: str, sector: int, min_period: float = 0.8, max
             # Generate English Vetting Summary Plot
             fig, axes = plt.subplots(2, 2, figsize=(14, 10))
             
-            axes[0, 0].plot(periods, power_arr, color="black", lw=0.8)
+            axes[0, 0].plot(periods, sde_arr, color="black", lw=0.8)
             axes[0, 0].axvline(best_p, color="red", linestyle="--", label=f"Peak #{rank_idx}: P = {refined_p:.5f} d")
+            axes[0, 0].axhline(6.0, color="gray", linestyle=":", label="SDE = 6.0")
             axes[0, 0].set_xlabel("Trial Period (days)")
-            axes[0, 0].set_ylabel("BLS Power")
-            axes[0, 0].set_title(f"BLS Periodogram: TIC {tic_id} (SDE = {sde:.1f}, N_transits = {unique_transits})")
+            axes[0, 0].set_ylabel("Kovács Whitened SDE")
+            axes[0, 0].set_title(f"BLS Whitened SDE: TIC {tic_id} (SDE = {sde:.1f}, N_transits = {unique_transits})")
             axes[0, 0].legend(loc="upper right")
             
             axes[0, 1].scatter(phase[vis], flat_f[vis], s=2, color="gray", alpha=0.35, label=f"Sector {last_sector} (2-min)")
@@ -955,6 +1113,7 @@ def analyze_single_target(tic_id: str, sector: int, min_period: float = 0.8, max
                 "period_days": round(refined_p, 6),
                 "t0_btjd": round(best_t0, 5),
                 "duration_hours": round(obs_dur_hr, 2),
+                "min_kepler_dur_hours": round(min_kepler_dur_hr, 2),
                 "max_kepler_dur_hours": round(max_kepler_dur_hr, 2),
                 "n_transits": unique_transits,
                 "depth_ppm": round(depth_ppm, 1),
@@ -976,15 +1135,20 @@ def analyze_single_target(tic_id: str, sector: int, min_period: float = 0.8, max
             )
             return tic_id, "CANDIDATE", msg, cand_data
             
+        if AUTO_PURGE_CACHE:
+            purge_target_cache(tic_id)
         return tic_id, first_reject_code, first_reject_msg, None
         
     except Exception as e:
+        if AUTO_PURGE_CACHE:
+            purge_target_cache(tic_id)
         return tic_id, "ERROR", f"ERROR: {e}", None
 
 
-if __name__ == "__main__":
+    start_banner = f"=== ALDEBARAN PIPELINE {PIPELINE_VERSION} STARTED (Workers={MAX_WORKERS}, Batch={MAX_TARGETS}) ==="
     write_log("=" * 70, print_to_console=False)
-    write_log(f"=== ALDEBARAN PIPELINE {PIPELINE_VERSION} STARTED (Workers={MAX_WORKERS}, Batch={MAX_TARGETS}) ===")
+    write_log(start_banner)
+    write_event(start_banner)
     
     active_sector, targets = select_latest_sector_and_targets(sector_list=PREFERRED_SECTORS, limit=MAX_TARGETS)
     candidates = []
@@ -1015,21 +1179,34 @@ if __name__ == "__main__":
             
             if code != "ERROR":
                 append_scanned_history(tic_id)
+            else:
+                write_event(f"ERROR [{completed}/{total}] [TIC {tic_id}]: {status_msg}")
             
             if cand_dict is not None:
                 write_log(f"\n>>> [{completed}/{total}] [TIC {tic_id}] {status_msg} <<<\n")
+                write_event(f"CANDIDATE FOUND [{completed}/{total}] [TIC {tic_id}]: {status_msg}")
                 candidates = [c for c in candidates if str(c.get("tic_id")) != str(tic_id)]
                 candidates.append(cand_dict)
                 pd.DataFrame(candidates).to_csv(REPORT_FILE, index=False)
             else:
                 write_log(f"[{completed}/{total}] [TIC {tic_id}] {status_msg}")
+
+            if completed % 500 == 0:
+                cand_cnt = len(candidates)
+                err_cnt = stats_counter.get("ERROR", 0)
+                pct = (completed / total) * 100
+                write_event(f"Progress Checkpoint: [{completed}/{total}] ({pct:.1f}%) | Candidates: {cand_cnt} | Errors: {err_cnt}")
                 
     except KeyboardInterrupt:
         write_log("\n[!] Run interrupted by user (Ctrl+C). Shutting down worker pool...")
+        write_event("Execution interrupted by user (Ctrl+C).")
         executor.shutdown(wait=False, cancel_futures=True)
     else:
         executor.shutdown(wait=True)
         
     summary_str = " | ".join(f"{k}: {v}" for k, v in sorted(stats_counter.items()))
-    write_log(f"\nRun Summary (Sector {active_sector}, {completed}/{total} processed): {summary_str}")
+    final_summary = f"Run Summary (Sector {active_sector}, {completed}/{total} processed): {summary_str}"
+    write_log(f"\n{final_summary}")
     write_log(f"Total candidates saved: {len(candidates)}. Output folder: '{OUTPUT_DIR}'.")
+    write_event(final_summary)
+    write_event(f"Completed Sector {active_sector}. Total candidates: {len(candidates)}.")

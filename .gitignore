@@ -1,6 +1,44 @@
+# ==============================================================================
+# ALDEBARAN / PLEIADES .gitignore
+# ==============================================================================
+
+# OS & Environment junk
+desktop.ini
+Thumbs.db
+.DS_Store
+
+# Python byte-code & virtual environments
 __pycache__/
-*.pyc
+*.py[cod]
+*$py.class
+*.so
+.venv/
+venv/
+ENV/
+env/
+
+# IDE configurations
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+
+# Large FITS & raw astronomical data
 *.fits
+*.fits.gz
+*.tar.gz
+
+# Local pipeline caches & execution logs
 tess_results/scanned_tics.txt
 tess_results/known_catalog_cache.txt
 tess_results/*.log
+*.log
+
+# Heavy generated candidate plots (prevents bloating git repository)
+tess_results/*.png
+tess_results/deep_vetting/*.png
+
+# Internal AI context & local dev notes (not needed for public repo users)
+PROJECT_CONTEXT.md
+*.tmp
+*.bak

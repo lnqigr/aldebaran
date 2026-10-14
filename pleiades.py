@@ -13,7 +13,11 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from scipy import stats
 from scipy.optimize import curve_fit
+from scipy.ndimage import median_filter
 from astropy.timeseries import BoxLeastSquares
+from astropy.coordinates import SkyCoord
+import astropy.units as u
+from astroquery.vizier import Vizier
 import lightkurve as lk
 from astroquery.mast import Catalogs
 
@@ -22,6 +26,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 os.environ["PYTHONWARNINGS"] = "ignore::UserWarning"
 warnings.filterwarnings("ignore", category=UserWarning)
 
+PIPELINE_VERSION = "v2.2"
 INPUT_CSV = os.path.join("tess_results", "candidates_report.csv")
 VET_DIR = os.path.join("tess_results", "deep_vetting")
 os.makedirs(VET_DIR, exist_ok=True)
@@ -77,6 +82,138 @@ def calc_max_keplerian_duration_hours(p_days: float, r_star_sun: float, m_star_s
     return float(t14_sec / 3600.0)
 
 
+def compute_keplerian_duration_bounds_hours(
+    p_days: float, r_star: float, e_r_star: float, m_star: float, e_m_star: float, rp_rs: float
+) -> tuple[float, float, float]:
+    """
+    Returns (nominal_circular_max_hr, strict_lower_bound_hr, eccentric_upper_bound_hr)
+    accounting for 1-sigma TIC stellar uncertainties (e_rad, e_mass) and e <= 0.30 eccentricity.
+    """
+    nom_max_hr = calc_max_keplerian_duration_hours(p_days, r_star, m_star, rp_rs)
+    
+    r_upper = r_star + max(e_r_star, 0.08 * r_star)
+    m_lower = max(0.08, m_star - max(e_m_star, 0.10 * m_star))
+    upper_circ_hr = calc_max_keplerian_duration_hours(p_days, r_upper, m_lower, rp_rs)
+    
+    r_lower = max(0.08, r_star - max(e_r_star, 0.08 * r_star))
+    m_upper = m_star + max(e_m_star, 0.10 * m_star)
+    lower_circ_hr = calc_max_keplerian_duration_hours(p_days, r_lower, m_upper, rp_rs)
+    
+    return nom_max_hr, 0.35 * lower_circ_hr, 1.38 * upper_circ_hr
+
+
+def scan_full_orbit_secondary_eclipse(
+    t: np.ndarray,
+    flat_f: np.ndarray,
+    period: float,
+    t0: float,
+    dur: float,
+    primary_depth_ppm: float
+) -> tuple[bool, float, float, float, float]:
+    """
+    Scans all out-of-transit orbital phases phi in [min_phi, 1 - min_phi] using a sliding
+    box of width 0.85 * dur to detect eccentric secondary eclipses (e > 0.1).
+    Applies Sidak-Bonferroni trials-factor correction for alpha = 0.001 false-alarm rate.
+    Returns: (is_eb_flag, max_sec_snr, max_sec_depth_ppm, best_sec_phase, z_crit_threshold)
+    """
+    phase_0to1 = ((t - t0) % period) / period
+    dur_phase = dur / period
+    min_phi = max(0.06, 1.6 * dur_phase)
+    
+    if min_phi >= 0.45:
+        return False, 0.0, 0.0, 0.5, 4.0
+        
+    oot_mask = (phase_0to1 >= min_phi) & (phase_0to1 <= (1.0 - min_phi))
+    if np.sum(oot_mask) < 50:
+        return False, 0.0, 0.0, 0.5, 4.0
+        
+    oot_baseline = float(np.nanmedian(flat_f[oot_mask]))
+    oot_noise = float(1.4826 * np.nanmedian(np.abs(flat_f[oot_mask] - oot_baseline)) + 1e-12)
+    
+    n_indep_win = max(5, int((1.0 - 2.0 * min_phi) / max(dur_phase, 0.005)))
+    z_crit = float(stats.norm.isf(0.001 / n_indep_win))
+    
+    n_steps = max(20, n_indep_win * 2)
+    trial_phases = np.linspace(min_phi + 0.5 * dur_phase, 1.0 - min_phi - 0.5 * dur_phase, n_steps)
+    half_box = 0.425 * dur_phase
+    
+    ph_oot = phase_0to1[oot_mask]
+    f_oot = flat_f[oot_mask]
+    sort_idx = np.argsort(ph_oot)
+    ph_sorted = ph_oot[sort_idx]
+    f_sorted = f_oot[sort_idx]
+    
+    left_idx = np.searchsorted(ph_sorted, trial_phases - half_box, side="left")
+    right_idx = np.searchsorted(ph_sorted, trial_phases + half_box, side="right")
+    
+    max_snr = 0.0
+    max_depth_ppm = 0.0
+    best_phi = 0.5
+    
+    for phi_c, l_i, r_i in zip(trial_phases, left_idx, right_idx):
+        n_pts = r_i - l_i
+        if n_pts < 5:
+            continue
+        dip_ppm = float((oot_baseline - np.nanmean(f_sorted[l_i:r_i])) * 1e6)
+        err_ppm = (oot_noise * 1e6) / np.sqrt(n_pts)
+        snr = dip_ppm / max(err_ppm, 1.0)
+        if snr > max_snr:
+            max_snr = snr
+            max_depth_ppm = dip_ppm
+            best_phi = float(phi_c)
+            
+    is_eb = (max_snr > z_crit) and (max_depth_ppm > 220.0) and (max_depth_ppm >= 0.12 * primary_depth_ppm)
+    return is_eb, max_snr, max_depth_ppm, best_phi, z_crit
+
+
+def check_binary_catalogs(ra: float, dec: float) -> dict:
+    """
+    Cross-matches target against VizieR TESS Eclipsing Binary Catalogue (Prša et al. 2022)
+    and Gaia DR3 Non-Single Star (NSS) Two-Body Orbit Table.
+    """
+    res = {
+        "is_tess_eb": False,
+        "tess_eb_tic": None,
+        "tess_eb_period": None,
+        "is_gaia_nss": False,
+        "gaia_nss_type": None,
+        "gaia_nss_period": None
+    }
+    # 1. VizieR TESS Eclipsing Binary Catalogue (Prša et al. 2022, ApJS, 258, 16)
+    try:
+        v = Vizier(columns=["TIC", "Per", "Morph"], row_limit=1)
+        coord = SkyCoord(ra, dec, unit="deg", frame="icrs")
+        v_res = v.query_region(coord, radius=8.0 * u.arcsec, catalog="J/ApJS/258/16/tess-ebs")
+        if len(v_res) > 0 and len(v_res[0]) > 0:
+            res["is_tess_eb"] = True
+            res["tess_eb_tic"] = str(v_res[0]["TIC"][0])
+            res["tess_eb_period"] = safe_float(v_res[0]["Per"][0], None)
+    except Exception:
+        pass
+
+    # 2. Gaia DR3 Non-Single Star (NSS) Two-Body Orbit Table
+    try:
+        adql_nss = (
+            f"SELECT TOP 1 n.nss_solution_type, n.period FROM gaiadr3.nss_two_body_orbit AS n "
+            f"JOIN gaiadr3.gaia_source AS g ON n.source_id=g.source_id "
+            f"WHERE 1=CONTAINS(POINT('ICRS', g.ra, g.dec), CIRCLE('ICRS', {ra}, {dec}, 0.001))"
+        )
+        url_nss = (
+            "https://gea.esac.esa.int/tap-server/tap/sync?REQUEST=doQuery"
+            f"&LANG=ADQL&FORMAT=csv&QUERY={urllib.parse.quote(adql_nss)}"
+        )
+        df_nss = fetch_csv_no_ssl(url_nss)
+        if len(df_nss) > 0 and "nss_solution_type" in df_nss.columns:
+            sol = str(df_nss["nss_solution_type"].iloc[0]).strip()
+            if sol and sol.upper() != "NAN":
+                res["is_gaia_nss"] = True
+                res["gaia_nss_type"] = sol
+                res["gaia_nss_period"] = safe_float(df_nss["period"].iloc[0], None)
+    except Exception:
+        pass
+    return res
+
+
 def tukey_biweight_detrend(t: np.ndarray, f: np.ndarray, window_days: float = 0.75, mask: np.ndarray = None) -> np.ndarray:
     """Wotan-style Tukey's biweight time-windowed slider."""
     if mask is None:
@@ -119,8 +256,8 @@ def tukey_biweight_detrend(t: np.ndarray, f: np.ndarray, window_days: float = 0.
 
 def exact_annulus_transit_model(phase: np.ndarray, rp_rs: float, b: float, dur_total: float, u1: float, u2: float) -> np.ndarray:
     """
-    High-precision Mandel-Agol transit model using 60-ring radial annulus integration
-    across the quadratic limb-darkened stellar disk. Accurate for both small and giant planets.
+    High-precision Mandel-Agol transit model using 300-ring radial annulus integration
+    across the quadratic limb-darkened stellar disk. Sub-ppm accurate without staircase artifacts.
     """
     rp_rs = float(np.clip(rp_rs, 0.001, 0.35))
     b = float(np.clip(b, 0.0, 0.999))
@@ -135,7 +272,7 @@ def exact_annulus_transit_model(phase: np.ndarray, rp_rs: float, b: float, dur_t
     if not np.any(in_disk):
         return flux
         
-    n_rings = 60
+    n_rings = 300
     r_edges = np.linspace(0.0, 1.0, n_rings + 1)
     r_centers = 0.5 * (r_edges[:-1] + r_edges[1:])
     ring_areas = np.pi * (r_edges[1:] ** 2 - r_edges[:-1] ** 2)
@@ -166,7 +303,11 @@ def exact_annulus_transit_model(phase: np.ndarray, rp_rs: float, b: float, dur_t
 
 
 def query_gaia_contamination(tic_id: str, depth_ppm: float) -> dict:
-    info = {"n_neighbors": 0, "contamination_ratio": 0.0, "neb_capable_stars": 0, "target_gmag": np.nan, "ruwe": np.nan}
+    info = {
+        "n_neighbors": 0, "contamination_ratio": 0.0, "neb_capable_stars": 0, "target_gmag": np.nan, "ruwe": np.nan,
+        "is_tess_eb": False, "tess_eb_tic": None, "tess_eb_period": None,
+        "is_gaia_nss": False, "gaia_nss_type": None, "gaia_nss_period": None
+    }
     try:
         tic_data = Catalogs.query_criteria(catalog="Tic", ID=int(tic_id))
         if len(tic_data) == 0:
@@ -174,6 +315,10 @@ def query_gaia_contamination(tic_id: str, depth_ppm: float) -> dict:
         row = tic_data[0]
         ra = float(to_numpy(row["ra"]))
         dec = float(to_numpy(row["dec"]))
+        
+        # Cross-match against VizieR TESS EB & Gaia DR3 NSS binary tables
+        bin_cats = check_binary_catalogs(ra, dec)
+        info.update(bin_cats)
         
         adql = (
             f"SELECT TOP 100 ra, dec, phot_g_mean_mag, ruwe, "
@@ -232,7 +377,7 @@ def deep_vet_target(cand_row: dict) -> dict | None:
     depth_init_ppm = safe_float(cand_row.get("depth_ppm"), 1000.0)
     
     print(f"\n======================================================================")
-    print(f"DEEP SCIENTIFIC VETTING v2.0: TIC {tic_id} (Initial P = {p_init:.5f} d)")
+    print(f"PLEIADES DEEP SCIENTIFIC VETTING {PIPELINE_VERSION}: TIC {tic_id} (Initial P = {p_init:.5f} d)")
     print(f"======================================================================")
     
     search_res = lk.search_lightcurve(f"TIC {tic_id}", mission="TESS", author="SPOC", exptime=120)
@@ -276,7 +421,7 @@ def deep_vet_target(cand_row: dict) -> dict | None:
     
     phase = ((t - t0_ref + 0.5 * p_ref) % p_ref) - 0.5 * p_ref
     
-    print(f"[2/4] Fitting 60-Ring Annular Limb-Darkened Transit Model (Teff={teff:.0f} K, R*={r_star:.2f} R_Sun)...")
+    print(f"[2/4] Fitting 300-Ring Annular Limb-Darkened Transit Model (Teff={teff:.0f} K, R*={r_star:.2f} R_Sun)...")
     u1_est = float(np.clip(0.45 - 0.00008 * (teff - 5500.0), 0.15, 0.70))
     u2_est = float(np.clip(0.25 + 0.00003 * (teff - 5500.0), 0.05, 0.45))
     
@@ -285,20 +430,25 @@ def deep_vet_target(cand_row: dict) -> dict | None:
     f_fit = f[fit_win]
     
     rp_rs_guess = float(np.sqrt(max(1e-5, depth_init_ppm * 1e-6)))
-    max_kep_dur_days = calc_max_keplerian_duration_hours(p_ref, r_star, m_star, rp_rs_guess) / 24.0
-    upper_dur_bound = max(dur_ref * 0.7, min(dur_ref * 1.5, 1.25 * max_kep_dur_days))
+    e_r_star = safe_float(cand_row.get("e_r_star_sun"), 0.10 * r_star)
+    e_m_star = safe_float(cand_row.get("e_m_star_sun"), 0.12 * m_star)
+    nom_max_dur_hr, min_kepler_dur_hr, max_kepler_dur_hr = compute_keplerian_duration_bounds_hours(
+        p_ref, r_star, e_r_star, m_star, e_m_star, rp_rs_guess
+    )
+    upper_dur_bound = max(dur_ref * 0.7, min(dur_ref * 1.6, max_kepler_dur_hr / 24.0))
+    lower_dur_bound = max(0.005, min(dur_ref * 0.5, min_kepler_dur_hr / 24.0))
     
     def model_to_fit(ph, rp_rs, b, dur_t):
         return exact_annulus_transit_model(ph, rp_rs, b, dur_t, u1_est, u2_est)
         
     try:
-        p0_dur = np.clip(dur_ref, dur_ref * 0.6, upper_dur_bound * 0.98)
+        p0_dur = np.clip(dur_ref, lower_dur_bound * 1.05, upper_dur_bound * 0.98)
         popt, _ = curve_fit(
             model_to_fit,
             ph_fit,
             f_fit,
             p0=[rp_rs_guess, 0.3, p0_dur],
-            bounds=([0.002, 0.0, dur_ref * 0.5], [0.30, 0.98, upper_dur_bound]),
+            bounds=([0.002, 0.0, lower_dur_bound], [0.30, 0.98, upper_dur_bound]),
             maxfev=6000
         )
         rp_rs_fit, b_fit, dur_fit = float(popt[0]), float(popt[1]), float(popt[2])
@@ -306,21 +456,15 @@ def deep_vet_target(cand_row: dict) -> dict | None:
         rp_rs_fit, b_fit, dur_fit = rp_rs_guess, 0.5, dur_ref
         
     true_rp_earth = r_star * rp_rs_fit * 109.076
-    dur_ratio_kepler = (dur_fit * 24.0) / max(max_kep_dur_days * 24.0, 0.1)
+    dur_ratio_kepler = (dur_fit * 24.0) / max(nom_max_dur_hr, 0.1)
     
-    print(f"[3/4] Running Secondary Eclipse & Phase Curve test at Phase = 0.5...")
-    phase_0to1 = ((t - t0_ref) % p_ref) / p_ref
-    sec_mask = np.abs(phase_0to1 - 0.5) < (0.5 * dur_fit / p_ref)
-    oot_sec_mask = (np.abs(phase_0to1 - 0.5) > (0.8 * dur_fit / p_ref)) & (np.abs(phase_0to1 - 0.5) < (2.5 * dur_fit / p_ref))
+    print(f"[3/4] Scanning Full-Orbit Secondary Eclipse across all out-of-transit phases...")
+    is_sec_eb, sec_snr, sec_depth_ppm, sec_phi, z_crit = scan_full_orbit_secondary_eclipse(
+        t, f, p_ref, t0_ref, dur_fit, depth_init_ppm
+    )
+    sec_center_phi = sec_phi if np.isfinite(sec_phi) else 0.5
     
-    if np.sum(sec_mask) > 5 and np.sum(oot_sec_mask) > 10:
-        sec_depth_ppm = float((np.nanmedian(f[oot_sec_mask]) - np.nanmean(f[sec_mask])) * 1e6)
-        sec_err_ppm = float(np.nanstd(f[oot_sec_mask]) / np.sqrt(np.sum(sec_mask)) * 1e6)
-        sec_snr = sec_depth_ppm / max(sec_err_ppm, 1.0)
-    else:
-        sec_depth_ppm, sec_snr = 0.0, 0.0
-        
-    print(f"[4/4] Querying Gaia DR3 neighborhood (r = 120\") & computing Heuristic FP Risk Score...")
+    print(f"[4/4] Querying Gaia DR3 neighborhood, NSS two-body & VizieR TESS EB catalogs...")
     gaia_contam = query_gaia_contamination(tic_id, depth_init_ppm)
     
     # Composite Heuristic False-Positive Risk Score (0.0% = clean, 100% = definite FP)
@@ -329,23 +473,56 @@ def deep_vet_target(cand_row: dict) -> dict | None:
         risk_score += 25.0 * ((b_fit - 0.75) / 0.25) ** 2
     if sec_snr > 2.2:
         risk_score += 45.0 * (sec_snr / 3.0)
+    if is_sec_eb:
+        risk_score += 65.0
+    if gaia_contam.get("is_tess_eb"):
+        risk_score += 90.0
+    if gaia_contam.get("is_gaia_nss"):
+        risk_score += 80.0
     if gaia_contam["neb_capable_stars"] > 0:
         risk_score += 8.0 * gaia_contam["neb_capable_stars"]
     if gaia_contam["contamination_ratio"] > 0.25:
         risk_score += 35.0 * gaia_contam["contamination_ratio"]
-    if dur_ratio_kepler > 1.20:
+    if dur_ratio_kepler > 1.38:
         risk_score += 40.0 * (dur_ratio_kepler - 1.0)
+    elif dur_ratio_kepler < 0.35:
+        risk_score += 85.0 * ((0.35 - dur_ratio_kepler) / 0.35)
     if np.isfinite(gaia_contam["ruwe"]) and gaia_contam["ruwe"] > 1.25:
         risk_score += 15.0
     risk_pct = float(np.clip(risk_score, 0.1, 99.9))
     
-    is_clean = (risk_pct < 5.0 and b_fit < 0.82 and sec_snr < 2.5 and dur_ratio_kepler <= 1.25)
-    disposition = "TIER-2 VETTED CANDIDATE (Low FP Risk)" if is_clean else "SUSPECT / GRAZING OR CONTAMINATED"
+    is_clean = (
+        risk_pct < 5.0
+        and b_fit < 0.82
+        and sec_snr < 2.5
+        and not is_sec_eb
+        and not gaia_contam.get("is_tess_eb")
+        and not gaia_contam.get("is_gaia_nss")
+        and 0.35 <= dur_ratio_kepler <= 1.38
+    )
+    if gaia_contam.get("is_tess_eb"):
+        disposition = f"CONFIRMED FP / CATALOGED TESS EB (TIC {gaia_contam.get('tess_eb_tic')})"
+    elif gaia_contam.get("is_gaia_nss"):
+        disposition = f"CONFIRMED FP / GAIA NSS BINARY ({gaia_contam.get('gaia_nss_type')})"
+    elif is_sec_eb:
+        disposition = f"CONFIRMED FP / ECCENTRIC EB (Phase {sec_center_phi:.2f}, {sec_snr:.1f} sigma)"
+    elif dur_ratio_kepler < 0.35:
+        disposition = "SUSPECT / UNPHYSICALLY NARROW TRANSIT"
+    elif dur_ratio_kepler > 1.38:
+        disposition = "SUSPECT / UNPHYSICALLY LONG TRANSIT (Subgiant/Blend)"
+    elif is_clean:
+        disposition = "TIER-2 VETTED CANDIDATE (Low FP Risk)"
+    else:
+        disposition = "SUSPECT / GRAZING OR CONTAMINATED"
     
     print(f"      -> Fitted Radius: Rp = {true_rp_earth:.2f} R_Earth (Rp/R* = {rp_rs_fit:.4f})")
-    print(f"      -> Impact Parameter: b = {b_fit:.3f} | Duration / Max_Kepler = {dur_ratio_kepler:.2f}")
-    print(f"      -> Secondary Eclipse at Phase 0.5: Depth = {sec_depth_ppm:.0f} ppm (SNR = {sec_snr:.2f} sigma)")
-    print(f"      -> Gaia DR3 Neighbors (120\"): {gaia_contam['n_neighbors']} stars | Flux Contamination = {gaia_contam['contamination_ratio']*100:.2f}%")
+    print(f"      -> Impact Parameter: b = {b_fit:.3f} | Duration / Nom_Kepler = {dur_ratio_kepler:.2f}")
+    print(f"      -> Secondary Eclipse: Depth = {sec_depth_ppm:.0f} ppm at Phase {sec_center_phi:.2f} (SNR = {sec_snr:.2f} sigma)")
+    print(f"      -> Gaia DR3 Neighbors (120\"): {gaia_contam['n_neighbors']} stars | Contamination = {gaia_contam['contamination_ratio']*100:.2f}%")
+    if gaia_contam.get("is_tess_eb"):
+        print(f"      -> [!] VizieR TESS EB Match: TIC {gaia_contam.get('tess_eb_tic')} (P={gaia_contam.get('tess_eb_period')} d)")
+    if gaia_contam.get("is_gaia_nss"):
+        print(f"      -> [!] Gaia NSS Two-Body Orbit: {gaia_contam.get('gaia_nss_type')} (P={gaia_contam.get('gaia_nss_period')} d)")
     print(f"      -> Heuristic FP Risk Score: {risk_pct:.1f}% -> {disposition}")
     
     fig, axes = plt.subplots(2, 2, figsize=(15, 10))
@@ -362,25 +539,27 @@ def deep_vet_target(cand_row: dict) -> dict | None:
         color="crimson",
         lw=2.5,
         zorder=5,
-        label=f"60-Ring Fit (b={b_fit:.2f}, Rp={true_rp_earth:.2f} R_E)"
+        label=f"300-Ring Fit (b={b_fit:.2f}, Rp={true_rp_earth:.2f} R_E)"
     )
     axes[0, 0].set_xlabel("Time from Mid-Transit (hours)")
     axes[0, 0].set_ylabel("Relative Flux")
     axes[0, 0].set_title(f"TIC {tic_id}: Annular Limb-Darkened Transit Model (Sectors {sectors_used})")
     axes[0, 0].legend(loc="lower right")
     
-    sec_win = np.abs(phase_0to1 - 0.5) <= min(0.12, 3.0 * dur_fit / p_ref)
-    ph_sec_hrs = (phase_0to1[sec_win] - 0.5) * p_ref * 24.0
+    phase_0to1 = ((t - t0_ref) % p_ref) / p_ref
+    sec_phase_diff = ((phase_0to1 - sec_center_phi + 0.5) % 1.0) - 0.5
+    sec_win = np.abs(sec_phase_diff) <= min(0.12, 3.0 * dur_fit / p_ref)
+    ph_sec_hrs = sec_phase_diff[sec_win] * p_ref * 24.0
     axes[0, 1].scatter(ph_sec_hrs, f[sec_win], s=3, color="silver", alpha=0.4)
     if len(ph_sec_hrs) > 20:
         s_bins = np.linspace(np.min(ph_sec_hrs), np.max(ph_sec_hrs), 25)
         s_means, s_edges, _ = stats.binned_statistic(ph_sec_hrs, f[sec_win], statistic="mean", bins=s_bins)
         s_centers = 0.5 * (s_edges[:-1] + s_edges[1:])
-        axes[0, 1].plot(s_centers, s_means, color="royalblue", lw=2, label=f"Phase 0.5 Binned (SNR={sec_snr:.1f} sigma)")
+        axes[0, 1].plot(s_centers, s_means, color="royalblue", lw=2, label=f"Phase {sec_center_phi:.2f} Binned (SNR={sec_snr:.1f} sigma)")
     axes[0, 1].axhline(1.0, color="black", linestyle="--", alpha=0.6)
-    axes[0, 1].set_xlabel("Time from Secondary Phase 0.5 (hours)")
+    axes[0, 1].set_xlabel(f"Time from Secondary Phase {sec_center_phi:.2f} (hours)")
     axes[0, 1].set_ylabel("Relative Flux")
-    axes[0, 1].set_title(f"Secondary Eclipse Test (Self-Luminous EB Check: {sec_depth_ppm:.0f} ppm)")
+    axes[0, 1].set_title(f"Secondary Eclipse Scan (Max Dip at Phase {sec_center_phi:.2f}: {sec_depth_ppm:.0f} ppm)")
     axes[0, 1].legend(loc="lower right")
     
     orbit_nums = np.round((t - t0_ref) / p_ref).astype(int)
@@ -398,21 +577,25 @@ def deep_vet_target(cand_row: dict) -> dict | None:
     
     axes[1, 1].axis("off")
     ruwe_str = f"{gaia_contam['ruwe']:.3f}" if np.isfinite(gaia_contam["ruwe"]) else "N/A"
+    eb_match_str = f"TIC {gaia_contam.get('tess_eb_tic')} (P={gaia_contam.get('tess_eb_period', 'N/A')}d)" if gaia_contam.get("is_tess_eb") else "None"
+    nss_match_str = f"{gaia_contam.get('gaia_nss_type')} (P={gaia_contam.get('gaia_nss_period', 'N/A')}d)" if gaia_contam.get("is_gaia_nss") else "None"
     summary_text = (
         f"SCIENTIFIC VETTING DOSSIER: TIC {tic_id}\n"
         f"{'-'*48}\n"
         f"Disposition:       {disposition}\n"
         f"Heuristic FP Risk: {risk_pct:.1f}% (Clean Threshold < 5.0%)\n\n"
-        f"ORBITAL & PHYSICAL PARAMETERS (60-Ring Fit):\n"
+        f"ORBITAL & PHYSICAL PARAMETERS (300-Ring Fit):\n"
         f"  Refined Period:  {p_ref:.6f} days\n"
         f"  Mid-Transit T0:  {t0_ref:.5f} BTJD\n"
-        f"  Transit Dur:     {dur_fit*24.0:.2f} h (Max Keplerian: {max_kep_dur_days*24.0:.2f} h)\n"
+        f"  Transit Dur:     {dur_fit*24.0:.2f} h (Kepler Bounds: {min_kepler_dur_hr:.2f}h - {max_kepler_dur_hr:.2f}h)\n"
         f"  Radius Ratio:    Rp/R* = {rp_rs_fit:.4f}\n"
         f"  Planet Radius:   Rp = {true_rp_earth:.2f} R_Earth\n"
         f"  Impact Param:    b = {b_fit:.3f} (0=central, >0.82=grazing)\n"
         f"  Limb Darkening:  u1 = {u1_est:.2f}, u2 = {u2_est:.2f} (Teff={teff:.0f} K)\n\n"
         f"FALSE POSITIVE FALSIFICATION TESTS:\n"
-        f"  Secondary Ecl:   {sec_depth_ppm:.0f} ppm ({sec_snr:.2f} sigma at Phase 0.5)\n"
+        f"  Secondary Ecl:   {sec_depth_ppm:.0f} ppm ({sec_snr:.2f} sigma at Phase {sec_center_phi:.2f})\n"
+        f"  TESS EB Match:   {eb_match_str}\n"
+        f"  Gaia NSS Orbit:  {nss_match_str}\n"
         f"  Odd/Even Diff:   {cand_row.get('odd_even_sigma', 'N/A')} sigma\n"
         f"  Centroid Shift:  {cand_row.get('centroid_shift_arcsec', 'N/A')} arcsec\n"
         f"  Gaia DR3 RUWE:   {ruwe_str}\n"
@@ -437,6 +620,9 @@ def deep_vet_target(cand_row: dict) -> dict | None:
         "impact_param_b": round(b_fit, 3),
         "dur_to_kepler_max": round(dur_ratio_kepler, 2),
         "secondary_snr_sigma": round(sec_snr, 2),
+        "sec_eclipse_phase": round(sec_center_phi, 3),
+        "is_known_tess_eb": gaia_contam.get("is_tess_eb", False),
+        "gaia_nss_type": gaia_contam.get("gaia_nss_type"),
         "flux_contam_percent": round(gaia_contam["contamination_ratio"] * 100, 2),
         "neb_capable_neighbors": gaia_contam["neb_capable_stars"],
         "sectors_stitched": ",".join(str(s) for s in sectors_used)
@@ -448,7 +634,7 @@ if __name__ == "__main__":
         print(f"File '{INPUT_CSV}' not found. Run aldebaran.py first.")
     else:
         df_cands = pd.read_csv(INPUT_CSV)
-        print(f"Loaded {len(df_cands)} candidates from '{INPUT_CSV}' for Tier-2 Deep Vetting v2.0.")
+        print(f"Loaded {len(df_cands)} candidates from '{INPUT_CSV}' for Pleiades Tier-2 Deep Vetting {PIPELINE_VERSION}.")
         vet_results = []
         for _, row in df_cands.iterrows():
             try:
@@ -460,4 +646,4 @@ if __name__ == "__main__":
         if vet_results:
             out_csv = os.path.join(VET_DIR, "scientific_dossier_summary.csv")
             pd.DataFrame(vet_results).to_csv(out_csv, index=False)
-            print(f"\nDeep vetting complete! Dossiers saved to '{VET_DIR}'.")
+            print(f"\nPleiades deep vetting complete! Dossiers saved to '{VET_DIR}'.")
