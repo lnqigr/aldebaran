@@ -1156,6 +1156,7 @@ def analyze_single_target(tic_id: str, sector: int, min_period: float = 0.8, max
         return tic_id, "ERROR", f"ERROR: {e}", None
 
 
+if __name__ == "__main__":
     start_banner = f"=== ALDEBARAN PIPELINE {PIPELINE_VERSION} STARTED (Workers={MAX_WORKERS}, Batch={MAX_TARGETS}) ==="
     write_log("=" * 70, print_to_console=False)
     write_log(start_banner)
