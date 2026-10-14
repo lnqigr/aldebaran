@@ -40,5 +40,7 @@ tess_results/deep_vetting/*.png
 
 # Internal AI context & local dev notes (not needed for public repo users)
 PROJECT_CONTEXT.md
+tess_results/archive*/
+tess_results/archive/
 *.tmp
 *.bak

@@ -46,7 +46,7 @@ PREFERRED_SECTORS = [
     98, 106, 105, 104, 103, 102, 101, 100, 99,
     97, 96, 95, 94, 93, 92, 91, 90, 89, 88, 87, 86, 85, 84, 83, 82, 81, 80
 ]
-MAX_TARGETS = 2500        # Number of stars to scan per run
+MAX_TARGETS = 1000        # Number of stars to scan per run
 MAX_WORKERS = 16          # Optimal for i9-14900HX without triggering NASA MAST HTTP rate-limits
 MAX_PEAKS_PER_STAR = 3    # Inspect top 3 distinct BLS peaks per star before rejecting
 PRIORITY_TICS = []        # Add specific TIC IDs here to force-test them first
@@ -134,6 +134,17 @@ def get_known_exoplanet_tics() -> set:
             write_log(f"      -> Loaded {len(ctois)} Community TOI (CTOI) targets.")
     except Exception as e:
         write_log(f"      [!] Warning: Could not load ExoFOP CTOI table (using cache): {e}")
+
+    write_log("[4/5] Fetching TESS Eclipsing Binary Catalogue (Prša et al. 2022) from VizieR TAP...")
+    try:
+        adql_eb = 'SELECT distinct TIC FROM "J/ApJS/258/16/tess-ebs"'
+        eb_url = "https://tapvizier.cds.unistra.fr/TAPVizieR/tap/sync?REQUEST=doQuery&LANG=ADQL&FORMAT=csv&QUERY=" + urllib.parse.quote(adql_eb)
+        df_eb = fetch_csv_with_headers(eb_url)
+        eb_tics = set(df_eb["TIC"].dropna().astype(int).astype(str))
+        known_tics.update(eb_tics)
+        write_log(f"      -> Loaded {len(eb_tics)} cataloged TESS Eclipsing Binary (EB) stars.")
+    except Exception as e:
+        write_log(f"      [!] Warning: Could not load VizieR TESS EB table (using cache): {e}")
 
     if known_tics:
         try:
