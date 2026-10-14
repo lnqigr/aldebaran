@@ -531,11 +531,26 @@ def deep_vet_target(cand_row: dict) -> dict | None:
     fig, axes = plt.subplots(2, 2, figsize=(15, 10))
     
     ph_grid = np.linspace(-2.2 * dur_fit, 2.2 * dur_fit, 500)
-    axes[0, 0].scatter(ph_fit * 24.0, f_fit, s=3, color="silver", alpha=0.4, label="Tukey Biweight Cadences")
+    axes[0, 0].scatter(ph_fit * 24.0, f_fit, s=3, color="silver", alpha=0.35, label="Tukey Biweight Cadences")
     bins = np.linspace(-2.2 * dur_fit, 2.2 * dur_fit, 35)
     b_means, b_edges, _ = stats.binned_statistic(ph_fit, f_fit, statistic="mean", bins=bins)
+    b_std, _, _ = stats.binned_statistic(ph_fit, f_fit, statistic="std", bins=bins)
+    b_cnt, _, _ = stats.binned_statistic(ph_fit, f_fit, statistic="count", bins=bins)
     b_centers = 0.5 * (b_edges[:-1] + b_edges[1:])
-    axes[0, 0].scatter(b_centers * 24.0, b_means, s=28, color="black", zorder=4, label="Binned Photometry")
+    valid_b = b_cnt >= 3
+    b_err = b_std[valid_b] / np.sqrt(b_cnt[valid_b])
+    axes[0, 0].errorbar(
+        b_centers[valid_b] * 24.0,
+        b_means[valid_b],
+        yerr=b_err,
+        fmt="o",
+        color="black",
+        ms=5,
+        capsize=2.5,
+        elinewidth=1.2,
+        zorder=4,
+        label="Binned Photometry (±1σ)"
+    )
     axes[0, 0].plot(
         ph_grid * 24.0,
         model_to_fit(ph_grid, rp_rs_fit, b_fit, dur_fit),
@@ -544,6 +559,16 @@ def deep_vet_target(cand_row: dict) -> dict | None:
         zorder=5,
         label=f"300-Ring Fit (b={b_fit:.2f}, Rp={true_rp_earth:.2f} R_E)"
     )
+    # Focused Y-axis zoom on the transit feature to prevent noisy outliers from squishing the curve
+    transit_depth = rp_rs_fit ** 2
+    y_min_target = 1.0 - max(0.003, 3.5 * transit_depth)
+    y_max_target = 1.0 + max(0.002, 2.0 * transit_depth)
+    if np.sum(valid_b) > 0:
+        y_min = min(y_min_target, np.nanmin(b_means[valid_b] - b_err) - 0.0005)
+        y_max = max(y_max_target, np.nanmax(b_means[valid_b] + b_err) + 0.0005)
+    else:
+        y_min, y_max = y_min_target, y_max_target
+    axes[0, 0].set_ylim(y_min, y_max)
     axes[0, 0].set_xlabel("Time from Mid-Transit (hours)")
     axes[0, 0].set_ylabel("Relative Flux")
     axes[0, 0].set_title(f"TIC {tic_id}: Annular Limb-Darkened Transit Model (Sectors {sectors_used})")

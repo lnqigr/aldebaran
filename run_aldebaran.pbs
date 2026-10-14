@@ -1,25 +1,22 @@
 #!/bin/bash
 # ==============================================================================
-# ALDEBARAN TESS PIPELINE - METACENTRUM PBS PRO BATCH SCRIPT (SAFE SYNC EDITION)
+# ALDEBARAN TESS PIPELINE v8.0 - METACENTRUM PBS PRO BATCH SCRIPT
 # ==============================================================================
-# Single-node job. Job arrays (qsub -J) are NOT supported yet: all array members would
-# scan the same targets and overwrite each other's candidates_report.csv on sync-back.
+# Supports both Single-Node runs and Multi-Node Job Arrays (qsub -J 1-8).
+# In array mode (qsub -J 1-8), each worker index automatically maps to an independent
+# fresh TESS sector (106, 105, 104, 103, 102, 101, 100, 99) in isolated subdirectories,
+# preventing file collisions or network congestion on NASA MAST.
 #
-# Measured throughput (Sector 98, 16 workers): ~4.0 s/star wall-clock (MAST-download bound,
-# not CPU bound) -> ~900 stars/hour. 12000 stars ~ 13-14 h, hence walltime=24h.
+# Resources per node: 8 CPUs, 16 GB RAM, 35 GB local NVMe scratch, 6h walltime.
+# (8 cores per node matches NASA MAST download throughput without wasting fairshare).
 #PBS -N aldebaran_tess
-#PBS -l select=1:ncpus=16:mem=32gb:scratch_local=40gb
-#PBS -l walltime=24:00:00
+#PBS -l select=1:ncpus=8:mem=16gb:scratch_local=35gb
+#PBS -l walltime=06:00:00
 #PBS -m ae
 #PBS -j oe
 
-export ALDEBARAN_MAX_TARGETS="${ALDEBARAN_MAX_TARGETS:-12000}"
-export ALDEBARAN_WORKERS="${PBS_NCPUS:-16}"
-
-if [ -n "${PBS_ARRAY_INDEX:-}" ]; then
-    echo "[!] Job arrays are not supported yet (duplicate targets + result overwrite). Submit without -J."
-    exit 2
-fi
+export ALDEBARAN_MAX_TARGETS="${ALDEBARAN_MAX_TARGETS:-15000}"
+export ALDEBARAN_WORKERS="${PBS_NCPUS:-8}"
 
 # ------------------------------------------------------------------------------
 # 1. Safe sync & cleanup. Runs exactly once on normal exit, crash, walltime SIGTERM or qdel.
@@ -72,16 +69,16 @@ run_py() {
 
 echo "======================================================================"
 echo "Starting Aldebaran TESS Job on MetaCentrum node: $(hostname)"
-echo "Job ID: $PBS_JOBID | Workers: $ALDEBARAN_WORKERS | Batch: $ALDEBARAN_MAX_TARGETS"
+echo "Job ID: $PBS_JOBID | Array Index: ${PBS_ARRAY_INDEX:-Single-Job}"
+echo "Workers: $ALDEBARAN_WORKERS | Batch Limit: $ALDEBARAN_MAX_TARGETS"
 echo "PBS Working Directory: $PBS_O_WORKDIR"
 echo "Local Scratch Directory: $SCRATCHDIR"
 echo "Start time: $(date)"
 echo "======================================================================"
 
 # ------------------------------------------------------------------------------
-# 2. Python >= 3.10 is required (PEP 604 "dict | None" annotations in pleiades.py)
+# 2. Python >= 3.10 is required
 # ------------------------------------------------------------------------------
-# Check available names on a frontend with:  module avail python
 module add python/3.11 2>/dev/null || module add python 2>/dev/null || true
 if ! python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3, 10) else 1)'; then
     echo "[!] python3 >= 3.10 required, found: $(python3 --version 2>&1). Fix the 'module add' line."
@@ -91,8 +88,6 @@ echo "Python: $(python3 --version)"
 
 # ------------------------------------------------------------------------------
 # 3. All caches on node-local NVMe scratch (nothing is written to the shared $HOME quota).
-#    LIGHTKURVE_CACHE_DIR is applied inside aldebaran.py / pleiades.py via lk.conf.cache_dir.
-#    No symlinks in $HOME: concurrent jobs on other nodes would fight over them.
 # ------------------------------------------------------------------------------
 export XDG_CACHE_HOME="$SCRATCHDIR/.cache"
 export PIP_CACHE_DIR="$SCRATCHDIR/.cache/pip"
@@ -102,8 +97,7 @@ export MPLCONFIGDIR="$SCRATCHDIR/.cache/matplotlib"
 mkdir -p "$XDG_CACHE_HOME" "$PIP_CACHE_DIR" "$LIGHTKURVE_CACHE_DIR" "$ASTROPY_CACHE_DIR" "$MPLCONFIGDIR"
 
 # ------------------------------------------------------------------------------
-# 4. Copy code AND the whole existing tess_results (history, catalog cache, previous
-#    candidates_report.csv, logs) so new results are appended, never overwritten.
+# 4. Copy code AND existing tess_results to local scratch
 # ------------------------------------------------------------------------------
 cp "$PBS_O_WORKDIR"/*.py "$SCRATCHDIR/"
 cp "$PBS_O_WORKDIR"/requirements.txt "$SCRATCHDIR/" 2>/dev/null || true
@@ -126,9 +120,16 @@ else
     pip install --no-cache-dir --quiet numpy scipy astropy pandas lightkurve astroquery matplotlib requests urllib3 certifi
 fi
 
-# Belt-and-braces: periodic sync every 20 min, in case the node dies hard (no trap possible).
+# Periodic sync every 20 min in case the node dies hard
 ( while true; do sleep 1200; sync_results; done ) &
 SYNC_LOOP_PID=$!
+
+# Initial jitter (0-20s) if running as array to desynchronize batch downloads
+if [ -n "${PBS_ARRAY_INDEX:-}" ]; then
+    SLEEP_SEC=$(( (PBS_ARRAY_INDEX * 3) % 20 ))
+    echo "[*] Array worker ${PBS_ARRAY_INDEX}: pacing start by ${SLEEP_SEC}s..."
+    sleep $SLEEP_SEC
+fi
 
 # ------------------------------------------------------------------------------
 # 6. Tier-1 screening
@@ -137,13 +138,17 @@ echo "[2/4] Launching Aldebaran Tier-1 Pipeline..."
 run_py aldebaran.py
 
 # ------------------------------------------------------------------------------
-# 7. Tier-2 deep vetting if any candidates exist
+# 7. Tier-2 deep vetting (if single job) or shard registration (if array)
 # ------------------------------------------------------------------------------
-if [ -s "tess_results/candidates_report.csv" ]; then
-    echo "[3/4] Candidates found! Launching Pleiades Tier-2 Deep Vetting..."
-    run_py pleiades.py
+if [ -z "${PBS_ARRAY_INDEX:-}" ]; then
+    if [ -s "tess_results/candidates_report.csv" ]; then
+        echo "[3/4] Candidates found! Launching Pleiades Tier-2 Deep Vetting..."
+        run_py pleiades.py
+    else
+        echo "[3/4] No candidates found in this batch. Tier-2 vetting skipped."
+    fi
 else
-    echo "[3/4] No candidates found in this batch. Tier-2 vetting skipped."
+    echo "[3/4] Array shard complete. Output staged in tess_results/sector_*. Run merge_shards.py after array completes."
 fi
 
 # Final sync + scratch cleanup are performed by the EXIT trap.

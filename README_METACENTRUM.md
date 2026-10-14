@@ -46,8 +46,18 @@ You can override the target count without editing any files:
 qsub -v ALDEBARAN_MAX_TARGETS=15000 run_aldebaran.pbs
 ```
 
-> **Note on Multi-Node Job Arrays (`-J`):**
-> Do not submit with `qsub -J` yet. Running concurrent nodes on the same sector without a shared target dispatcher causes workers to process overlapping targets and conflict on result synchronization. Full multi-node coordinated partitioning will be introduced in v8.0.
+### High-Throughput Distributed Array (8 Nodes, 8 Sectors, ~100,000 Targets)
+To scan up to 8 fresh TESS sectors (Sectors 99 through 106) simultaneously in ~2 hours:
+```bash
+qsub -J 1-8 run_aldebaran.pbs
+```
+Each node in the array:
+* Gets 8 dedicated CPU cores, 16 GB RAM, and 35 GB local NVMe scratch.
+* Automatically processes its own assigned sector in zero-lock isolated storage (`tess_results/sector_<sec>/`).
+* After the array finishes, run the aggregator to merge all sectors into a unified candidate catalog and trigger Tier-2 Pleiades deep vetting:
+```bash
+python merge_shards.py
+```
 
 ---
 

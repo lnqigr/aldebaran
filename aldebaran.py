@@ -38,7 +38,7 @@ from astropy.timeseries import BoxLeastSquares
 import lightkurve as lk
 from astroquery.mast import Observations, Catalogs
 
-PIPELINE_VERSION = "v7.7"
+PIPELINE_VERSION = "v8.0"
 AUTO_PURGE_CACHE = True       # Automatically deletes raw FITS files of non-candidates to keep cache at ~0 MB
 
 # Lightkurve does NOT read a LIGHTKURVE_CACHE_DIR env var by itself; apply it explicitly so HPC jobs
@@ -47,25 +47,36 @@ if os.environ.get("LIGHTKURVE_CACHE_DIR"):
     os.makedirs(os.environ["LIGHTKURVE_CACHE_DIR"], exist_ok=True)
     lk.conf.cache_dir = os.environ["LIGHTKURVE_CACHE_DIR"]
 
-# Finishes Sector 98 first, then automatically advances to newest released sectors (106 down to 80)
+# Newest released sectors (106 down to 80; Sector 98 is completed)
 PREFERRED_SECTORS = [
-    98, 106, 105, 104, 103, 102, 101, 100, 99,
-    97, 96, 95, 94, 93, 92, 91, 90, 89, 88, 87, 86, 85, 84, 83, 82, 81, 80
+    106, 105, 104, 103, 102, 101, 100, 99,
+    98, 97, 96, 95, 94, 93, 92, 91, 90, 89, 88, 87, 86, 85, 84, 83, 82, 81, 80
 ]
-# Both values can be overridden from the PBS script (ALDEBARAN_MAX_TARGETS / ALDEBARAN_WORKERS)
-MAX_TARGETS = int(os.environ.get("ALDEBARAN_MAX_TARGETS", 1000))   # Number of stars to scan per run
-MAX_WORKERS = int(os.environ.get("ALDEBARAN_WORKERS", 16))         # 16 is optimal for i9-14900HX without MAST rate-limits
+
+# Multi-Node PBS Array Coordinator (v8.0 Zero-Lock Sharding)
+ARRAY_IDX = int(os.environ.get("PBS_ARRAY_INDEX", "0"))
+if ARRAY_IDX > 0:
+    target_sec = PREFERRED_SECTORS[(ARRAY_IDX - 1) % len(PREFERRED_SECTORS)]
+    PREFERRED_SECTORS = [target_sec]
+    OUTPUT_DIR = os.path.join("tess_results", f"sector_{target_sec}")
+    DEFAULT_WORKERS = 8
+    DEFAULT_TARGETS = 15000
+else:
+    OUTPUT_DIR = "tess_results"
+    DEFAULT_WORKERS = 16
+    DEFAULT_TARGETS = 1000
+
+MAX_TARGETS = int(os.environ.get("ALDEBARAN_MAX_TARGETS", DEFAULT_TARGETS))
+MAX_WORKERS = int(os.environ.get("ALDEBARAN_WORKERS", DEFAULT_WORKERS))
 MAX_PEAKS_PER_STAR = 3    # Inspect top 3 distinct BLS peaks per star before rejecting
 PRIORITY_TICS = []        # Add specific TIC IDs here to force-test them first
 
-OUTPUT_DIR = "tess_results"
+os.makedirs(OUTPUT_DIR, exist_ok=True)
 HISTORY_FILE = os.path.join(OUTPUT_DIR, "scanned_tics.txt")
-CATALOG_CACHE_FILE = os.path.join(OUTPUT_DIR, "known_catalog_cache.txt")
+CATALOG_CACHE_FILE = os.path.join("tess_results", "known_catalog_cache.txt")
 REPORT_FILE = os.path.join(OUTPUT_DIR, "candidates_report.csv")
 LOG_FILE = os.path.join(OUTPUT_DIR, "pipeline_run.log")
 EVENTS_LOG_FILE = os.path.join(OUTPUT_DIR, "pipeline_events.log")
-
-os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 
 def write_log(message: str, print_to_console: bool = True):
@@ -436,9 +447,8 @@ def scan_full_orbit_secondary_eclipse(
     left_idx = np.searchsorted(ph_sorted, trial_phases - half_box, side="left")
     right_idx = np.searchsorted(ph_sorted, trial_phases + half_box, side="right")
     
-    max_snr = 0.0
-    max_depth_ppm = 0.0
-    best_phi = 0.5
+    circ_max_snr, circ_max_depth = 0.0, 0.0
+    ecc_max_snr, ecc_max_depth, ecc_best_phi = 0.0, 0.0, 0.5
     
     for phi_c, l_i, r_i in zip(trial_phases, left_idx, right_idx):
         n_pts = r_i - l_i
@@ -447,13 +457,39 @@ def scan_full_orbit_secondary_eclipse(
         dip_ppm = float((oot_baseline - np.nanmean(f_sorted[l_i:r_i])) * 1e6)
         err_ppm = (oot_noise * 1e6) / np.sqrt(n_pts)
         snr = dip_ppm / max(err_ppm, 1.0)
-        if snr > max_snr:
-            max_snr = snr
-            max_depth_ppm = dip_ppm
-            best_phi = float(phi_c)
+        
+        if abs(phi_c - 0.50) <= 0.04:
+            if snr > circ_max_snr:
+                circ_max_snr = snr
+                circ_max_depth = dip_ppm
+        else:
+            if snr > ecc_max_snr:
+                ecc_max_snr = snr
+                ecc_max_depth = dip_ppm
+                ecc_best_phi = float(phi_c)
+                
+    # Circular zone (|phi - 0.50| <= 0.04): 1 hypothesis test -> threshold SNR > 3.1
+    circ_eb = (circ_max_snr > 3.1) and (circ_max_depth > 100.0) and (circ_max_depth >= 0.10 * primary_depth_ppm)
+    # Eccentric zone (|phi - 0.50| > 0.04): N independent trials -> Sidak-Bonferroni z_crit
+    ecc_eb = (ecc_max_snr > z_crit) and (ecc_max_depth > 100.0) and (ecc_max_depth >= 0.10 * primary_depth_ppm)
+    
+    if circ_eb and (circ_max_snr >= ecc_max_snr):
+        is_eb = True
+        max_snr = circ_max_snr
+        max_depth_ppm = circ_max_depth
+        best_phi = 0.50
+    elif ecc_eb:
+        is_eb = True
+        max_snr = ecc_max_snr
+        max_depth_ppm = ecc_max_depth
+        best_phi = ecc_best_phi
+    else:
+        is_eb = False
+        if circ_max_snr > ecc_max_snr:
+            max_snr, max_depth_ppm, best_phi = circ_max_snr, circ_max_depth, 0.50
+        else:
+            max_snr, max_depth_ppm, best_phi = ecc_max_snr, ecc_max_depth, ecc_best_phi
             
-    # Flag as eccentric EB if SNR exceeds trials-corrected threshold AND depth >= 12% of primary
-    is_eb = (max_snr > z_crit) and (max_depth_ppm > 220.0) and (max_depth_ppm >= 0.12 * primary_depth_ppm)
     return is_eb, max_snr, max_depth_ppm, best_phi, z_crit
 
 
@@ -770,6 +806,17 @@ def verify_multi_epoch(
             return (
                 False,
                 f"Archival non-detection in sectors {chosen_secs} (Prior Depth={depth_prior_ppm:.0f}ppm, SNR={archival_snr:.1f}sigma) -> Transient artifact",
+                None
+            )
+            
+        # Multi-sector secondary eclipse check on combined baseline (catches eccentric EBs with boosted multi-sector SNR)
+        is_sec_eb, sec_snr, sec_depth_ppm, sec_phi, _ = scan_full_orbit_secondary_eclipse(
+            t_comb, f_comb, refined_p, refined_t0, best_dur, depth_prior_ppm
+        )
+        if is_sec_eb:
+            return (
+                False,
+                f"Multi-sector secondary eclipse in sectors {chosen_secs} at phase {sec_phi:.2f} ({sec_depth_ppm:.0f}ppm, {sec_snr:.1f}sigma) -> Eccentric EB",
                 None
             )
             

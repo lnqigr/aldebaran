@@ -34,9 +34,13 @@ tess_results/known_catalog_cache.txt
 tess_results/*.log
 *.log
 
-# Heavy generated candidate plots (prevents bloating git repository)
+# Heavy generated candidate plots & run outputs (prevents bloating git repository)
 tess_results/*.png
-tess_results/deep_vetting/*.png
+tess_results/**/*.png
+tess_results/*.csv
+tess_results/**/*.csv
+tess_results/cluster_deep_vetting/
+tess_results/sector_*/
 
 # Internal AI context & local dev notes (not needed for public repo users)
 PROJECT_CONTEXT.md
