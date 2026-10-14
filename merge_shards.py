@@ -71,11 +71,16 @@ def merge_shards(results_dir: str = "tess_results") -> None:
     if os.path.exists(out_csv) and os.path.getsize(out_csv) > 50:
         print("\n[+] Launching Pleiades Tier-2 Deep Vetting on unified candidate list...")
         subprocess.run([sys.executable, "pleiades.py"], check=False)
+
+        # 4. Launch Tier-3 CTOI Packager & Follow-Up Prioritizer
+        if os.path.exists("ctoi_packager.py"):
+            print("\n[+] Launching Tier-3 CTOI Packager & Follow-Up Prioritizer...")
+            subprocess.run([sys.executable, "ctoi_packager.py"], check=False)
     else:
         print("\n[+] No candidates to vet. Tier-2 deep vetting skipped.")
 
     print("=" * 70)
-    print("Shard aggregation complete!")
+    print("Shard aggregation and CTOI packaging complete!")
     print("=" * 70)
 
 if __name__ == "__main__":
