@@ -75,7 +75,7 @@ chmod +x submit_all.sh run_merge.pbs
 ### Attaching the Auto-Reducer to an Already-Running Array
 If you already submitted an array (e.g. `24683990`), schedule the reducer to wait for it:
 ```bash
-qsub -W depend=afterany:24683990.pbs-m1 run_merge.pbs
+qsub -W depend=afterany:24683990[].pbs-m1.metacentrum.cz run_merge.pbs
 ```
 The reducer job will sit in `Hold` (`H`), and the instant the final array worker finishes, PBS will launch `run_merge.pbs`, deduplicating candidates and generating all Pleiades diagnostic dossiers.
 

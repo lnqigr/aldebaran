@@ -17,11 +17,8 @@ echo "======================================================================"
 ARRAY_JOB_ID=$(qsub -J 1-8 run_aldebaran.pbs)
 echo "[+] Step 1/2: Submitted Tier-1 array job -> ${ARRAY_JOB_ID}"
 
-# Extract base job ID (strip trailing [] or server suffix if needed)
-BASE_ID=$(echo "$ARRAY_JOB_ID" | sed 's/\[\]//')
-
-# 2. Submit Tier-2 reducer with afterany dependency on the array
-MERGE_JOB_ID=$(qsub -W depend=afterany:"${BASE_ID}" run_merge.pbs)
+# 2. Submit Tier-2 reducer with afterany dependency on the entire array
+MERGE_JOB_ID=$(qsub -W depend=afterany:"${ARRAY_JOB_ID}" run_merge.pbs)
 echo "[+] Step 2/2: Submitted Tier-2 merge reducer job -> ${MERGE_JOB_ID}"
 
 echo "======================================================================"
