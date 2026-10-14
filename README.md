@@ -1,4 +1,4 @@
-# Aldebaran: End-to-End Photometric Discovery, Vetting & Archival Forensic Pipeline for TESS (v8.x)
+# Aldebaran: End-to-End Photometric Discovery, Vetting & Archival Forensic Pipeline for TESS (v8.2)
 
 **Aldebaran** is an automated, high-throughput digital signal processing (DSP) and astrophysical falsification pipeline designed to detect low-SNR transiting exoplanets in archival and newly released sectors of the NASA TESS Extended Mission (2-minute SPOC cadence).
 
@@ -92,7 +92,7 @@ The pipeline is engineered to probe the detection grey zone ($6.0 \le \text{SDE}
 
 ---
 
-## Key Features in v8.x
+## Key Features in v8.2 (v8.0 – v8.2)
 
 1. **Distributed PBS Job Array Sharding (`qsub -J 1-8`)**:
    Enables parallel execution across 8 independent compute nodes without inter-process file locks. Workers autonomously map `PBS_ARRAY_INDEX` to sequential TESS sectors (`[106, 105, 104, 103, 102, 101, 100, 99]`) and write to isolated subdirectories (`tess_results/sector_<sec>/`).
