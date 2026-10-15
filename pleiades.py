@@ -414,6 +414,12 @@ def deep_vet_target(cand_row: dict) -> dict | None:
     sort_idx = np.argsort(t)
     t, f = t[sort_idx], f[sort_idx]
     
+    # Pre-clip >4-sigma stellar flares and extreme single-cadence downward glitches
+    med_raw = float(np.nanmedian(f))
+    mad_raw = float(1.4826 * np.nanmedian(np.abs(f - med_raw)) + 1e-12)
+    clean_clip = (f < (med_raw + 4.0 * mad_raw)) & (f > (med_raw - 8.0 * mad_raw))
+    t, f = t[clean_clip], f[clean_clip]
+    
     fine_p_grid = np.linspace(p_init * 0.995, p_init * 1.005, 6000)
     bls = BoxLeastSquares(t, f)
     bls_res = bls.power(fine_p_grid, np.linspace(max(0.025, dur_init * 0.7), min(0.25, dur_init * 1.3), 10))
@@ -500,6 +506,16 @@ def deep_vet_target(cand_row: dict) -> dict | None:
         risk_score += 85.0 * ((0.35 - dur_ratio_kepler) / 0.35)
     if np.isfinite(gaia_contam["ruwe"]) and gaia_contam["ruwe"] > 1.25:
         risk_score += 15.0
+        
+    # Enforce Stitched Primary Transit SNR Gate (prevents marginal white noise from masquerading as confirmed candidate)
+    in_tr_mask = np.abs(ph_fit) < (0.45 * dur_fit)
+    oot_mask_local = (np.abs(ph_fit) > (0.65 * dur_fit)) & (np.abs(ph_fit) <= (2.2 * dur_fit))
+    oot_std_pt = float(1.4826 * np.nanmedian(np.abs(f_fit[oot_mask_local] - 1.0)) + 1e-12)
+    n_in = int(np.sum(in_tr_mask))
+    stitched_primary_snr = float((1.0 - np.nanmean(f_fit[in_tr_mask])) / (oot_std_pt / np.sqrt(max(1, n_in)))) if n_in >= 3 else 0.0
+    if stitched_primary_snr < 5.5:
+        risk_score += min(65.0, max(0.0, (5.5 - stitched_primary_snr) * 22.0))
+        
     risk_pct = float(np.clip(risk_score, 0.1, 99.9))
     
     is_clean = (
@@ -510,6 +526,7 @@ def deep_vet_target(cand_row: dict) -> dict | None:
         and not gaia_contam.get("is_tess_eb")
         and not gaia_contam.get("is_gaia_nss")
         and 0.35 <= dur_ratio_kepler <= 1.38
+        and stitched_primary_snr >= 5.5
     )
     if gaia_contam.get("is_tess_eb"):
         disposition = f"CONFIRMED FP / CATALOGED TESS EB (TIC {gaia_contam.get('tess_eb_tic')})"
@@ -655,6 +672,7 @@ def deep_vet_target(cand_row: dict) -> dict | None:
         "fitted_rp_earth": round(true_rp_earth, 2),
         "impact_param_b": round(b_fit, 3),
         "dur_to_kepler_max": round(dur_ratio_kepler, 2),
+        "stitched_primary_snr": round(stitched_primary_snr, 2),
         "secondary_snr_sigma": round(sec_snr, 2),
         "sec_eclipse_phase": round(sec_center_phi, 3),
         "is_known_tess_eb": gaia_contam.get("is_tess_eb", False),
