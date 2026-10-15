@@ -1,4 +1,4 @@
-# Aldebaran: End-to-End Photometric Discovery, Vetting & Archival Forensic Pipeline for TESS (v8.5)
+# Aldebaran: End-to-End Photometric Discovery, Vetting & Archival Forensic Pipeline for TESS (v8.6)
 
 **Aldebaran** is an automated, high-throughput digital signal processing (DSP) and astrophysical falsification pipeline designed to detect low-SNR transiting exoplanets in archival and newly released sectors of the NASA TESS Extended Mission (2-minute SPOC cadence).
 
@@ -76,8 +76,36 @@ The pipeline is engineered to probe the detection grey zone ($6.0 \le \text{SDE}
 │  • Stage 3C: Planetary Follow-Up Prioritization (K m/s, TSM, ESM)       │
 │  • Stage 3D: ExoFOP CTOI Export with Multi-Sector Parameter Sync        │
 │  • 4-Panel Archival Posters saved in tess_results/archival_vetting/     │
+└────────────────────────────────────┬────────────────────────────────────┘
+                                     │ prioritized_targets_ranking.csv
+                                     ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│         TIER 4: Bayesian Validation & Holdout Engine (v8.6)             │
+├─────────────────────────────────────────────────────────────────────────┤
+│  • TRICERATOPS Bayesian Blend Validation (validate_triceratops.py)       │
+│     - 18 astrophysical blend scenarios (Giacalone et al. 2021)          │
+│     - Formal FPP (False Positive Prob) & NFPP (Nearby FPP) calculation  │
+│     - Memory-optimized 60-bin phase folding (prevents 11 GB OOM)        │
+│  • Leave-One-Year-Out (LOYO) Blind Holdout Validator (loyo_validator.py)│
+│     - Multi-year blind timing prediction across 800+ day gaps           │
+│     - 94-transit O - C timing analysis & Keplerian clock verification   │
+│  • Top-3 Presentation Showcase Generator (generate_top3_showcase.py)    │
+│  • Master Scanned TICs Catalog Reducer (merge_scanned_tics.py)          │
 └─────────────────────────────────────────────────────────────────────────┘
 ```
+
+---
+
+## Key Features in v8.6
+
+1. **Tier-4 Bayesian Statistical Validation (`validate_triceratops.py`)**:
+   Evaluates 18 astrophysical blend scenarios (Giacalone et al. 2021) using TRICERATOPS. Computes formal False Positive Probability (FPP) and Nearby False Positive Probability (NFPP) against background stars, aperture blends, and unresolved companions. Features adaptive 60-bin phase folding across the transit window, cutting multi-sector array memory footprint from 11.55 GB to ~60 MB (<0.6%) to prevent OOM errors while boosting binned SNR per cadence by $\sqrt{N_{\text{transits}}}$.
+2. **Leave-One-Year-Out (LOYO) Blind Holdout Engine (`loyo_validator.py`)**:
+   Implements multi-year temporal cross-validation inspired by independent researcher Pavel Rabtsevich (TIC 4206066). Blindly predicts transit arrival times across multi-year data gaps (e.g. $+1.94\text{ min}$ timing precision over 800 days on TIC 350190949, $4.0\%$ of transit duration) and conducts 94-transit $\text{O}-\text{C}$ Keplerian clock stability analysis ($dP/dt \approx 0$).
+3. **Master Scanned TICs Consolidation (`merge_scanned_tics.py`)**:
+   Aggregates, deduplicates, and numerically sorts historical scanned TICs across MetaCentrum cluster arrays, local archives, and current workspace into a unified registry (expanding local history from 411 to 6,337+ unique TICs).
+4. **Top-3 Presentation Showcase (`generate_top3_showcase.py`)**:
+   Generates a standalone, high-resolution publication infographic (`exofop_top3_showcase.png`) displaying phase-folded profiles with 300-ring limb-darkened fits, strictly labeled with academic candidate terminology.
 
 ---
 
@@ -144,6 +172,15 @@ python ctoi_packager.py
 
 # 5. Run Antares multi-year archival forensic drill on a specific candidate
 python antares.py --tic 46314221
+
+# 6. Run Tier-4 Bayesian TRICERATOPS statistical blend validation
+python validate_triceratops.py --tic 322051865 --period 2.831532 --t0 4154.32930 --duration 1.08 --depth 778.4 --sectors 103 104 105 106 --mc 5 --bins 60
+
+# 7. Run Leave-One-Year-Out (LOYO) 7.8-year blind holdout clock test
+python loyo_validator.py --tic 350190949 --period 0.926120 --t0 1325.61416 --duration 0.81 --sectors 1 28 104 105
+
+# 8. Merge and synchronize master scanned TICs catalog
+python merge_scanned_tics.py
 ```
 
 ### HPC End-to-End Automated Array Execution (MetaCentrum)
