@@ -7,8 +7,16 @@ import argparse
 import warnings
 from datetime import datetime, timedelta
 
-# Global SSL bypass for MAST / Caltech TAP compatibility
-ssl._create_default_https_context = ssl._create_unverified_context
+import logging
+import certifi
+
+logger = logging.getLogger(__name__)
+
+# Priority P1: Enforce verified TLS context anchored to certifi CA bundle
+CA_BUNDLE_PATH = certifi.where()
+os.environ["SSL_CERT_FILE"] = CA_BUNDLE_PATH
+os.environ["REQUESTS_CA_BUNDLE"] = CA_BUNDLE_PATH
+ssl._create_default_https_context = lambda: ssl.create_default_context(cafile=CA_BUNDLE_PATH)
 os.environ["PYTHONWARNINGS"] = "ignore::UserWarning"
 warnings.filterwarnings("ignore", category=UserWarning)
 

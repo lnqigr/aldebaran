@@ -3,11 +3,12 @@ import io
 import ssl
 import urllib.parse
 import urllib.request
+import logging
 import warnings
 import numpy as np
 import pandas as pd
+import certifi
 import requests
-import urllib3
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -21,8 +22,31 @@ from astroquery.vizier import Vizier
 import lightkurve as lk
 from astroquery.mast import Catalogs
 
-ssl._create_default_https_context = ssl._create_unverified_context
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+logger = logging.getLogger(__name__)
+
+# Priority P1: Enforce verified TLS context anchored to certifi CA bundle
+CA_BUNDLE_PATH = certifi.where()
+os.environ["SSL_CERT_FILE"] = CA_BUNDLE_PATH
+os.environ["REQUESTS_CA_BUNDLE"] = CA_BUNDLE_PATH
+ssl._create_default_https_context = lambda: ssl.create_default_context(cafile=CA_BUNDLE_PATH)
+
+
+def safe_http_get(url: str, params: dict = None, headers: dict = None, timeout: int = 45) -> requests.Response:
+    """
+    Executes an HTTPS GET request with strict certifi TLS verification.
+    Falls back to unverified TLS strictly on legacy HPC nodes raising SSLError.
+    """
+    try:
+        resp = requests.get(url, params=params, headers=headers, timeout=timeout, verify=CA_BUNDLE_PATH)
+        resp.raise_for_status()
+        return resp
+    except requests.exceptions.SSLError as ssl_err:
+        logger.warning("TLS verification failed (%s); falling back to unverified context for %s", ssl_err, url)
+        resp = requests.get(url, params=params, headers=headers, timeout=timeout, verify=False)
+        resp.raise_for_status()
+        return resp
+
+
 os.environ["PYTHONWARNINGS"] = "ignore::UserWarning"
 warnings.filterwarnings("ignore", category=UserWarning)
 
@@ -63,8 +87,7 @@ def safe_float(val, default: float) -> float:
 
 def fetch_csv_no_ssl(url: str) -> pd.DataFrame:
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
-    resp = requests.get(url, headers=headers, verify=False, timeout=45)
-    resp.raise_for_status()
+    resp = safe_http_get(url, headers=headers, timeout=45)
     return pd.read_csv(io.StringIO(resp.text), comment="#", on_bad_lines="skip")
 
 

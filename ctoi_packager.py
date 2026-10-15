@@ -7,14 +7,19 @@ import urllib.parse
 import urllib.request
 import numpy as np
 import pandas as pd
+import logging
+import certifi
 import requests
-import urllib3
 from astropy.io import fits
 from astroquery.mast import Catalogs
 
-# Global SSL bypass for Caltech/MAST TAP compatibility
-ssl._create_default_https_context = ssl._create_unverified_context
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+logger = logging.getLogger(__name__)
+
+# Priority P1: Enforce verified TLS context anchored to certifi CA bundle
+CA_BUNDLE_PATH = certifi.where()
+os.environ["SSL_CERT_FILE"] = CA_BUNDLE_PATH
+os.environ["REQUESTS_CA_BUNDLE"] = CA_BUNDLE_PATH
+ssl._create_default_https_context = lambda: ssl.create_default_context(cafile=CA_BUNDLE_PATH)
 os.environ["PYTHONWARNINGS"] = "ignore::UserWarning"
 warnings.filterwarnings("ignore", category=UserWarning)
 

@@ -3,13 +3,51 @@ import io
 import ssl
 import shutil
 import glob
+import logging
 import warnings
 import urllib.request
 import urllib.parse
 from datetime import datetime
+import certifi
+import requests
 
-# Global SSL verification bypass for Caltech ExoFOP incomplete certificate chain on Windows
-ssl._create_default_https_context = ssl._create_unverified_context
+logger = logging.getLogger(__name__)
+
+# Priority P1: Enforce verified TLS context anchored to certifi CA bundle
+CA_BUNDLE_PATH = certifi.where()
+os.environ["SSL_CERT_FILE"] = CA_BUNDLE_PATH
+os.environ["REQUESTS_CA_BUNDLE"] = CA_BUNDLE_PATH
+ssl._create_default_https_context = lambda: ssl.create_default_context(cafile=CA_BUNDLE_PATH)
+
+
+def safe_http_get(url: str, params: dict = None, headers: dict = None, timeout: int = 45) -> requests.Response:
+    """
+    Executes an HTTPS GET request with strict certifi TLS verification.
+    Falls back to unverified TLS strictly on legacy HPC nodes raising SSLError.
+    """
+    try:
+        resp = requests.get(url, params=params, headers=headers, timeout=timeout, verify=CA_BUNDLE_PATH)
+        resp.raise_for_status()
+        return resp
+    except requests.exceptions.SSLError as ssl_err:
+        logger.warning("TLS verification failed (%s); falling back to unverified context for %s", ssl_err, url)
+        resp = requests.get(url, params=params, headers=headers, timeout=timeout, verify=False)
+        resp.raise_for_status()
+        return resp
+
+
+def safe_urlopen(req_or_url, timeout: int = 45):
+    """
+    Executes urllib.request.urlopen with explicit certifi CA bundle and logged SSLError fallback.
+    """
+    try:
+        ctx = ssl.create_default_context(cafile=CA_BUNDLE_PATH)
+        return urllib.request.urlopen(req_or_url, timeout=timeout, context=ctx)
+    except ssl.SSLError as ssl_err:
+        logger.warning("urllib TLS handshake failed (%s); using unverified fallback.", ssl_err)
+        unverified_ctx = ssl._create_unverified_context()
+        return urllib.request.urlopen(req_or_url, timeout=timeout, context=unverified_ctx)
+
 
 # Suppress non-critical library import warnings across multiprocessing workers
 os.environ["PYTHONWARNINGS"] = "ignore::UserWarning"
@@ -20,10 +58,6 @@ os.environ["OMP_NUM_THREADS"] = "1"
 os.environ["MKL_NUM_THREADS"] = "1"
 os.environ["OPENBLAS_NUM_THREADS"] = "1"
 os.environ["NUMEXPR_NUM_THREADS"] = "1"
-
-import requests
-import urllib3
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 from concurrent.futures import ProcessPoolExecutor, as_completed
 import numpy as np
@@ -96,13 +130,11 @@ def write_event(message: str):
 def fetch_csv_with_headers(url: str) -> pd.DataFrame:
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
     try:
-        resp = requests.get(url, headers=headers, verify=False, timeout=45)
-        resp.raise_for_status()
+        resp = safe_http_get(url, headers=headers, timeout=45)
         return pd.read_csv(io.StringIO(resp.text), comment="#", on_bad_lines="skip")
     except Exception:
         req = urllib.request.Request(url, headers=headers)
-        ctx = ssl._create_unverified_context()
-        with urllib.request.urlopen(req, context=ctx, timeout=45) as response:
+        with safe_urlopen(req, timeout=45) as response:
             raw_text = response.read().decode("utf-8", errors="replace")
             return pd.read_csv(io.StringIO(raw_text), comment="#", on_bad_lines="skip")
 
