@@ -474,7 +474,15 @@ def deep_vet_target(cand_row: dict) -> dict | None:
     risk_score = 0.2
     if b_fit > 0.75:
         risk_score += 25.0 * ((b_fit - 0.75) / 0.25) ** 2
-    if sec_snr > 2.2:
+    
+    # Secondary eclipse significance calibration (Šidák-Bonferroni correction across ~30 phase bins):
+    # Pure Gaussian white noise across ~30 independent windows has E[max(z)] ~ 2.1-2.5 sigma.
+    # Penalize only when exceeding the true statistical significance threshold:
+    # Circular zone (|phase - 0.50| <= 0.04): SNR > 2.8 sigma
+    # Eccentric zone (|phase - 0.50| > 0.04): SNR > 3.4 sigma
+    is_circular_sec = abs(sec_center_phi - 0.50) <= 0.04
+    sec_snr_threshold = 2.8 if is_circular_sec else 3.4
+    if sec_snr > sec_snr_threshold:
         risk_score += 45.0 * (sec_snr / 3.0)
     if is_sec_eb:
         risk_score += 65.0
@@ -497,7 +505,7 @@ def deep_vet_target(cand_row: dict) -> dict | None:
     is_clean = (
         risk_pct < 5.0
         and b_fit < 0.82
-        and sec_snr < 2.5
+        and sec_snr <= sec_snr_threshold
         and not is_sec_eb
         and not gaia_contam.get("is_tess_eb")
         and not gaia_contam.get("is_gaia_nss")
