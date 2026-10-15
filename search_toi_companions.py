@@ -25,7 +25,6 @@ import pandas as pd
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-from astropy.timeseries import BoxLeastSquares
 
 import aldebaran as ald
 
@@ -37,7 +36,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Aldebaran TOI Sibling Exoplanet Search Engine")
     parser.add_argument("--sectors", type=int, nargs="+", default=[106, 105, 104, 103, 102, 101, 100, 99],
                         help="TESS sectors to search for TOI host companion planets")
-    parser.add_argument("--workers", type=int, default=8, help="Number of parallel worker processes")
+    parser.add_argument("--workers", type=int, default=4, help="Number of parallel worker processes")
     parser.add_argument("--limit-per-sector", type=int, default=500, help="Max TOI hosts to screen per sector")
     parser.add_argument("--output-dir", type=str, default="tess_results/toi_companions",
                         help="Directory to save companion candidate reports and plots")
@@ -57,22 +56,23 @@ def get_toi_hosts_in_sector(sector: int, toi_hosts_set: set) -> list:
             return []
         df_obs = obs.to_pandas()
         spoc_mask = df_obs["target_name"].astype(str).str.isdigit() & (df_obs["provenance_name"] == "SPOC")
-        spoc_tics = set(df_obs.loc[spoc_mask, "target_name"].astype(str))
-        matched = sorted(list(spoc_tics & toi_hosts_set))
+        spoc_tics = set(df_obs.loc[spoc_mask, "target_name"].astype(str).str.lstrip("0"))
+        cleaned_host_set = {str(t).lstrip("0") for t in toi_hosts_set}
+        matched = sorted(list(spoc_tics & cleaned_host_set))
         return matched
     except Exception as e:
         logger.warning("Error querying MAST for sector %d: %s", sector, e)
         return []
 
 
-def process_toi_host(tic_id: str, sector: int, toi_ephems: list, output_dir: str):
+def process_toi_host(tic_id: str, sector: int) -> dict:
     """Executes masking and residual BLS search on a single TOI host star."""
     try:
-        res = ald.analyze_single_target(tic_id, sector, known_ephemerides=toi_ephems)
-        if res.get("status") == "PASS":
+        tic_out, disp, msg, cand_data = ald.analyze_single_target(tic_id, sector)
+        if disp == "CANDIDATE" and cand_data is not None:
             logger.info(">>> SIBLING CANDIDATE DISCOVERED! TIC %s (Sector %d, SDE=%.2f, P=%.4f d)",
-                        tic_id, sector, res.get("sde", 0.0), res.get("period", 0.0))
-            return res
+                        tic_id, sector, cand_data.get("sde", 0.0), cand_data.get("period_days", 0.0))
+            return cand_data
         return None
     except Exception as e:
         logger.debug("Error processing TIC %s: %s", tic_id, e)
@@ -82,15 +82,17 @@ def process_toi_host(tic_id: str, sector: int, toi_ephems: list, output_dir: str
 def main():
     args = parse_args()
     os.makedirs(args.output_dir, exist_ok=True)
+    ald.OUTPUT_DIR = args.output_dir
     report_file = os.path.join(args.output_dir, "toi_companions_summary.csv")
 
     logger.info("======================================================================")
     logger.info("ALDEBARAN v9.0 - TOI SIBLING EXOPLANET SEARCH ENGINE")
     logger.info("Target Sectors: %s | Workers: %d", args.sectors, args.workers)
+    logger.info("Output Directory: %s", args.output_dir)
     logger.info("======================================================================")
 
     # 1. Load TOI catalog ephemerides
-    known_tics, confirmed_tics, ctoi_tics, eb_tics, toi_ephem_dict = ald.load_known_catalogs_and_toi_ephemerides()
+    known_tics, eb_tics, toi_ephem_dict = ald.load_known_catalogs_and_toi_ephemerides()
     toi_host_set = set(toi_ephem_dict.keys())
     logger.info("Loaded %d TOI host systems with cached orbital ephemerides.", len(toi_host_set))
 
@@ -110,7 +112,7 @@ def main():
 
         with ProcessPoolExecutor(max_workers=args.workers) as executor:
             futures = {
-                executor.submit(process_toi_host, tic, sec, toi_ephem_dict.get(tic, []), args.output_dir): tic
+                executor.submit(process_toi_host, tic, sec): tic
                 for tic in selected_tics
             }
             for fut in as_completed(futures):
