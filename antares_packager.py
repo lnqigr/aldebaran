@@ -355,10 +355,10 @@ def compute_astrophysical_metrics(
 
 def calc_sidak_corrected_risk(row: pd.Series) -> float:
     """
-    Computes Sidak-Bonferroni dual-zone corrected false-alarm probability (commit bfb2cad).
+    Computes Sidak-Bonferroni dual-zone corrected Vetting Penalty Score (VPS, 0-100).
     Suppresses false-alarm penalties when secondary peaks are consistent with noise.
     """
-    r = float(row.get("fp_risk_percent", 50.0))
+    r = float(row.get("vps_score", row.get("fp_risk_percent", 50.0)))
     sec_snr = float(row.get("secondary_snr_sigma", 0.0)) if pd.notna(row.get("secondary_snr_sigma")) else 0.0
     sec_phase = float(row.get("sec_eclipse_phase", 0.50)) if pd.notna(row.get("sec_eclipse_phase")) else 0.50
     if sec_snr > 2.2:

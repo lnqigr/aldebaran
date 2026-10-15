@@ -548,9 +548,10 @@ def deep_vet_target(cand_row: dict) -> dict | None:
         risk_score += min(65.0, max(0.0, (5.5 - stitched_primary_snr) * 22.0))
         
     risk_pct = float(np.clip(risk_score, 0.1, 99.9))
+    vps_score = risk_pct
     
     is_clean = (
-        risk_pct < 5.0
+        vps_score < 5.0
         and b_fit < 0.82
         and sec_snr <= sec_snr_threshold
         and not is_sec_eb
@@ -582,7 +583,7 @@ def deep_vet_target(cand_row: dict) -> dict | None:
         print(f"      -> [!] VizieR TESS EB Match: TIC {gaia_contam.get('tess_eb_tic')} (P={gaia_contam.get('tess_eb_period')} d)")
     if gaia_contam.get("is_gaia_nss"):
         print(f"      -> [!] Gaia NSS Two-Body Orbit: {gaia_contam.get('gaia_nss_type')} (P={gaia_contam.get('gaia_nss_period')} d)")
-    print(f"      -> Heuristic FP Risk Score: {risk_pct:.1f}% -> {disposition}")
+    print(f"      -> Vetting Penalty Score (VPS): {vps_score:.1f} (Gate <= 24.0) -> {disposition}")
     
     fig, axes = plt.subplots(2, 2, figsize=(15, 10))
     
@@ -667,7 +668,7 @@ def deep_vet_target(cand_row: dict) -> dict | None:
         f"SCIENTIFIC VETTING DOSSIER: TIC {tic_id}\n"
         f"{'-'*48}\n"
         f"Disposition:       {disposition}\n"
-        f"Heuristic FP Risk: {risk_pct:.1f}% (Clean Threshold < 5.0%)\n\n"
+        f"Vetting Score VPS: {vps_score:.1f} / 100 (Optimal Gate <= 24.0)\n\n"
         f"ORBITAL & PHYSICAL PARAMETERS (300-Ring Fit):\n"
         f"  Refined Period:  {p_ref:.6f} days\n"
         f"  Mid-Transit T0:  {t0_ref:.5f} BTJD\n"
@@ -698,7 +699,8 @@ def deep_vet_target(cand_row: dict) -> dict | None:
     return {
         "tic_id": tic_id,
         "disposition": disposition,
-        "fp_risk_percent": round(risk_pct, 1),
+        "vps_score": round(vps_score, 1),
+        "fp_risk_percent": round(vps_score, 1),  # backward compatibility alias
         "refined_period_days": round(p_ref, 6),
         "refined_t0_btjd": round(t0_ref, 5),
         "fitted_depth_ppm": round((rp_rs_fit ** 2) * 1e6, 1),

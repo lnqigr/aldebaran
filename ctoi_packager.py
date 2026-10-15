@@ -433,14 +433,15 @@ def run_ctoi_packager():
             v_or_tmag=phot["Tmag"]
         )
         
-        fp_risk = to_clean_float(row.get("fp_risk_percent"), 30.0)
+        fp_risk = to_clean_float(row.get("vps_score", row.get("fp_risk_percent")), 30.0)
+        vps_score = fp_risk
         sde_val = to_clean_float(row.get("sde"), 6.5)
         contam_pct = to_clean_float(row.get("flux_contam_percent"), 0.0)
         neb_cnt = int(to_clean_float(row.get("neb_capable_neighbors"), 0))
         secs_str = str(row.get("sectors_stitched") if pd.notna(row.get("sectors_stitched")) and str(row.get("sectors_stitched")) != "" else row.get("sector", "N/A"))
         
-        # Composite Follow-Up Score: rewards low FP risk, high TSM, and high RV K
-        clean_weight = max(0.1, (100.0 - fp_risk) / 100.0)
+        # Composite Follow-Up Score: rewards low VPS risk, high TSM, and high RV K
+        clean_weight = max(0.1, (100.0 - vps_score) / 100.0)
         priority_score = round(clean_weight * (0.65 * astro["tsm"] + 4.5 * astro["rv_k_ck17_ms"] + 1.5 * astro["esm"]), 2)
         
         cam_str, ccd_str = extract_camera_ccd_from_cache(tid)
@@ -449,7 +450,8 @@ def run_ctoi_packager():
             "tic_id": tid,
             "priority_score": priority_score,
             "disposition": row.get("disposition", "CANDIDATE"),
-            "fp_risk_percent": round(fp_risk, 1),
+            "vps_score": round(vps_score, 1),
+            "fp_risk_percent": round(vps_score, 1),
             "sectors": secs_str,
             "period_days": round(p_days, 6),
             "t0_btjd": round(t0_btjd, 5),
