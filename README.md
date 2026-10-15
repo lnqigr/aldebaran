@@ -118,11 +118,11 @@ python -c "import subprocess, sys; [subprocess.run([sys.executable, t], check=Tr
 ## HPC & Cluster Execution (MetaCentrum)
 
 For large-scale runs across tens of thousands of stars, PBS Pro scripts are available:
-* `run_aldebaran.pbs`: PBS script optimized for MetaCentrum HPC with Job Arrays (`qsub -J 1-8`) and local NVMe `$SCRATCHDIR` I/O (8 CPUs, 16 GB RAM, 35 GB local scratch, 6h walltime).
-* `run_merge.pbs`: Dependent reducer PBS job that executes automatically when the array finishes.
-* `submit_all.sh`: One-command automated launcher submitting both the 8-node array and the dependent reducer job.
+* `cluster/run_aldebaran.pbs`: PBS script optimized for MetaCentrum HPC with Job Arrays (`qsub -J 1-8`) and local NVMe `$SCRATCHDIR` I/O (8 CPUs, 24 GB RAM, 35 GB local scratch, 8h walltime).
+* `cluster/run_merge.pbs`: Dependent reducer PBS job that executes automatically when the array finishes.
+* `cluster/submit_all.sh`: One-command automated launcher submitting both the 8-node array and the dependent reducer job.
 * `merge_shards.py`: Reducer script to merge shard outputs after array execution.
-* See [README_METACENTRUM.md](README_METACENTRUM.md) for full deployment and monitoring instructions.
+* See [README_METACENTRUM.md](docs/README_METACENTRUM.md) for full deployment and monitoring instructions.
 
 ---
 
@@ -149,6 +149,6 @@ python antares.py --tic 46314221
 ### HPC End-to-End Automated Array Execution (MetaCentrum)
 ```bash
 # One-command fully automated workflow (Tier-1 array + automatic Tier-2 deep vetting reducer):
-chmod +x submit_all.sh run_merge.pbs run_aldebaran.pbs
-./submit_all.sh
+chmod +x cluster/submit_all.sh cluster/run_merge.pbs cluster/run_aldebaran.pbs
+./cluster/submit_all.sh
 ```

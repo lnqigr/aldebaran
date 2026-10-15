@@ -18,6 +18,12 @@
 export ALDEBARAN_MAX_TARGETS="${ALDEBARAN_MAX_TARGETS:-15000}"
 export ALDEBARAN_WORKERS="${PBS_NCPUS:-8}"
 
+# Locate project root directory regardless of whether qsub was called from root or cluster/
+REPO_DIR="$PBS_O_WORKDIR"
+if [ ! -f "$REPO_DIR/aldebaran.py" ] && [ -f "$REPO_DIR/../aldebaran.py" ]; then
+    REPO_DIR="$(cd "$REPO_DIR/.." && pwd)"
+fi
+
 # ------------------------------------------------------------------------------
 # 1. Safe sync & cleanup. Runs exactly once on normal exit, crash, walltime SIGTERM or qdel.
 # ------------------------------------------------------------------------------
@@ -27,8 +33,8 @@ SYNC_LOOP_PID=""
 
 sync_results() {
     if [ -d "$SCRATCHDIR/tess_results" ]; then
-        mkdir -p "$PBS_O_WORKDIR/tess_results"
-        cp -rf "$SCRATCHDIR/tess_results"/. "$PBS_O_WORKDIR/tess_results/" 2>/dev/null || true
+        mkdir -p "$REPO_DIR/tess_results"
+        cp -rf "$SCRATCHDIR/tess_results"/. "$REPO_DIR/tess_results/" 2>/dev/null || true
     fi
 }
 
@@ -39,7 +45,7 @@ sync_and_clean() {
     echo "[TRAP] Final result synchronization at: $(date)"
     [ -n "$SYNC_LOOP_PID" ] && kill "$SYNC_LOOP_PID" 2>/dev/null
     sync_results
-    echo "[TRAP] Reports, logs and dossiers synced to: $PBS_O_WORKDIR/tess_results"
+    echo "[TRAP] Reports, logs and dossiers synced to: $REPO_DIR/tess_results"
     clean_scratch
     echo "[TRAP] Local scratch cleaned."
     echo "======================================================================"
@@ -99,11 +105,11 @@ mkdir -p "$XDG_CACHE_HOME" "$PIP_CACHE_DIR" "$LIGHTKURVE_CACHE_DIR" "$ASTROPY_CA
 # ------------------------------------------------------------------------------
 # 4. Copy code AND existing tess_results to local scratch
 # ------------------------------------------------------------------------------
-cp "$PBS_O_WORKDIR"/*.py "$SCRATCHDIR/"
-cp "$PBS_O_WORKDIR"/requirements.txt "$SCRATCHDIR/" 2>/dev/null || true
+cp "$REPO_DIR"/*.py "$SCRATCHDIR/"
+cp "$REPO_DIR"/requirements.txt "$SCRATCHDIR/" 2>/dev/null || true
 mkdir -p "$SCRATCHDIR/tess_results"
-if [ -d "$PBS_O_WORKDIR/tess_results" ]; then
-    cp -rf "$PBS_O_WORKDIR/tess_results"/. "$SCRATCHDIR/tess_results/" 2>/dev/null || true
+if [ -d "$REPO_DIR/tess_results" ]; then
+    cp -rf "$REPO_DIR/tess_results"/. "$SCRATCHDIR/tess_results/" 2>/dev/null || true
 fi
 cd "$SCRATCHDIR" || exit 1
 

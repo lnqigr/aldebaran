@@ -14,7 +14,11 @@ echo "Job ID: $PBS_JOBID"
 echo "Start time: $(date)"
 echo "======================================================================"
 
-cd "$PBS_O_WORKDIR" || exit 1
+REPO_DIR="$PBS_O_WORKDIR"
+if [ ! -f "$REPO_DIR/merge_shards.py" ] && [ -f "$REPO_DIR/../merge_shards.py" ]; then
+    REPO_DIR="$(cd "$REPO_DIR/.." && pwd)"
+fi
+cd "$REPO_DIR" || exit 1
 
 module add python/3.11 2>/dev/null || module add python 2>/dev/null || true
 

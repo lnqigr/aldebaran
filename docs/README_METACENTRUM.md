@@ -27,9 +27,9 @@ cd exoplanet_search
 git pull origin main
 ```
 
-Make the PBS script executable:
+Make the cluster scripts executable:
 ```bash
-chmod +x run_aldebaran.pbs
+chmod +x cluster/*.pbs cluster/*.sh
 ```
 
 ---
@@ -39,7 +39,7 @@ chmod +x run_aldebaran.pbs
 ### Standard Production Job (8 Cores, 24 GB RAM, 35 GB NVMe Scratch, 8h Walltime)
 To submit a single-sector production run:
 ```bash
-qsub run_aldebaran.pbs
+qsub cluster/run_aldebaran.pbs
 ```
 PBS will return a unique Job ID, for example: `1234567.pbs-m1.metacentrum.cz`.
 
@@ -49,35 +49,35 @@ By default, the script scans up to 15,000 targets (`ALDEBARAN_MAX_TARGETS=15000`
 You can override the target count without editing any files:
 ```bash
 # Scan a smaller test batch (e.g. 500 targets):
-qsub -v ALDEBARAN_MAX_TARGETS=500 run_aldebaran.pbs
+qsub -v ALDEBARAN_MAX_TARGETS=500 cluster/run_aldebaran.pbs
 
 # Scan a full sector (e.g. 15,000 targets):
-qsub -v ALDEBARAN_MAX_TARGETS=15000 run_aldebaran.pbs
+qsub -v ALDEBARAN_MAX_TARGETS=15000 cluster/run_aldebaran.pbs
 ```
 
 ### High-Throughput Distributed Array (8 Nodes, 8 Sectors, ~100,000 Targets)
 To scan up to 8 fresh TESS sectors (Sectors 106, 105, 104, 103, 102, 101, 100, 99) simultaneously in ~2 hours:
 ```bash
-qsub -J 1-8 run_aldebaran.pbs
+qsub -J 1-8 cluster/run_aldebaran.pbs
 ```
 Each node in the array:
-* Gets 8 dedicated CPU cores, 16 GB RAM, and 35 GB local NVMe scratch.
+* Gets 8 dedicated CPU cores, 24 GB RAM, and 35 GB local NVMe scratch.
 * Automatically processes its own assigned sector from `PREFERRED_SECTORS` in zero-lock isolated storage (`tess_results/sector_<sec>/`).
 * Desynchronizes MAST API calls with an initial jitter delay (`sleep $(( (PBS_ARRAY_INDEX * 3) % 20 ))`).
 
 ### Fully Automated "Before Sleep" Workflow (`submit_all.sh`)
 To queue the entire end-to-end pipeline (Tier-1 array screening + automatic Tier-2 Pleiades deep vetting) with a single command:
 ```bash
-chmod +x submit_all.sh run_merge.pbs
-./submit_all.sh
+chmod +x cluster/submit_all.sh cluster/run_merge.pbs cluster/run_aldebaran.pbs
+./cluster/submit_all.sh
 ```
 
 ### Attaching the Auto-Reducer to an Already-Running Array
 If you already submitted an array (e.g. `24683990`), schedule the reducer to wait for it:
 ```bash
-qsub -W depend=afterany:24683990[].pbs-m1.metacentrum.cz run_merge.pbs
+qsub -W depend=afterany:24683990[].pbs-m1.metacentrum.cz cluster/run_merge.pbs
 ```
-The reducer job will sit in `Hold` (`H`), and the instant the final array worker finishes, PBS will launch `run_merge.pbs`, deduplicating candidates and generating all Pleiades diagnostic dossiers.
+The reducer job will sit in `Hold` (`H`), and the instant the final array worker finishes, PBS will launch `cluster/run_merge.pbs`, deduplicating candidates and generating all Pleiades diagnostic dossiers.
 
 ---
 
