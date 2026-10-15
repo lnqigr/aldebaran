@@ -1,6 +1,7 @@
 import os
 import io
 import ssl
+import json
 import shutil
 import glob
 import logging
@@ -72,7 +73,7 @@ from astropy.timeseries import BoxLeastSquares
 import lightkurve as lk
 from astroquery.mast import Observations, Catalogs
 
-PIPELINE_VERSION = "v8.5"
+PIPELINE_VERSION = "v9.0"
 AUTO_PURGE_CACHE = True       # Automatically deletes raw FITS files of non-candidates to keep cache at ~0 MB
 
 # Lightkurve does NOT read a LIGHTKURVE_CACHE_DIR env var by itself; apply it explicitly so HPC jobs
@@ -108,6 +109,9 @@ PRIORITY_TICS = []        # Add specific TIC IDs here to force-test them first
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 HISTORY_FILE = os.path.join(OUTPUT_DIR, "scanned_tics.txt")
 CATALOG_CACHE_FILE = os.path.join("tess_results", "known_catalog_cache.txt")
+TOI_EPHEMERIS_CACHE_FILE = os.path.join("tess_results", "toi_ephemerides_cache.json")
+SEARCH_TOI_COMPANIONS = os.environ.get("ALDEBARAN_SEARCH_TOI_COMPANIONS", "1").lower() not in ("0", "false", "no")
+GLOBAL_TOI_EPHEMERIDES = {}
 REPORT_FILE = os.path.join(OUTPUT_DIR, "candidates_report.csv")
 LOG_FILE = os.path.join(OUTPUT_DIR, "pipeline_run.log")
 EVENTS_LOG_FILE = os.path.join(OUTPUT_DIR, "pipeline_events.log")
@@ -139,25 +143,82 @@ def fetch_csv_with_headers(url: str) -> pd.DataFrame:
             return pd.read_csv(io.StringIO(raw_text), comment="#", on_bad_lines="skip")
 
 
-def get_known_exoplanet_tics() -> set:
-    known_tics = set()
+def load_known_catalogs_and_toi_ephemerides() -> tuple:
+    """
+    Ingests official TOI catalog ephemerides (P, T0, T_dur, depth, disp), confirmed planet hosts,
+    ExoFOP CTOIs, and cataloged EBs from VizieR (Prša et al. 2022).
+    
+    Returns:
+        known_catalog_tics: set of all cataloged TICs (legacy union)
+        known_eb_tics: set of confirmed/cataloged Eclipsing Binary stars (Prša et al. 2022)
+        toi_ephemerides: dict[str, list[dict]] mapping TIC string to list of known TOI planets
+    """
+    global GLOBAL_TOI_EPHEMERIDES
+    known_catalog_tics = set()
+    known_eb_tics = set()
+    toi_ephemerides = {}
+
+    if os.path.exists(TOI_EPHEMERIS_CACHE_FILE):
+        try:
+            with open(TOI_EPHEMERIS_CACHE_FILE, "r", encoding="utf-8") as f:
+                toi_ephemerides = json.load(f)
+            GLOBAL_TOI_EPHEMERIDES = toi_ephemerides
+        except Exception:
+            pass
+
     if os.path.exists(CATALOG_CACHE_FILE):
         try:
             with open(CATALOG_CACHE_FILE, "r", encoding="utf-8") as f:
                 cached = set(line.strip() for line in f if line.strip())
-            known_tics.update(cached)
+            known_catalog_tics.update(cached)
         except Exception:
             pass
 
-    write_log("[1/5] Fetching official TOI catalog from NASA Exoplanet Archive...")
+    write_log("[1/5] Fetching official TOI catalog & ephemerides from NASA Exoplanet Archive...")
     try:
-        toi_url = "https://exoplanetarchive.ipac.caltech.edu/TAP/sync?query=select+distinct+tid+from+toi&format=csv"
+        toi_query = (
+            "select tid, toi, pl_tranmid, pl_orbper, pl_trandurh, pl_trandep, tfopwg_disp "
+            "from toi where pl_orbper is not null and pl_tranmid is not null"
+        )
+        toi_url = "https://exoplanetarchive.ipac.caltech.edu/TAP/sync?query=" + urllib.parse.quote(toi_query) + "&format=csv"
         df_toi = fetch_csv_with_headers(toi_url)
-        tois = set(df_toi["tid"].dropna().astype(int).astype(str))
-        known_tics.update(tois)
-        write_log(f"      -> Loaded {len(tois)} official TOI targets.")
+        
+        toi_ephem_fresh = {}
+        for _, row in df_toi.iterrows():
+            try:
+                tid_str = str(int(row["tid"]))
+                tmid = float(row["pl_tranmid"])
+                t0_btjd = tmid - 2457000.0 if tmid > 2400000.0 else tmid
+                per = float(row["pl_orbper"])
+                dur = float(row["pl_trandurh"]) / 24.0 if pd.notna(row["pl_trandurh"]) else 0.08
+                dep = float(row["pl_trandep"]) if pd.notna(row["pl_trandep"]) else np.nan
+                disp = str(row["tfopwg_disp"]) if pd.notna(row["tfopwg_disp"]) else "PC"
+                
+                if tid_str not in toi_ephem_fresh:
+                    toi_ephem_fresh[tid_str] = []
+                toi_ephem_fresh[tid_str].append({
+                    "toi": str(row["toi"]),
+                    "period": per,
+                    "t0": t0_btjd,
+                    "duration": dur,
+                    "depth_ppm": dep,
+                    "disp": disp
+                })
+                known_catalog_tics.add(tid_str)
+            except Exception:
+                continue
+
+        if toi_ephem_fresh:
+            toi_ephemerides = toi_ephem_fresh
+            GLOBAL_TOI_EPHEMERIDES = toi_ephemerides
+            try:
+                with open(TOI_EPHEMERIS_CACHE_FILE, "w", encoding="utf-8") as f:
+                    json.dump(toi_ephemerides, f)
+            except Exception:
+                pass
+        write_log(f"      -> Loaded {len(df_toi)} TOI planet entries across {len(toi_ephemerides)} unique host stars.")
     except Exception as e:
-        write_log(f"      [!] Warning: Could not load TOI table (using cache): {e}")
+        write_log(f"      [!] Warning: Could not load TOI ephemeris table (using cache): {e}")
 
     write_log("[2/5] Fetching confirmed exoplanets (pscomppars) from NASA Exoplanet Archive...")
     try:
@@ -168,7 +229,7 @@ def get_known_exoplanet_tics() -> set:
             for val in df_ps["tic_id"].dropna()
             if str(val).replace("TIC", "").strip().isdigit()
         )
-        known_tics.update(ps_tics)
+        known_catalog_tics.update(ps_tics)
         write_log(f"      -> Loaded {len(ps_tics)} confirmed planet host stars.")
     except Exception as e:
         write_log(f"      [!] Warning: Could not load confirmed planets table (using cache): {e}")
@@ -180,7 +241,7 @@ def get_known_exoplanet_tics() -> set:
         tic_col = next((c for c in df_ctoi.columns if "tic" in c.lower()), None)
         if tic_col:
             ctois = set(df_ctoi[tic_col].dropna().astype(int).astype(str))
-            known_tics.update(ctois)
+            known_catalog_tics.update(ctois)
             write_log(f"      -> Loaded {len(ctois)} Community TOI (CTOI) targets.")
     except Exception as e:
         write_log(f"      [!] Warning: Could not load ExoFOP CTOI table (using cache): {e}")
@@ -191,19 +252,42 @@ def get_known_exoplanet_tics() -> set:
         eb_url = "https://tapvizier.cds.unistra.fr/TAPVizieR/tap/sync?REQUEST=doQuery&LANG=ADQL&FORMAT=csv&QUERY=" + urllib.parse.quote(adql_eb)
         df_eb = fetch_csv_with_headers(eb_url)
         eb_tics = set(df_eb["TIC"].dropna().astype(int).astype(str))
-        known_tics.update(eb_tics)
+        known_eb_tics.update(eb_tics)
+        known_catalog_tics.update(eb_tics)
         write_log(f"      -> Loaded {len(eb_tics)} cataloged TESS Eclipsing Binary (EB) stars.")
     except Exception as e:
         write_log(f"      [!] Warning: Could not load VizieR TESS EB table (using cache): {e}")
 
-    if known_tics:
+    if known_catalog_tics:
         try:
             with open(CATALOG_CACHE_FILE, "w", encoding="utf-8") as f:
-                f.write("\n".join(sorted(known_tics)) + "\n")
+                f.write("\n".join(sorted(known_catalog_tics)) + "\n")
         except Exception:
             pass
 
-    return known_tics
+    return known_catalog_tics, known_eb_tics, toi_ephemerides
+
+
+def get_known_transits_for_tic(tic_id: str) -> list:
+    """Retrieves cached official TOI planet ephemerides for a target star, if any."""
+    tid_str = str(tic_id).lstrip("0")
+    if tid_str in GLOBAL_TOI_EPHEMERIDES:
+        return GLOBAL_TOI_EPHEMERIDES[tid_str]
+    if os.path.exists(TOI_EPHEMERIS_CACHE_FILE):
+        try:
+            with open(TOI_EPHEMERIS_CACHE_FILE, "r", encoding="utf-8") as f:
+                ephems = json.load(f)
+                GLOBAL_TOI_EPHEMERIDES.update(ephems)
+                return GLOBAL_TOI_EPHEMERIDES.get(tid_str, [])
+        except Exception:
+            pass
+    return []
+
+
+def get_known_exoplanet_tics() -> set:
+    """Legacy compatibility helper."""
+    known_cats, _, _ = load_known_catalogs_and_toi_ephemerides()
+    return known_cats
 
 
 def purge_target_cache(tic_id: str):
@@ -268,13 +352,16 @@ def append_scanned_history(tic_id: str):
 
 
 def select_latest_sector_and_targets(sector_list: list, limit: int) -> tuple:
-    known_catalog_tics = get_known_exoplanet_tics()
+    known_catalog_tics, known_eb_tics, toi_ephemerides = load_known_catalogs_and_toi_ephemerides()
     scanned_tics = load_scanned_history() - set(PRIORITY_TICS)
 
-    write_log("[4/5] Probing MAST archive for the newest available TESS SPOC sector...")
+    write_log("[5/5] Probing MAST archive for the newest available TESS SPOC sector...")
     chosen_sector = None
     available_tics = []
     raw_count = 0
+    toi_in_sec_count = 0
+    novel_count = 0
+    toi_host_set = set(toi_ephemerides.keys()) - known_eb_tics
 
     for sec in sector_list:
         try:
@@ -289,14 +376,31 @@ def select_latest_sector_and_targets(sector_list: list, limit: int) -> tuple:
                 continue
 
             raw_tics = set(str(t).lstrip("0") for t in obs_table["target_name"] if str(t).isdigit())
-            rem_tics = list(raw_tics - known_catalog_tics - scanned_tics)
-            if len(rem_tics) == 0:
+            
+            # Known TOI candidate/confirmed planetary systems (excluding cataloged EBs)
+            toi_in_sec = [t for t in sorted(raw_tics & toi_host_set) if t not in scanned_tics]
+            novel_tics = [t for t in sorted(raw_tics - known_catalog_tics) if t not in scanned_tics]
+
+            if SEARCH_TOI_COMPANIONS:
+                # Prioritize known TOI systems at the head of the queue for companion exoplanet discovery
+                combined_unsearched = toi_in_sec + novel_tics
+                write_log(
+                    f"      -> Sector {sec}: Found {len(raw_tics)} SPOC stars | "
+                    f"{len(toi_in_sec)} known TOI hosts queued for sibling search | "
+                    f"{len(novel_tics)} unsearched novel stars."
+                )
+            else:
+                combined_unsearched = novel_tics
+
+            if len(combined_unsearched) == 0:
                 write_log(f"      -> Sector {sec}: All {len(raw_tics)} targets already scanned, moving to next...")
                 continue
 
             chosen_sector = sec
-            available_tics = rem_tics
+            available_tics = combined_unsearched
             raw_count = len(raw_tics)
+            toi_in_sec_count = len(toi_in_sec)
+            novel_count = len(novel_tics)
             break
         except Exception as e:
             write_log(f"      -> Sector {sec} query error ({e}), trying next...")
@@ -307,17 +411,19 @@ def select_latest_sector_and_targets(sector_list: list, limit: int) -> tuple:
 
     final_queue = []
     for ptic in PRIORITY_TICS:
-        if ptic in known_catalog_tics:
-            write_log(f"      [i] Note: Priority target TIC {ptic} is already listed in TOI/CTOI/Confirmed catalogs.")
+        if ptic in known_catalog_tics and ptic not in toi_host_set:
+            write_log(f"      [i] Note: Priority target TIC {ptic} is already listed in catalogs.")
         final_queue.append(ptic)
 
     for tic in available_tics:
         if tic not in final_queue:
             final_queue.append(tic)
 
+    n_toi_queued = sum(1 for t in final_queue[:limit] if t in toi_host_set)
     lock_msg = (
         f"Sector {chosen_sector} locked | Total SPOC: {raw_count} | "
-        f"Unsearched: {len(available_tics)} | Queued: {min(limit, len(final_queue))}"
+        f"Unsearched: {len(available_tics)} (TOI Hosts: {toi_in_sec_count}, Novel: {novel_count}) | "
+        f"Queued: {min(limit, len(final_queue))} (TOI Sibling Targets: {n_toi_queued})"
     )
     write_log(f"[5/5] {lock_msg}\n")
     write_event(lock_msg)
@@ -747,6 +853,7 @@ def verify_multi_epoch(
     flat_f_curr: np.ndarray,
     flat_ferr_curr: np.ndarray,
     best_p: float,
+    best_t0: float,
     best_dur: float,
     depth_ppm_curr: float,
     sde_curr: float
@@ -769,10 +876,17 @@ def verify_multi_epoch(
                 "n_archival_sectors": 0,
                 "archival_sectors_str": "None",
                 "refined_p": best_p,
+                "refined_t0": best_t0,
                 "archival_snr": np.nan,
+                "est_multi_sde_proxy": sde_curr,
                 "multi_sde": sde_curr,
                 "arch_bin_centers": None,
-                "arch_bin_means": None
+                "arch_bin_means": None,
+                "n_trials": 1,
+                "snr_crit": 2.4,
+                "is_projected_strict": True,
+                "delta_t_arch_days": 0.0,
+                "sigma_p_sec": np.nan
             }
             
         chosen_idx = prior_indices[-3:]
@@ -799,11 +913,17 @@ def verify_multi_epoch(
                 "n_archival_sectors": 0,
                 "archival_sectors_str": "None",
                 "refined_p": best_p,
+                "refined_t0": best_t0,
                 "archival_snr": np.nan,
                 "est_multi_sde_proxy": sde_curr,
                 "multi_sde": sde_curr,
                 "arch_bin_centers": None,
-                "arch_bin_means": None
+                "arch_bin_means": None,
+                "n_trials": 1,
+                "snr_crit": 2.4,
+                "is_projected_strict": True,
+                "delta_t_arch_days": 0.0,
+                "sigma_p_sec": np.nan
             }
             
         t_prior = np.concatenate(t_raw_list)
@@ -817,19 +937,42 @@ def verify_multi_epoch(
         sort_c = np.argsort(t_comb)
         t_comb, f_comb, ferr_comb = t_comb[sort_c], f_comb[sort_c], ferr_comb[sort_c]
         
-        baseline_days = float(np.max(t_comb) - np.min(t_comb))
-        n_orbits = max(10.0, baseline_days / best_p)
-        n_grid_pts = int(np.clip(n_orbits * 45.0, 5000, 16000))
-        
-        fine_periods = np.linspace(best_p * 0.994, best_p * 1.006, n_grid_pts)
-        fine_durs = np.array([max(0.03, best_dur * 0.85), best_dur, min(0.22, best_dur * 1.15)])
-        
-        bls_comb = BoxLeastSquares(t_comb, f_comb, dy=ferr_comb)
-        res_comb = bls_comb.power(fine_periods, fine_durs)
-        best_c_idx = int(np.nanargmax(res_comb.power))
-        refined_p = float(res_comb.period[best_c_idx])
-        refined_t0 = float(res_comb.transit_time[best_c_idx])
-        
+        delta_t_arch = abs(float(np.median(t_curr) - np.median(t_prior)))
+        baseline_curr = float(np.max(t_curr) - np.min(t_curr))
+
+        # Goal 3: Cramer-Rao Fisher timing uncertainty from discovery sector (Carter et al. 2008)
+        sigma_t0 = (0.5 * best_dur) / max(sde_curr, 5.0)
+        n_cyc_disc = max(1.0, baseline_curr / best_p)
+        sigma_p = np.sqrt(12.0) * sigma_t0 / n_cyc_disc
+
+        if delta_t_arch <= 60.0:
+            # Contiguous or near-contiguous sectors: strict zero-freedom forward projection (N_trials = 1)
+            refined_p = best_p
+            refined_t0 = best_t0
+            n_trials = 1
+            snr_crit = 2.4
+            is_projected_strict = True
+        else:
+            # Multi-year archival baseline: search strictly within Cramer-Rao 2-sigma corridor
+            # with Sidak-Bonferroni trial penalty (eliminates circular overfitting of noise dips)
+            p_hw = 2.0 * sigma_p
+            p_min = max(0.5, best_p - p_hw)
+            p_max = best_p + p_hw
+            delta_p_indep = (best_p * best_dur) / delta_t_arch
+            n_trials = max(1, int(np.ceil((2.0 * p_hw) / max(delta_p_indep, 1e-6))))
+            snr_crit = max(2.8, float(np.sqrt(2.0 * np.log(max(n_trials, 2))) + 1.2))
+            is_projected_strict = False
+            
+            n_grid_pts = int(np.clip(n_trials * 4, 60, 4000))
+            fine_periods = np.linspace(p_min, p_max, n_grid_pts)
+            fine_durs = np.array([max(0.03, best_dur * 0.90), best_dur, min(0.22, best_dur * 1.10)])
+            
+            bls_comb = BoxLeastSquares(t_comb, f_comb, dy=ferr_comb)
+            res_comb = bls_comb.power(fine_periods, fine_durs)
+            best_c_idx = int(np.nanargmax(res_comb.power))
+            refined_p = float(res_comb.period[best_c_idx])
+            refined_t0 = float(res_comb.transit_time[best_c_idx])
+            
         phase_prior = ((t_prior - refined_t0 + 0.5 * refined_p) % refined_p) - 0.5 * refined_p
         tr_mask_prior = np.abs(phase_prior) < (0.6 * best_dur)
         trend_prior_ref = piecewise_savgol_detrend(t_prior, f_prior_raw, mask=tr_mask_prior, max_win=601)
@@ -846,10 +989,27 @@ def verify_multi_epoch(
         err_prior_ppm = float(np.nanstd(f_prior[out_tr_p]) / np.sqrt(np.sum(in_tr_p)) * 1e6)
         archival_snr = depth_prior_ppm / max(err_prior_ppm, 1.0)
         
-        if archival_snr < 2.4 or depth_prior_ppm < 0.25 * depth_ppm_curr:
+        # Control Phase Null Test: measure flux deficit at 8 off-transit control phases
+        ctrl_phases = [0.15, 0.20, 0.25, 0.30, 0.70, 0.75, 0.80, 0.85]
+        ctrl_snrs = []
+        for cp in ctrl_phases:
+            in_cp = np.abs(phase_prior - cp * refined_p) < (0.45 * best_dur)
+            if np.sum(in_cp) >= 5:
+                cp_depth = float((base_p - np.nanmean(f_prior[in_cp])) * 1e6)
+                ctrl_snrs.append(cp_depth / max(err_prior_ppm, 1.0))
+        max_ctrl_snr = max(ctrl_snrs) if ctrl_snrs else 0.0
+
+        if archival_snr < snr_crit or depth_prior_ppm < 0.25 * depth_ppm_curr:
             return (
                 False,
-                f"Archival non-detection in sectors {chosen_secs} (Prior Depth={depth_prior_ppm:.0f}ppm, SNR={archival_snr:.1f}sigma) -> Transient artifact",
+                f"Archival non-detection in sectors {chosen_secs} (Prior Depth={depth_prior_ppm:.0f}ppm, SNR={archival_snr:.1f}sigma < crit={snr_crit:.1f}sigma, N_trials={n_trials}) -> Transient artifact",
+                None
+            )
+
+        if not is_projected_strict and (archival_snr < max_ctrl_snr + 1.5):
+            return (
+                False,
+                f"Archival signal failed control phase null test in sectors {chosen_secs} (Transit SNR={archival_snr:.1f}sigma vs control peak {max_ctrl_snr:.1f}sigma) -> Red noise fluctuation",
                 None
             )
             
@@ -876,11 +1036,17 @@ def verify_multi_epoch(
             "n_archival_sectors": len(chosen_secs),
             "archival_sectors_str": secs_str,
             "refined_p": refined_p,
+            "refined_t0": refined_t0,
             "archival_snr": archival_snr,
             "est_multi_sde_proxy": proxy_sde,
             "multi_sde": proxy_sde,
             "arch_bin_centers": arch_centers,
-            "arch_bin_means": arch_means
+            "arch_bin_means": arch_means,
+            "n_trials": n_trials,
+            "snr_crit": snr_crit,
+            "is_projected_strict": is_projected_strict,
+            "delta_t_arch_days": delta_t_arch,
+            "sigma_p_sec": float(sigma_p * 86400.0)
         }
     except Exception as e:
         logger.warning("Archival verification error for TIC %s (%s)", tic_id, e)
@@ -890,11 +1056,17 @@ def verify_multi_epoch(
             "n_archival_sectors": 0,
             "archival_sectors_str": "None",
             "refined_p": best_p,
+            "refined_t0": best_t0,
             "archival_snr": np.nan,
             "est_multi_sde_proxy": sde_curr,
             "multi_sde": sde_curr,
             "arch_bin_centers": None,
-            "arch_bin_means": None
+            "arch_bin_means": None,
+            "n_trials": 1,
+            "snr_crit": 2.4,
+            "is_projected_strict": True,
+            "delta_t_arch_days": 0.0,
+            "sigma_p_sec": np.nan
         }
 
 
@@ -932,11 +1104,51 @@ def _analyze_single_target_impl(tic_id: str, sector: int, min_period: float = 0.
         keep = f < (med_f + 3.0 * mad_std)
         t, f, ferr, dx, dy = t[keep], f[keep], ferr[keep], dx[keep], dy[keep]
         
-        trend = piecewise_savgol_detrend(t, f, mask=None, max_win=601)
-        flat_f_init = f / trend
-        flat_ferr_init = ferr / trend
+        known_transits = get_known_transits_for_tic(tic_id)
+        is_toi_host = len(known_transits) > 0
+        in_known_transit = np.zeros(len(t), dtype=bool)
+
+        if is_toi_host:
+            for kp in known_transits:
+                pk = kp["period"]
+                t0k = kp["t0"]
+                durk = kp["duration"]
+                phk = ((t - t0k + 0.5 * pk) % pk) - 0.5 * pk
+                # Expanded buffer: +- 1.0 * duration (covers ingress/egress tails and up to +-45 min TTVs)
+                in_known_transit |= (np.abs(phk) <= (1.0 * durk))
+            mask_frac = float(np.mean(in_known_transit))
+            if mask_frac > 0.40:
+                return tic_id, "REJECT_TOI_MASK_TOO_LARGE", f"REJECT: Known TOI transits cover > 40% of light curve ({mask_frac*100:.1f}%)", None
+
+        if is_toi_host and np.any(in_known_transit):
+            # Goal 2: Linear interpolation across known transits BEFORE Savitzky-Golay detrending prevents filter edge ringing
+            f_for_trend = f.copy()
+            f_for_trend[in_known_transit] = np.interp(
+                t[in_known_transit], t[~in_known_transit], f[~in_known_transit]
+            )
+            trend = piecewise_savgol_detrend(t, f_for_trend, mask=None, max_win=601)
+            flat_f_init = f / trend
+            flat_ferr_init = ferr / trend
+
+            # Create masked residual arrays for BLS periodic signal search
+            keep_res = ~in_known_transit
+            t_bls = t[keep_res]
+            flat_f_bls = flat_f_init[keep_res]
+            flat_ferr_bls = flat_ferr_init[keep_res]
+            dx_bls = dx[keep_res]
+            dy_bls = dy[keep_res]
+        else:
+            trend = piecewise_savgol_detrend(t, f, mask=None, max_win=601)
+            flat_f_init = f / trend
+            flat_ferr_init = ferr / trend
+            keep_res = np.ones(len(t), dtype=bool)
+            t_bls = t
+            flat_f_bls = flat_f_init
+            flat_ferr_bls = flat_ferr_init
+            dx_bls = dx
+            dy_bls = dy
         
-        max_p = min(max_period, (t[-1] - t[0]) * 0.48)
+        max_p = min(max_period, (t_bls[-1] - t_bls[0]) * 0.48)
         if max_p <= min_period:
             return tic_id, "REJECT_BASELINE", "REJECT: Time baseline too short", None
             
@@ -945,7 +1157,7 @@ def _analyze_single_target_impl(tic_id: str, sector: int, min_period: float = 0.
         # Start durations at 0.045d (1.08h) to prevent BLS grid boundary collapse
         durations = np.linspace(0.045, 0.18, 12)
         
-        bls_model = BoxLeastSquares(t, flat_f_init, dy=flat_ferr_init)
+        bls_model = BoxLeastSquares(t_bls, flat_f_bls, dy=flat_ferr_bls)
         bls_res = bls_model.power(periods, durations)
         
         # Kovács et al. (2002) whitened linear Signal Residue SDE
@@ -974,19 +1186,48 @@ def _analyze_single_target_impl(tic_id: str, sector: int, min_period: float = 0.
                     first_reject_code = "REJECT_DUTY_CYCLE"
                     first_reject_msg = f"REJECT [SDE={sde:.1f}, P={best_p:.3f}d]: Duty cycle too wide ({best_dur/best_p:.2f}) -> Sinusoidal variable"
                 continue
+
+            # Harmonic protection: reject integer/fractional period multiples of masked known TOI planets
+            if is_toi_host:
+                is_harmonic = False
+                harmonic_reason = ""
+                for kp in known_transits:
+                    pk = kp["period"]
+                    for num, den in [(1, 1), (1, 2), (2, 1), (1, 3), (3, 1), (2, 3), (3, 2), (1, 4), (4, 1)]:
+                        exp_p = pk * (num / den)
+                        if abs(best_p - exp_p) / exp_p < 0.015:
+                            is_harmonic = True
+                            harmonic_reason = f"Harmonic {num}/{den} of known TOI {kp['toi']} (P={pk:.4f}d)"
+                            break
+                    if is_harmonic:
+                        break
+                if is_harmonic:
+                    if rank_idx == 1:
+                        first_reject_code = "REJECT_KNOWN_PLANET_HARMONIC"
+                        first_reject_msg = f"REJECT [SDE={sde:.1f}, P={best_p:.4f}d]: {harmonic_reason}"
+                    continue
                 
-            phase = ((t - best_t0 + 0.5 * best_p) % best_p) - 0.5 * best_p
-            transit_mask = np.abs(phase) < (0.6 * best_dur)
+            phase_full = ((t - best_t0 + 0.5 * best_p) % best_p) - 0.5 * best_p
+            phase = phase_full[keep_res]
+            transit_mask = (np.abs(phase_full) < (0.6 * best_dur)) | in_known_transit
             
-            if np.sum(transit_mask) < 6 or np.sum(~transit_mask) < 100:
+            if np.sum(np.abs(phase) < (0.6 * best_dur)) < 6 or np.sum(~transit_mask) < 100:
                 if rank_idx == 1:
                     first_reject_code = "REJECT_POINTS"
                     first_reject_msg = f"REJECT [SDE={sde:.1f}, P={best_p:.3f}d]: Insufficient in-transit points"
                 continue
                 
-            trend_refined = piecewise_savgol_detrend(t, f, mask=transit_mask, max_win=601)
-            flat_f = f / trend_refined
-            flat_ferr = ferr / trend_refined
+            f_for_ref = f.copy()
+            if is_toi_host and np.any(in_known_transit):
+                f_for_ref[in_known_transit] = np.interp(
+                    t[in_known_transit], t[~in_known_transit], f[~in_known_transit]
+                )
+            trend_refined = piecewise_savgol_detrend(t, f_for_ref, mask=transit_mask, max_win=601)
+            flat_f = (f / trend_refined)[keep_res]
+            flat_ferr = (ferr / trend_refined)[keep_res]
+            t_curr_eval = t_bls
+            dx_curr_eval = dx_bls
+            dy_curr_eval = dy_bls
             
             in_tr = np.abs(phase) < (0.45 * best_dur)
             out_tr = np.abs(phase) > (0.65 * best_dur)
@@ -1043,7 +1284,7 @@ def _analyze_single_target_impl(tic_id: str, sector: int, min_period: float = 0.
                         continue
             
             # Filter 3: Multiplicity (>= 3 transits), Odd-Even symmetry & Phase 0.5 Secondary Eclipse Test
-            orbit_num = np.round((t - best_t0) / best_p).astype(int)
+            orbit_num = np.round((t_curr_eval - best_t0) / best_p).astype(int)
             unique_transits = len(np.unique(orbit_num[in_tr]))
             if unique_transits < 3:
                 if rank_idx == 1:
@@ -1089,7 +1330,7 @@ def _analyze_single_target_impl(tic_id: str, sector: int, min_period: float = 0.
                 
             # Secondary Eclipse Test (full out-of-transit scan for eccentric EBs with Sidak-Bonferroni trials correction)
             is_sec_eb, sec_snr, sec_depth_ppm, sec_phi, z_crit = scan_full_orbit_secondary_eclipse(
-                t, flat_f, best_p, best_t0, best_dur, depth_ppm
+                t_curr_eval, flat_f, best_p, best_t0, best_dur, depth_ppm
             )
             if is_sec_eb:
                 if rank_idx == 1:
@@ -1101,8 +1342,8 @@ def _analyze_single_target_impl(tic_id: str, sector: int, min_period: float = 0.
                 continue
                 
             # Filter 4: Astrometric centroid stability
-            dx_in, dx_out = dx[in_tr], dx[out_tr]
-            dy_in, dy_out = dy[in_tr], dy[out_tr]
+            dx_in, dx_out = dx_curr_eval[in_tr], dx_curr_eval[out_tr]
+            dy_in, dy_out = dy_curr_eval[in_tr], dy_curr_eval[out_tr]
             
             _, p_val_x = stats.ttest_ind(dx_in, dx_out, equal_var=False)
             _, p_val_y = stats.ttest_ind(dy_in, dy_out, equal_var=False)
@@ -1167,7 +1408,7 @@ def _analyze_single_target_impl(tic_id: str, sector: int, min_period: float = 0.
 
             # Filter 7: Multi-Epoch Archival Verification across prior TESS sectors
             arch_ok, arch_status, arch_info = verify_multi_epoch(
-                tic_id, last_sector, t, flat_f, flat_ferr, best_p, best_dur, depth_ppm, sde
+                tic_id, last_sector, t_curr_eval, flat_f, flat_ferr, best_p, best_t0, best_dur, depth_ppm, sde
             )
             if not arch_ok:
                 if rank_idx == 1:
@@ -1187,7 +1428,8 @@ def _analyze_single_target_impl(tic_id: str, sector: int, min_period: float = 0.
             axes[0, 0].axhline(6.0, color="gray", linestyle=":", label="SDE = 6.0")
             axes[0, 0].set_xlabel("Trial Period (days)")
             axes[0, 0].set_ylabel("Kovács Whitened SDE")
-            axes[0, 0].set_title(f"BLS Whitened SDE: TIC {tic_id} (SDE = {sde:.1f}, N_transits = {unique_transits})")
+            toi_title_suffix = " [TOI Sibling Search]" if is_toi_host else ""
+            axes[0, 0].set_title(f"BLS Whitened SDE: TIC {tic_id}{toi_title_suffix} (SDE = {sde:.1f}, N_transits = {unique_transits})")
             axes[0, 0].legend(loc="upper right")
             
             axes[0, 1].scatter(phase[vis], flat_f[vis], s=2, color="gray", alpha=0.35, label=f"Sector {last_sector} (2-min)")
@@ -1209,8 +1451,8 @@ def _analyze_single_target_impl(tic_id: str, sector: int, min_period: float = 0.
             )
             axes[0, 1].legend(loc="lower right")
             
-            axes[1, 0].scatter(phase[vis], dx[vis] * 21.0, s=2, alpha=0.35, label="dX (arcsec)")
-            axes[1, 0].scatter(phase[vis], dy[vis] * 21.0, s=2, alpha=0.35, label="dY (arcsec)")
+            axes[1, 0].scatter(phase[vis], dx_curr_eval[vis] * 21.0, s=2, alpha=0.35, label="dX (arcsec)")
+            axes[1, 0].scatter(phase[vis], dy_curr_eval[vis] * 21.0, s=2, alpha=0.35, label="dY (arcsec)")
             axes[1, 0].axvspan(-0.5 * best_dur, 0.5 * best_dur, color="red", alpha=0.15, label="Transit Window")
             axes[1, 0].set_xlim(-win_phase, win_phase)
             axes[1, 0].set_ylim(-5, 5)
@@ -1241,8 +1483,14 @@ def _analyze_single_target_impl(tic_id: str, sector: int, min_period: float = 0.
                 "pipeline_version": PIPELINE_VERSION,
                 "tic_id": tic_id,
                 "sector": last_sector,
+                "is_toi_host": is_toi_host,
+                "known_toi_context": ",".join(f"{kp['toi']}(P={kp['period']:.3f}d)" for kp in known_transits) if is_toi_host else "None",
+                "candidate_type": "TOI_SIBLING_COMPANION" if is_toi_host else "NOVEL_DISCOVERY",
                 "archival_sectors": arch_secs_str,
                 "archival_snr_sigma": round(arch_snr, 2) if np.isfinite(arch_snr) else "Single-Sector",
+                "archival_trials": arch_info.get("n_trials", 1),
+                "archival_snr_crit": round(arch_info.get("snr_crit", 2.4), 2),
+                "cramer_rao_sigma_p_sec": round(arch_info.get("sigma_p_sec", 0.0), 2) if np.isfinite(arch_info.get("sigma_p_sec", np.nan)) else np.nan,
                 "period_days": round(refined_p, 6),
                 "t0_btjd": round(best_t0, 5),
                 "duration_hours": round(obs_dur_hr, 2),
@@ -1262,9 +1510,11 @@ def _analyze_single_target_impl(tic_id: str, sector: int, min_period: float = 0.
                 "exofop_url": f"https://exofop.ipac.caltech.edu/tess/target.php?id={tic_id}"
             }
             
+            cand_tag = f"TOI SIBLING (Host of {known_transits[0]['toi']})" if is_toi_host else "CANDIDATE"
+            trials_str = f"Trials={arch_info.get('n_trials', 1)}, Crit={arch_info.get('snr_crit', 2.4):.1f}s"
             msg = (
-                f"CANDIDATE FOUND (Peak #{rank_idx})! P={refined_p:.5f} d | N={unique_transits} | Depth={depth_ppm:.0f} ppm | "
-                f"Rp={r_planet_earth:.2f} R_E | SDE={sde:.1f} | Archival={arch_status}"
+                f"{cand_tag} FOUND (Peak #{rank_idx})! P={refined_p:.5f} d | N={unique_transits} | Depth={depth_ppm:.0f} ppm | "
+                f"Rp={r_planet_earth:.2f} R_E | SDE={sde:.1f} | Archival={arch_status} ({trials_str})"
             )
             return tic_id, "CANDIDATE", msg, cand_data
             

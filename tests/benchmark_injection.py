@@ -1,5 +1,6 @@
 import os
 import sys
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import warnings
 import numpy as np
 import pandas as pd
@@ -9,6 +10,7 @@ import matplotlib.pyplot as plt
 from scipy.signal import savgol_filter
 from scipy.ndimage import median_filter
 from astropy.timeseries import BoxLeastSquares
+from pleiades import exact_annulus_transit_model
 
 os.environ["PYTHONWARNINGS"] = "ignore::UserWarning"
 warnings.filterwarnings("ignore", category=UserWarning)
@@ -71,9 +73,11 @@ def inject_physical_transit(
     rp_earth: float,
     r_star_sun: float = 0.50,
     m_star_sun: float = 0.50,
-    b_impact: float = 0.30
+    b_impact: float = 0.30,
+    u1: float = 0.45,
+    u2: float = 0.25
 ) -> tuple[np.ndarray, float, float]:
-    """Injects a limb-darkened transit signal into flux array f and returns (f_injected, depth_ppm, dur_days)."""
+    """Injects a high-precision limb-darkened transit using the 5-point Gauss-Legendre 300-ring integrator (<3.1 ppm error)."""
     g_si = 6.67430e-11
     m_sun_val = 1.98847e30
     r_sun_val = 6.957e8
@@ -88,18 +92,14 @@ def inject_physical_transit(
     dur_days = max(0.040, dur_days)
 
     ph = ((t - t0_days + 0.5 * p_days) % p_days) - 0.5 * p_days
-    in_tr = np.abs(ph) < (0.5 * dur_days)
+    in_tr = np.abs(ph) < (0.6 * dur_days)
     f_inj = f.copy()
     if np.any(in_tr):
-        x_norm = ph[in_tr] / (0.5 * dur_days)
-        z = np.hypot(b_impact, x_norm * half_chord)
-        mu = np.sqrt(np.clip(1.0 - np.clip(z, 0.0, 1.0) ** 2, 0.0, 1.0))
-        u1, u2 = 0.50, 0.22
-        norm_ld = 1.0 - u1 / 3.0 - u2 / 6.0
-        ld_prof = (1.0 - u1 * (1.0 - mu) - u2 * (1.0 - mu) ** 2) / norm_ld
-        f_inj[in_tr] -= (rp_rs ** 2) * ld_prof
+        model_flux = exact_annulus_transit_model(ph[in_tr], rp_rs, b_impact, dur_days, u1, u2)
+        f_inj[in_tr] -= (1.0 - model_flux)
 
-    return f_inj, float((rp_rs ** 2) * 1e6), dur_days
+    depth_ppm = float((rp_rs ** 2) * 1e6)
+    return f_inj, depth_ppm, dur_days
 
 
 def run_injection_recovery_suite(n_trials_per_cell: int = 8):
@@ -109,7 +109,7 @@ def run_injection_recovery_suite(n_trials_per_cell: int = 8):
     a publication-grade Completeness Heatmap and CSV summary.
     """
     print("=" * 72)
-    print("ALDEBARAN v8.2 SYNTHETIC INJECTION-RECOVERY BENCHMARK")
+    print("ALDEBARAN v9.0 SYNTHETIC INJECTION-RECOVERY BENCHMARK")
     print("=" * 72)
 
     p_bins = np.array([1.0, 2.2, 4.0, 6.5, 9.5, 12.0])
@@ -180,7 +180,7 @@ def run_injection_recovery_suite(n_trials_per_cell: int = 8):
     ax.set_yticklabels([f"{r:.1f}" for r in rp_bins])
     ax.set_xlabel("Injected Orbital Period (days)", fontsize=11)
     ax.set_ylabel("Injected Planet Radius ($R_\\oplus$, for $0.50\\,R_\\odot$ Host)", fontsize=11)
-    ax.set_title("Aldebaran v8.2 Injection-Recovery Completeness Map (SDE $\\geq 6.0$)", fontsize=12)
+    ax.set_title("Aldebaran v9.0 Injection-Recovery Completeness Map (SDE $\\geq 6.0$)", fontsize=12)
 
     for i in range(len(rp_bins)):
         for j in range(len(p_bins)):
