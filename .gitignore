@@ -33,10 +33,14 @@ tess_results/scanned_tics.txt
 tess_results/known_catalog_cache.txt
 tess_results/*.log
 *.log
+*_gaia_background.csv
+*_background.csv
 
 # Heavy generated candidate plots & run outputs (prevents bloating git repository)
 tess_results/*.png
 tess_results/**/*.png
+tess_results/*.pdf
+tess_results/**/*.pdf
 tess_results/*.csv
 tess_results/**/*.csv
 tess_results/cluster_deep_vetting/
