@@ -114,6 +114,7 @@ def run_triceratops_validation(tic_id, period, t0_btjd, duration_hours, depth_pp
     print(f"\n[TRICERATOPS] Calculating Bayesian scenario probabilities (N_MC={n_mc} draws)...")
     fpps = []
     nfpps = []
+    probs_history = []
     for i in range(n_mc):
         try:
             target.calc_probs(
@@ -126,6 +127,7 @@ def run_triceratops_validation(tic_id, period, t0_btjd, duration_hours, depth_pp
             )
             fpps.append(target.FPP)
             nfpps.append(target.NFPP)
+            probs_history.append(target.probs.copy())
             print(f"   [Iter {i+1:2d}/{n_mc}] FPP = {target.FPP:.5f} ({target.FPP*100:.2f}%) | NFPP = {target.NFPP:.5f} ({target.NFPP*100:.2f}%)")
         except Exception as e:
             print(f"   [Iter {i+1:2d}] Failed: {e}")
@@ -184,17 +186,39 @@ def run_triceratops_validation(tic_id, period, t0_btjd, duration_hours, depth_pp
     except Exception as e:
         print(f"[!] Notice plotting field: {e}")
 
-    # Save CSV
-    prob_df = target.probs
+    # Save CSV: compute mean probabilities across all Monte Carlo draws
+    base_df = target.probs.copy()
+    if probs_history:
+        all_p = np.array([p['prob'].values for p in probs_history])
+        mean_p = np.mean(all_p, axis=0)
+        base_df['prob'] = mean_p
+        if base_df['prob'].sum() > 0:
+            base_df['prob'] = base_df['prob'] / base_df['prob'].sum()
+    prob_df = base_df
+
     csv_path = f"tess_results/triceratops/triceratops_probs_TIC_{tic_id}.csv"
     prob_df.to_csv(csv_path)
-    print(f"[TRICERATOPS] Saved scenario probabilities table to {csv_path}")
+    print(f"[TRICERATOPS] Saved scenario probabilities table (averaged over {len(probs_history)} MC draws) to {csv_path}")
 
     # Print scenario breakdown
-    print("\n[TRICERATOPS] Top 5 Most Probable Scenarios:")
+    print(f"\n[TRICERATOPS] Top 5 Most Probable Scenarios (Averaged across {len(probs_history)} MC draws):")
     sorted_probs = prob_df.sort_values(by="prob", ascending=False)
     for idx, r in sorted_probs.head(5).iterrows():
         print(f"   {r['scenario']:<10}: P = {r['prob']:.4f} ({r['prob']*100:.2f}%)")
+
+    # Astrophysical accounting breakdown
+    p_tp = prob_df[prob_df['scenario'] == 'TP']['prob'].sum()
+    p_ptp = prob_df[prob_df['scenario'] == 'PTP']['prob'].sum()
+    p_dtp = prob_df[prob_df['scenario'] == 'DTP']['prob'].sum()
+    p_stp = prob_df[prob_df['scenario'] == 'STP']['prob'].sum()
+    p_primary_planet = p_tp + p_ptp + p_dtp
+    p_bound_planet = p_primary_planet + p_stp
+    p_eb_total = 1.0 - p_bound_planet
+    print(f"\n[TRICERATOPS] Astrophysical Planet vs. False Positive Budget:")
+    print(f"   -> Primary Host Planet (1 - FPP)  : {p_primary_planet*100:.2f}% (TP={p_tp*100:.2f}%, PTP={p_ptp*100:.2f}%, DTP={p_dtp*100:.2f}%)")
+    print(f"   -> Secondary Companion Planet(STP): {p_stp*100:.2f}% (classified under formal FPP in TRICERATOPS)")
+    print(f"   -> Total Bound Planet Probability : {p_bound_planet*100:.2f}%")
+    print(f"   -> Non-Planetary EB Probability   : {p_eb_total*100:.2f}% (Nearby NEB={mean_nfpp*100:.2f}%)")
 
     return {
         'tic_id': tic_id,
