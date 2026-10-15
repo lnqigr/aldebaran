@@ -1,0 +1,60 @@
+#!/bin/bash
+# ==============================================================================
+# ALDEBARAN v9.0 - TOI COMPANION SEARCH ON SECTORS 99-106 (METACENTRUM BATCH)
+# ==============================================================================
+#PBS -N toi_companions
+#PBS -l select=1:ncpus=8:mem=24gb:scratch_local=25gb
+#PBS -l walltime=03:00:00
+#PBS -m ae
+#PBS -j oe
+
+echo "======================================================================"
+echo "Starting TOI Companion Search on $(hostname)"
+echo "Job ID: $PBS_JOBID"
+echo "Start time: $(date)"
+echo "======================================================================"
+
+REPO_DIR="$PBS_O_WORKDIR"
+if [ ! -f "$REPO_DIR/search_toi_companions.py" ] && [ -f "$REPO_DIR/../search_toi_companions.py" ]; then
+    REPO_DIR="$(cd "$REPO_DIR/.." && pwd)"
+fi
+cd "$REPO_DIR" || exit 1
+
+module add python/3.11 2>/dev/null || module add python 2>/dev/null || true
+
+export XDG_CACHE_HOME="$SCRATCHDIR/.cache"
+export PIP_CACHE_DIR="$SCRATCHDIR/.cache/pip"
+export LIGHTKURVE_CACHE_DIR="$SCRATCHDIR/.cache/lightkurve"
+export ASTROPY_CACHE_DIR="$SCRATCHDIR/.cache/astropy"
+export MPLCONFIGDIR="$SCRATCHDIR/.cache/matplotlib"
+mkdir -p "$XDG_CACHE_HOME" "$PIP_CACHE_DIR" "$LIGHTKURVE_CACHE_DIR" "$ASTROPY_CACHE_DIR" "$MPLCONFIGDIR"
+
+# Copy code and existing cache to scratch
+cp "$REPO_DIR"/*.py "$SCRATCHDIR/"
+cp "$REPO_DIR"/requirements.txt "$SCRATCHDIR/" 2>/dev/null || true
+mkdir -p "$SCRATCHDIR/tess_results/toi_companions"
+if [ -d "$REPO_DIR/tess_results" ]; then
+    cp -rf "$REPO_DIR/tess_results"/. "$SCRATCHDIR/tess_results/" 2>/dev/null || true
+fi
+cd "$SCRATCHDIR" || exit 1
+
+python3 -m venv "$SCRATCHDIR/venv"
+source "$SCRATCHDIR/venv/bin/activate"
+pip install --upgrade pip --no-cache-dir --quiet
+if [ -f requirements.txt ]; then
+    pip install --no-cache-dir --quiet -r requirements.txt certifi
+else
+    pip install --no-cache-dir --quiet numpy scipy astropy pandas lightkurve astroquery matplotlib requests urllib3 certifi
+fi
+
+# Run TOI companion search on sectors 106 down to 99 across 8 parallel workers
+python search_toi_companions.py --sectors 106 105 104 103 102 101 100 99 --workers 8 --output-dir "$SCRATCHDIR/tess_results/toi_companions"
+
+# Sync results back to permanent repo storage
+mkdir -p "$REPO_DIR/tess_results/toi_companions"
+cp -rf "$SCRATCHDIR/tess_results/toi_companions"/. "$REPO_DIR/tess_results/toi_companions/" 2>/dev/null || true
+
+clean_scratch
+echo "======================================================================"
+echo "TOI Companion Search completed at: $(date)"
+echo "======================================================================"
