@@ -89,7 +89,6 @@ The pipeline is engineered to probe the detection grey zone ($6.0 \le \text{SDE}
 │  • Leave-One-Year-Out (LOYO) Blind Holdout Validator (loyo_validator.py)│
 │     - Multi-year blind timing prediction across 800+ day gaps           │
 │     - 94-transit O - C timing analysis & Keplerian clock verification   │
-│  • Top-3 Presentation Showcase Generator (generate_top3_showcase.py)    │
 │  • Master Scanned TICs Catalog Reducer (merge_scanned_tics.py)          │
 └─────────────────────────────────────────────────────────────────────────┘
 ```
@@ -104,8 +103,6 @@ The pipeline is engineered to probe the detection grey zone ($6.0 \le \text{SDE}
    Implements multi-year temporal cross-validation inspired by independent researcher Pavel Rabtsevich (TIC 4206066). Blindly predicts transit arrival times across multi-year data gaps (e.g. $+1.94\text{ min}$ timing precision over 800 days on TIC 350190949, $4.0\%$ of transit duration) and conducts 94-transit $\text{O}-\text{C}$ Keplerian clock stability analysis ($dP/dt \approx 0$).
 3. **Master Scanned TICs Consolidation (`merge_scanned_tics.py`)**:
    Aggregates, deduplicates, and numerically sorts historical scanned TICs across MetaCentrum cluster arrays, local archives, and current workspace into a unified registry (expanding local history from 411 to 6,337+ unique TICs).
-4. **Top-3 Presentation Showcase (`generate_top3_showcase.py`)**:
-   Generates a standalone, high-resolution publication infographic (`exofop_top3_showcase.png`) displaying phase-folded profiles with 300-ring limb-darkened fits, strictly labeled with academic candidate terminology.
 
 ---
 
