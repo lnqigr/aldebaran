@@ -372,9 +372,20 @@ def get_stellar_and_gaia_params(tic_id: str) -> dict:
         ra = float(to_numpy(row["ra"]))
         dec = float(to_numpy(row["dec"]))
         
+        # Proper-motion propagation from TIC coordinates (J2000.0) to Gaia DR3 epoch (2016.0)
+        dt_yr = 16.0
+        pm_ra = float(to_numpy(row["pmra"])) if "pmra" in row and pd.notna(row["pmra"]) else 0.0
+        pm_dec = float(to_numpy(row["pmdec"])) if "pmdec" in row and pd.notna(row["pmdec"]) else 0.0
+        cos_dec = np.cos(np.radians(dec))
+        ra_ep2016 = ra + (pm_ra * dt_yr) / (3600.0 * 1000.0 * (cos_dec if abs(cos_dec) > 1e-4 else 1.0))
+        dec_ep2016 = dec + (pm_dec * dt_yr) / (3600.0 * 1000.0)
+
         adql = (
-            f"SELECT TOP 1 ruwe FROM gaiadr3.gaia_source "
-            f"WHERE 1=CONTAINS(POINT('ICRS', ra, dec), CIRCLE('ICRS', {ra}, {dec}, 0.000833))"
+            f"SELECT TOP 1 ruwe, "
+            f"DISTANCE(POINT('ICRS', ra, dec), POINT('ICRS', {ra_ep2016:.6f}, {dec_ep2016:.6f})) AS dist_deg "
+            f"FROM gaiadr3.gaia_source "
+            f"WHERE 1=CONTAINS(POINT('ICRS', ra, dec), CIRCLE('ICRS', {ra_ep2016:.6f}, {dec_ep2016:.6f}, 0.001389)) "
+            f"ORDER BY dist_deg ASC"
         )
         gaia_url = (
             "https://gea.esac.esa.int/tap-server/tap/sync?REQUEST=doQuery"
@@ -784,11 +795,12 @@ def verify_multi_epoch(
         if not t_raw_list:
             if sde_curr < 6.5:
                 return False, "Archival sectors unreadable and SDE < 6.5", None
-            return True, "Single-Sector_Only", {
+            return True, "Single-Sector_Only (Archival Download Failed)", {
                 "n_archival_sectors": 0,
                 "archival_sectors_str": "None",
                 "refined_p": best_p,
                 "archival_snr": np.nan,
+                "est_multi_sde_proxy": sde_curr,
                 "multi_sde": sde_curr,
                 "arch_bin_centers": None,
                 "arch_bin_means": None
@@ -859,23 +871,27 @@ def verify_multi_epoch(
         arch_centers = 0.5 * (arch_edges[:-1] + arch_edges[1:])
         
         secs_str = ",".join(str(s) for s in chosen_secs)
+        proxy_sde = sde_curr * np.sqrt(1.0 + len(chosen_secs) * 0.5)
         return True, f"Confirmed_in_Sectors_{secs_str}", {
             "n_archival_sectors": len(chosen_secs),
             "archival_sectors_str": secs_str,
             "refined_p": refined_p,
             "archival_snr": archival_snr,
-            "multi_sde": sde_curr * np.sqrt(1.0 + len(chosen_secs) * 0.5),
+            "est_multi_sde_proxy": proxy_sde,
+            "multi_sde": proxy_sde,
             "arch_bin_centers": arch_centers,
             "arch_bin_means": arch_means
         }
-    except Exception:
+    except Exception as e:
+        logger.warning("Archival verification error for TIC %s (%s)", tic_id, e)
         if sde_curr < 6.5:
-            return False, "Archival lookup failed and single-sector SDE < 6.5", None
-        return True, "Single-Sector_Only", {
+            return False, f"Archival lookup failed ({type(e).__name__}) and single-sector SDE < 6.5", None
+        return True, "Single-Sector_Only (Archival Query Error)", {
             "n_archival_sectors": 0,
             "archival_sectors_str": "None",
             "refined_p": best_p,
             "archival_snr": np.nan,
+            "est_multi_sde_proxy": sde_curr,
             "multi_sde": sde_curr,
             "arch_bin_centers": None,
             "arch_bin_means": None

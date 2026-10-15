@@ -165,7 +165,7 @@ python aldebaran.py
 python pleiades.py
 
 # 4. Run Tier-3 CTOI packaging, RV K calculation & atmospheric ranking
-python ctoi_packager.py
+python antares_packager.py
 
 # 5. Run Antares multi-year archival forensic drill on a specific candidate
 python antares.py --tic 46314221
