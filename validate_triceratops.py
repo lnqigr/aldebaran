@@ -229,8 +229,83 @@ def run_triceratops_validation(tic_id, period, t0_btjd, duration_hours, depth_pp
         'disposition': disposition
     }
 
+
+def validate_auto(n_mc: int = 5, n_bins: int = 60, top_csv: str = None):
+    """
+    Automatically validates top CTOI candidates from exofop_ctoi_upload_top3.csv
+    or prioritized_targets_ranking.csv.
+    """
+    if top_csv is None:
+        top_csv = os.path.join("tess_results", "exofop_ctoi_upload_top3.csv")
+    if not os.path.exists(top_csv):
+        print(f"[!] Top candidates table '{top_csv}' not found. Skipping auto-validation.")
+        return
+
+    import re
+    sep = "|" if "|" in open(top_csv, encoding="utf-8").readline() else ","
+    df_top = pd.read_csv(top_csv, sep=sep)
+    col_tic = [c for c in df_top.columns if "TIC" in c.upper()][0]
+    col_p = [c for c in df_top.columns if "PERIOD" in c.upper()][0]
+    col_epoch = [c for c in df_top.columns if "EPOCH" in c.upper() or "T0" in c.upper()][0]
+    col_depth = [c for c in df_top.columns if "DEPTH" in c.upper()][0]
+    col_dur = [c for c in df_top.columns if "DUR" in c.upper()][0]
+
+    ranking_csv = os.path.join("tess_results", "prioritized_targets_ranking.csv")
+    df_rank = pd.read_csv(ranking_csv) if os.path.exists(ranking_csv) else None
+
+    targets_to_run = []
+    for _, row in df_top.iterrows():
+        tid = int(row[col_tic])
+        p_val = float(row[col_p])
+        epoch_val = float(row[col_epoch])
+        t0_btjd = epoch_val - 2457000.0 if epoch_val > 2450000.0 else epoch_val
+        depth_val = float(row[col_depth])
+        dur_val = float(row[col_dur])
+
+        sectors = None
+        if df_rank is not None and "tic_id" in df_rank.columns:
+            m = df_rank[df_rank["tic_id"].astype(str) == str(tid)]
+            if len(m) > 0 and "sectors" in m.columns:
+                s_str = str(m.iloc[0]["sectors"])
+                s_nums = [int(x) for x in re.findall(r"\b\d+\b", s_str)]
+                if s_nums:
+                    sectors = s_nums
+        if not sectors:
+            if tid == 301152169:
+                sectors = [100, 101, 102, 103]
+            elif tid == 322051865:
+                sectors = [103, 104, 105, 106]
+            elif tid == 350190949:
+                sectors = [1, 28, 104, 105]
+            else:
+                sectors = [100]
+
+        targets_to_run.append({
+            "tic_id": tid,
+            "period": p_val,
+            "t0_btjd": t0_btjd,
+            "duration_hours": dur_val,
+            "depth_ppm": depth_val,
+            "sectors": sectors
+        })
+
+    print(f"\n[+] Automatic TRICERATOPS validation queue: {len(targets_to_run)} targets loaded.")
+    for cand in targets_to_run:
+        run_triceratops_validation(
+            tic_id=cand["tic_id"],
+            period=cand["period"],
+            t0_btjd=cand["t0_btjd"],
+            duration_hours=cand["duration_hours"],
+            depth_ppm=cand["depth_ppm"],
+            sectors=cand["sectors"],
+            n_mc=n_mc,
+            n_bins=n_bins
+        )
+
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Run TRICERATOPS Bayesian Validation on a candidate.")
+    parser.add_argument("--auto", action="store_true", help="Automatically validate all targets from tess_results/exofop_ctoi_upload_top3.csv")
     parser.add_argument("--tic", type=int, default=350190949, help="TIC ID")
     parser.add_argument("--period", type=float, default=0.926120, help="Period in days")
     parser.add_argument("--t0", type=float, default=1325.61416, help="T0 BTJD")
@@ -241,13 +316,16 @@ if __name__ == '__main__':
     parser.add_argument("--bins", type=int, default=60, help="Number of phase bins across transit window")
     
     args = parser.parse_args()
-    run_triceratops_validation(
-        tic_id=args.tic,
-        period=args.period,
-        t0_btjd=args.t0,
-        duration_hours=args.duration,
-        depth_ppm=args.depth,
-        sectors=args.sectors,
-        n_mc=args.mc,
-        n_bins=args.bins
-    )
+    if args.auto:
+        validate_auto(n_mc=args.mc, n_bins=args.bins)
+    else:
+        run_triceratops_validation(
+            tic_id=args.tic,
+            period=args.period,
+            t0_btjd=args.t0,
+            duration_hours=args.duration,
+            depth_ppm=args.depth,
+            sectors=args.sectors,
+            n_mc=args.mc,
+            n_bins=args.bins
+        )

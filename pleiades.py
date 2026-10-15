@@ -562,10 +562,10 @@ def deep_vet_target(cand_row: dict) -> dict | None:
     )
     if gaia_contam.get("is_tess_eb"):
         disposition = f"CONFIRMED FP / CATALOGED TESS EB (TIC {gaia_contam.get('tess_eb_tic')})"
-    elif gaia_contam.get("is_gaia_nss"):
-        disposition = f"CONFIRMED FP / GAIA NSS BINARY ({gaia_contam.get('gaia_nss_type')})"
     elif is_sec_eb:
         disposition = f"CONFIRMED FP / ECCENTRIC EB (Phase {sec_center_phi:.2f}, {sec_snr:.1f} sigma)"
+    elif gaia_contam.get("is_gaia_nss"):
+        disposition = f"HIGH RISK / DUAL-STAR ARCHITECTURE (Gaia NSS {gaia_contam.get('gaia_nss_type')})"
     elif dur_ratio_kepler < 0.35:
         disposition = "SUSPECT / UNPHYSICALLY NARROW TRANSIT"
     elif dur_ratio_kepler > 1.38:

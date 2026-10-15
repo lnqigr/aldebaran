@@ -79,6 +79,12 @@ def merge_shards(results_dir: str = "tess_results") -> None:
         elif os.path.exists("ctoi_packager.py"):
             print("\n[+] Launching Tier-3 CTOI Packager & Follow-Up Prioritizer...")
             subprocess.run([sys.executable, "ctoi_packager.py"], check=False)
+
+        # 5. Launch Tier-4 TRICERATOPS Bayesian Validation on Golden Candidates (Priority P5)
+        top3_csv = os.path.join(results_dir, "exofop_ctoi_upload_top3.csv")
+        if os.path.exists("validate_triceratops.py") and os.path.exists(top3_csv):
+            print("\n[+] Launching Tier-4 TRICERATOPS Bayesian Statistical Validation on Golden Candidates...")
+            subprocess.run([sys.executable, "validate_triceratops.py", "--auto"], check=False)
     else:
         print("\n[+] No candidates to vet. Tier-2 deep vetting skipped.")
 

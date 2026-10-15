@@ -1,10 +1,10 @@
 #!/bin/bash
 # ==============================================================================
-# ALDEBARAN v8.5 - TIER-2 MERGE & DEEP VETTING REDUCER SCRIPT
+# ALDEBARAN v8.6 - TIER-2 MERGE, DEEP VETTING & TIER-4 TRICERATOPS REDUCER
 # ==============================================================================
 #PBS -N merge_shards
-#PBS -l select=1:ncpus=4:mem=16gb:scratch_local=15gb
-#PBS -l walltime=02:00:00
+#PBS -l select=1:ncpus=8:mem=24gb:scratch_local=25gb
+#PBS -l walltime=04:00:00
 #PBS -m ae
 #PBS -j oe
 
@@ -33,12 +33,21 @@ python3 -m venv "$SCRATCHDIR/venv"
 source "$SCRATCHDIR/venv/bin/activate"
 pip install --upgrade pip --no-cache-dir --quiet
 if [ -f requirements.txt ]; then
-    pip install --no-cache-dir --quiet -r requirements.txt certifi
+    pip install --no-cache-dir --quiet -r requirements.txt certifi triceratops
 else
-    pip install --no-cache-dir --quiet numpy scipy astropy pandas lightkurve astroquery matplotlib requests urllib3 certifi
+    pip install --no-cache-dir --quiet numpy scipy astropy pandas lightkurve astroquery matplotlib requests urllib3 certifi triceratops
 fi
 
 python merge_shards.py
+
+# Priority P5: Tier-4 TRICERATOPS Bayesian Statistical Validation on Golden Candidates
+if [ -f validate_triceratops.py ]; then
+    echo "======================================================================"
+    echo "Launching Tier-4 TRICERATOPS Bayesian Validation on $(hostname)"
+    echo "Start time: $(date)"
+    echo "======================================================================"
+    python validate_triceratops.py --auto
+fi
 
 clean_scratch
 echo "======================================================================"
