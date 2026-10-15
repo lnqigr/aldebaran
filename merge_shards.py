@@ -72,8 +72,11 @@ def merge_shards(results_dir: str = "tess_results") -> None:
         print("\n[+] Launching Pleiades Tier-2 Deep Vetting on unified candidate list...")
         subprocess.run([sys.executable, "pleiades.py"], check=False)
 
-        # 4. Launch Tier-3 CTOI Packager & Follow-Up Prioritizer
-        if os.path.exists("ctoi_packager.py"):
+        # 4. Launch Tier-3 Antares Packager & Follow-Up Prioritizer
+        if os.path.exists("antares_packager.py"):
+            print("\n[+] Launching Tier-3 Antares Packager & Archival Follow-Up Prioritizer...")
+            subprocess.run([sys.executable, "antares_packager.py"], check=False)
+        elif os.path.exists("ctoi_packager.py"):
             print("\n[+] Launching Tier-3 CTOI Packager & Follow-Up Prioritizer...")
             subprocess.run([sys.executable, "ctoi_packager.py"], check=False)
     else:
