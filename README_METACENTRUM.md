@@ -36,7 +36,7 @@ chmod +x run_aldebaran.pbs
 
 ## 2. Submitting Jobs via PBS Pro
 
-### Standard Production Job (8 Cores, 16 GB RAM, 35 GB NVMe Scratch, 6h Walltime)
+### Standard Production Job (8 Cores, 24 GB RAM, 35 GB NVMe Scratch, 8h Walltime)
 To submit a single-sector production run:
 ```bash
 qsub run_aldebaran.pbs

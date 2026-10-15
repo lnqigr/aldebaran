@@ -7,11 +7,11 @@
 # fresh TESS sector (106, 105, 104, 103, 102, 101, 100, 99) in isolated subdirectories,
 # preventing file collisions or network congestion on NASA MAST.
 #
-# Resources per node: 8 CPUs, 16 GB RAM, 35 GB local NVMe scratch, 6h walltime.
+# Resources per node: 8 CPUs, 24 GB RAM, 35 GB local NVMe scratch, 8h walltime.
 # (8 cores per node matches NASA MAST download throughput without wasting fairshare).
 #PBS -N aldebaran_tess
-#PBS -l select=1:ncpus=8:mem=16gb:scratch_local=35gb
-#PBS -l walltime=06:00:00
+#PBS -l select=1:ncpus=8:mem=24gb:scratch_local=35gb
+#PBS -l walltime=08:00:00
 #PBS -m ae
 #PBS -j oe
 
