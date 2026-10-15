@@ -1,6 +1,6 @@
 #!/bin/bash
 # ==============================================================================
-# ALDEBARAN v8.6 - TIER-2 MERGE, DEEP VETTING & TIER-4 TRICERATOPS REDUCER
+# ALDEBARAN v9.0 - TIER-2 MERGE, DEEP VETTING & TIER-4 TRICERATOPS REDUCER
 # ==============================================================================
 #PBS -N merge_shards
 #PBS -l select=1:ncpus=8:mem=24gb:scratch_local=25gb

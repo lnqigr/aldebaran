@@ -1,10 +1,10 @@
 #!/bin/bash
 # ==============================================================================
-# ALDEBARAN TESS PIPELINE v8.5 - METACENTRUM PBS PRO BATCH SCRIPT
+# ALDEBARAN TESS PIPELINE v9.0 - METACENTRUM PBS PRO BATCH SCRIPT
 # ==============================================================================
 # Supports both Single-Node runs and Multi-Node Job Arrays (qsub -J 1-8).
 # In array mode (qsub -J 1-8), each worker index automatically maps to an independent
-# fresh TESS sector (106, 105, 104, 103, 102, 101, 100, 99) in isolated subdirectories,
+# fresh TESS sector (108, 107, 98, 97, 96, 95, 94, 93) in isolated subdirectories,
 # preventing file collisions or network congestion on NASA MAST.
 #
 # Resources per node: 8 CPUs, 24 GB RAM, 35 GB local NVMe scratch, 8h walltime.

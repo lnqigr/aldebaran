@@ -1,6 +1,6 @@
 #!/bin/bash
 # ==============================================================================
-# ALDEBARAN v8.5 - END-TO-END AUTOMATED CLUSTER LAUNCHER
+# ALDEBARAN v9.0 - END-TO-END AUTOMATED CLUSTER LAUNCHER
 # ==============================================================================
 # Submits the 8-node screening array (Tier-1) and automatically schedules the
 # shard merge and Pleiades deep vetting (Tier-2) to execute once all shards finish.
@@ -14,7 +14,7 @@ REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$REPO_DIR"
 
 echo "======================================================================"
-echo "Submitting Aldebaran v8.5 End-to-End Pipeline to MetaCentrum"
+echo "Submitting Aldebaran v9.0 End-to-End Pipeline to MetaCentrum"
 echo "Repository Root: $REPO_DIR"
 echo "======================================================================"
 

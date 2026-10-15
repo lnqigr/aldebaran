@@ -82,10 +82,11 @@ if os.environ.get("LIGHTKURVE_CACHE_DIR"):
     os.makedirs(os.environ["LIGHTKURVE_CACHE_DIR"], exist_ok=True)
     lk.conf.cache_dir = os.environ["LIGHTKURVE_CACHE_DIR"]
 
-# Newest released sectors (106 down to 80; Sector 98 is completed)
+# Newest released sectors (108 down to 80; Sectors 99-106 completed in Run 1)
 PREFERRED_SECTORS = [
-    106, 105, 104, 103, 102, 101, 100, 99,
-    98, 97, 96, 95, 94, 93, 92, 91, 90, 89, 88, 87, 86, 85, 84, 83, 82, 81, 80
+    108, 107, 98, 97, 96, 95, 94, 93,
+    92, 91, 90, 89, 88, 87, 86, 85, 84, 83, 82, 81, 80,
+    106, 105, 104, 103, 102, 101, 100, 99
 ]
 
 # Multi-Node PBS Array Coordinator (v8.0 Zero-Lock Sharding)
