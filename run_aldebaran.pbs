@@ -1,6 +1,6 @@
 #!/bin/bash
 # ==============================================================================
-# ALDEBARAN TESS PIPELINE v8.0 - METACENTRUM PBS PRO BATCH SCRIPT
+# ALDEBARAN TESS PIPELINE v8.5 - METACENTRUM PBS PRO BATCH SCRIPT
 # ==============================================================================
 # Supports both Single-Node runs and Multi-Node Job Arrays (qsub -J 1-8).
 # In array mode (qsub -J 1-8), each worker index automatically maps to an independent

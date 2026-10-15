@@ -395,10 +395,10 @@ def run_ctoi_packager():
         t_meta = tic_phot_map.get(tid, {})
         
         p_days = to_clean_float(row.get("refined_period_days"), to_clean_float(row.get("period_days"), 1.0))
-        t0_btjd = to_clean_float(row.get("t0_btjd"), 3980.0)
+        t0_btjd = to_clean_float(row.get("refined_t0_btjd"), to_clean_float(row.get("t0_btjd"), 3980.0))
         epoch_bjd = t0_btjd + BTJD_OFFSET
-        dur_hr = to_clean_float(row.get("duration_hours"), 2.0)
-        depth_ppm = to_clean_float(row.get("depth_ppm"), 1000.0)
+        dur_hr = to_clean_float(row.get("fitted_duration_hours"), to_clean_float(row.get("duration_hours"), 2.0))
+        depth_ppm = to_clean_float(row.get("fitted_depth_ppm"), to_clean_float(row.get("depth_ppm"), 1000.0))
         rp_earth = to_clean_float(row.get("fitted_rp_earth"), to_clean_float(row.get("r_planet_earth"), 2.0))
         b_imp = to_clean_float(row.get("impact_param_b"), 0.30)
         

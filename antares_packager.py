@@ -410,16 +410,25 @@ def run_stage_3a_filter(
                 df_merged[c] = def_v
 
     # Fallback mappings for critical columns
-    df_merged["period_d"] = pd.to_numeric(df_merged["refined_period_days"], errors="coerce").fillna(
+    df_merged["period_d"] = pd.to_numeric(df_merged.get("refined_period_days"), errors="coerce").fillna(
         pd.to_numeric(df_merged.get("period_days"), errors="coerce")
     )
-    df_merged["rp_e"] = pd.to_numeric(df_merged["fitted_rp_earth"], errors="coerce").fillna(
+    df_merged["t0_btjd"] = pd.to_numeric(df_merged.get("refined_t0_btjd"), errors="coerce").fillna(
+        pd.to_numeric(df_merged.get("t0_btjd"), errors="coerce")
+    )
+    df_merged["duration_hours"] = pd.to_numeric(df_merged.get("fitted_duration_hours"), errors="coerce").fillna(
+        pd.to_numeric(df_merged.get("duration_hours"), errors="coerce")
+    )
+    df_merged["depth_ppm"] = pd.to_numeric(df_merged.get("fitted_depth_ppm"), errors="coerce").fillna(
+        pd.to_numeric(df_merged.get("depth_ppm"), errors="coerce")
+    )
+    df_merged["rp_e"] = pd.to_numeric(df_merged.get("fitted_rp_earth"), errors="coerce").fillna(
         pd.to_numeric(df_merged.get("r_planet_earth"), errors="coerce")
     )
-    df_merged["dur_ratio"] = pd.to_numeric(df_merged["dur_to_kepler_max"], errors="coerce").fillna(1.0)
-    df_merged["sec_snr"] = pd.to_numeric(df_merged["secondary_snr_sigma"], errors="coerce").fillna(0.0)
-    df_merged["contam_pct"] = pd.to_numeric(df_merged["flux_contam_percent"], errors="coerce").fillna(0.0)
-    df_merged["neb_count"] = pd.to_numeric(df_merged["neb_capable_neighbors"], errors="coerce").fillna(0).astype(int)
+    df_merged["dur_ratio"] = pd.to_numeric(df_merged.get("dur_to_kepler_max"), errors="coerce").fillna(1.0)
+    df_merged["sec_snr"] = pd.to_numeric(df_merged.get("secondary_snr_sigma"), errors="coerce").fillna(0.0)
+    df_merged["contam_pct"] = pd.to_numeric(df_merged.get("flux_contam_percent"), errors="coerce").fillna(0.0)
+    df_merged["neb_count"] = pd.to_numeric(df_merged.get("neb_capable_neighbors"), errors="coerce").fillna(0).astype(int)
 
     df_merged["corr_risk"] = df_merged.apply(calc_sidak_corrected_risk, axis=1)
 
@@ -929,8 +938,10 @@ def execute_archival_drill(
     print(f"      -> Stack ({stack_author}, {n_sectors_stack} secs): Depth = {master_metrics['depth_ppm']:.1f} ppm | SNR_red = {spoc_snr_red:.2f} sigma | Transits = {master_metrics['n_transits']}")
     print(f"      -> Archival Decision: [{status}] - {decision_reason}")
 
-    # Generate 4-panel diagnostic poster
-    out_png = os.path.join(results_dir, f"antares_TIC_{tid}.png")
+    # Generate 4-panel diagnostic poster in archival_vetting subfolder
+    archival_dir = os.path.join(results_dir, "archival_vetting")
+    os.makedirs(archival_dir, exist_ok=True)
+    out_png = os.path.join(archival_dir, f"antares_TIC_{tid}.png")
     try:
         fig, axes = plt.subplots(2, 2, figsize=(14, 10))
         win_hrs = min(0.18 * p_ref, 2.5 * dur_days) * 24.0

@@ -1,4 +1,4 @@
-# Aldebaran: End-to-End Photometric Discovery, Vetting & Archival Forensic Pipeline for TESS (v8.2)
+# Aldebaran: End-to-End Photometric Discovery, Vetting & Archival Forensic Pipeline for TESS (v8.5)
 
 **Aldebaran** is an automated, high-throughput digital signal processing (DSP) and astrophysical falsification pipeline designed to detect low-SNR transiting exoplanets in archival and newly released sectors of the NASA TESS Extended Mission (2-minute SPOC cadence).
 
@@ -13,7 +13,7 @@ The pipeline is engineered to probe the detection grey zone ($6.0 \le \text{SDE}
                                    │
                                    ▼
 ┌─────────────────────────────────────────────────────────────────────────┐
-│               TIER 1: High-Throughput Screening (aldebaran.py v8.0)     │
+│               TIER 1: High-Throughput Screening (aldebaran.py v8.5)     │
 ├─────────────────────────────────────────────────────────────────────────┤
 │  • Catalog Cross-Match (ExoFOP, TOIs, CTOIs, Confirmed Planets)         │
 │  • Bitwise Quality Filtering (QUALITY == 0) & Gap Ramp Trimming         │
@@ -42,7 +42,7 @@ The pipeline is engineered to probe the detection grey zone ($6.0 \le \text{SDE}
                                      │ candidates_report.csv
                                      ▼
 ┌─────────────────────────────────────────────────────────────────────────┐
-│             MULTI-NODE SHARD REDUCER (merge_shards.py v8.0)             │
+│             MULTI-NODE SHARD REDUCER (merge_shards.py v8.5)             │
 ├─────────────────────────────────────────────────────────────────────────┤
 │  • Aggregates all tess_results/sector_*/candidates_report.csv shards   │
 │  • Deduplicates multi-sector detections prioritizing highest Kovács SDE │
@@ -52,62 +52,49 @@ The pipeline is engineered to probe the detection grey zone ($6.0 \le \text{SDE}
                                      │
                                      ▼
 ┌─────────────────────────────────────────────────────────────────────────┐
-│               TIER 2: Deep Physical Vetting (pleiades.py v2.2)          │
+│               TIER 2: Deep Physical Vetting (pleiades.py v2.5)          │
 ├─────────────────────────────────────────────────────────────────────────┤
 │  • Multi-Sector Detrending & Stitched Baseline Normalization            │
 │  • 300-Ring Concentric Limb-Darkened Mandel-Agol Model Integration      │
-│  • Full-Orbit Eccentric Secondary Eclipse Scan                          │
+│  • Export of Multi-Sector Ephemeris: refined_t0, fitted_depth, dur_hr   │
+│  • Full-Orbit Eccentric Secondary Eclipse Scan with Šidák Threshold     │
 │  • Astrophysical Catalog Cross-Match:                                   │
 │     - VizieR TESS Eclipsing Binary Catalogue (Prša et al. 2022)         │
 │     - Gaia DR3 Non-Single Star (NSS) Two-Body Orbit Solutions (SB1/SB2) │
 │  • Gaia DR3 Field Contamination & Nearby Eclipsing Binary (NEB) Scoring │
-│  • 4-Panel Publication Dossiers with Transit Depth Zoom & Error Bars:   │
-│     - Top-Left:  Phase-folded LC zoomed to [1 - 3.5*d, 1 + 2*d] with   │
-│                  analytical 300-ring fit & ±1σ binned error bars        │
-│     - Top-Right: Full stitched multi-sector light curve with epochs     │
-│     - Bottom-Left: Odd/Even phase overlays & full-orbit secondary scan  │
-│     - Bottom-Right: Gaia DR3 120" neighbor map with NEB critical radii  │
+│  • 4-Panel Publication Dossiers in tess_results/deep_vetting/           │
 └────────────────────────────────────┬────────────────────────────────────┘
                                      │ scientific_dossier_summary.csv
                                      ▼
 ┌─────────────────────────────────────────────────────────────────────────┐
-│              TIER 3: CTOI Packager & Prioritizer (ctoi_packager.py)     │
+│       TIER 3: Archival Drill & CTOI Packager (antares_packager.py)      │
 ├─────────────────────────────────────────────────────────────────────────┤
-│  • Empirical Mass Forecasting (Chen & Kipping 2017; Wolfgang et al. 2016)│
-│  • Radial Velocity Semi-Amplitude K Calculation (ESPRESSO / MAROON-X)   │
-│  • Atmospheric Follow-Up Metrics (Kempton et al. 2018 TSM & ESM)        │
-│  • Automated NASA ExoFOP CTOI Pipe-Delimited Batch Upload CSV           │
-└────────────────────────────────────┬────────────────────────────────────┘
-                                     │
-                                     ▼
-┌─────────────────────────────────────────────────────────────────────────┐
-│     HISTORICAL ARCHIVAL FORENSICS: Antares Detective (antares.py)       │
-├─────────────────────────────────────────────────────────────────────────┤
-│  • Multi-Year Archival Drill across SPOC (2-min), QLP (200s), TGLC (1800s)│
-│  • High-Precision Coherent Ephemeris Locking Across 7+ Year Baselines   │
-│  • Cross-Pipeline Gaia-PSF Deblending Consistency (TGLC vs QLP vs SPOC) │
-│  • 6-Panel Diagnostic Dossier with Secular Mission-Year Stability       │
+│  • Stage 3A: Corrected FP Risk & Pre-Filtering Gate                     │
+│  • Stage 3B: Decoupled Archival Drill (SPOC vs FFI Isolation)           │
+│     - Earliest-Transit Anchoring (t0_anchor) avoids epoch drift         │
+│     - Clean SPOC-only coherent folding and SNR_red metrics              │
+│  • Stage 3C: Planetary Follow-Up Prioritization (K m/s, TSM, ESM)       │
+│  • Stage 3D: ExoFOP CTOI Export with Multi-Sector Parameter Sync        │
+│  • 4-Panel Archival Posters saved in tess_results/archival_vetting/     │
 └─────────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
 
-## Key Features in v8.2 (v8.0 – v8.2)
+## Key Features in v8.5
 
-1. **Distributed PBS Job Array Sharding (`qsub -J 1-8`)**:
+1. **Multi-Sector Ephemeris Synchronization (Pleiades v2.5)**:
+   Eliminated parameter desynchronization by propagating `refined_t0_btjd`, `fitted_depth_ppm`, and `fitted_duration_hours` directly from multi-sector Mandel-Agol fits into downstream packagers, preventing single-sector BLS parameter contamination in ExoFOP CTOI exports.
+2. **$\delta$ Scuti Asteroseismic Pre-Whitening (TIC 301152169)**:
+   Subtracts verified orthogonal pulsation modes ($f_1=37.93\text{ c/d}, f_2=41.28, f_3=28.70, f_4=44.72, f_5=37.40$), reducing residual RMS noise by 26.5% ($1554\text{ ppm} \to 1143\text{ ppm}$) and boosting transit SNR from $20.9\sigma$ to $28.6\sigma$ ($+7.8\sigma, 1.37\times$).
+3. **Decoupled Archival Drill & Earliest-Transit Anchoring (`antares_packager.py`)**:
+   Anchors $T_0$ to the earliest observed transit epoch ($t_{0,\text{anchor}}$), preventing negative epoch projection drift across multi-year baselines (e.g. eliminating 45-min phase errors on TIC 350190949 and lifting SPOC stack SNR from $2.1\sigma$ to $4.35\sigma$). Isolates SPOC 2-min cadence from QLP/TGLC side-lobe interference.
+4. **Distributed PBS Job Array Sharding (`qsub -J 1-8`)**:
    Enables parallel execution across 8 independent compute nodes without inter-process file locks. Workers autonomously map `PBS_ARRAY_INDEX` to sequential TESS sectors (`[106, 105, 104, 103, 102, 101, 100, 99]`) and write to isolated subdirectories (`tess_results/sector_<sec>/`).
-2. **Dual-Zone Full-Orbit Secondary Eclipse Scan**:
-   Differentiates between circular orbits ($|\phi - 0.50| \le 0.04$) evaluated as a single hypothesis test at $\text{SNR} > 3.1\sigma$ and eccentric orbits ($|\phi - 0.50| > 0.04$) evaluated with analytical Šidák-Bonferroni correction ($\alpha = 0.001$, $\text{SNR} > z_{\text{crit}}$). Enforces a 100 ppm floor and $\ge 10\%$ of primary depth to avoid rejecting real planets due to stellar variability.
-3. **Multi-Sector Archival Secondary Scan**:
-   Filter 8 (`verify_multi_epoch`) now executes a secondary eclipse scan across the combined archival baseline to eliminate faint occulting stellar companions that only become statistically significant when multiple sectors are stacked.
-4. **Automated Shard Aggregation (`merge_shards.py`)**:
-   Gathers reports and scanned star registries from all array shards, deduplicates duplicate candidates by highest SDE, and hands off the unified catalog directly to Pleiades Tier-2.
-5. **Dynamic Transit Zoom & Error Bars (Pleiades v2.2)**:
-   Diagnostic dossiers now automatically zoom into the transit depth window ($[1.0 - 3.5 \cdot \text{depth}, 1.0 + 2.0 \cdot \text{depth}]$) and render phase-binned $\pm 1\sigma$ error bars, providing clear visual discrimination of transit ingress, egress, and bottom flat-floor curvature.
-6. **Tier-3 CTOI Packaging & Atmospheric Ranking (`ctoi_packager.py`)**:
-   Automatically produces NASA ExoFOP CTOI pipe-delimited upload tables and ranks surviving candidates by RV semi-amplitude $K$ and JWST/HST Transmission/Emission Spectroscopy Metrics (TSM, ESM).
-7. **Antares Multi-Year Archival Drill (`antares.py`)**:
-   Targeted forensic detective for top candidates across all historical TESS sectors (2018–2026), stitching SPOC, QLP, and TGLC PSF-deblended light curves over 7+ year baselines with coherent ephemeris locking.
+5. **Dual-Zone Full-Orbit Secondary Eclipse Scan**:
+   Differentiates between circular orbits ($|\phi - 0.50| \le 0.04$, $\text{SNR} > 3.1\sigma$) and eccentric orbits ($|\phi - 0.50| > 0.04$, Šidák-Bonferroni $\text{SNR} > z_{\text{crit}}$). Enforces a 100 ppm floor and $\ge 10\%$ primary depth.
+6. **Modular Directory Architecture**:
+   Structured results into dedicated functional subfolders (`tess_results/deep_vetting/`, `tess_results/archival_vetting/`, `tess_results/archive/`) with consolidated summary catalogs in root for clean automated reporting.
 
 ---
 

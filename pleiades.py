@@ -26,7 +26,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 os.environ["PYTHONWARNINGS"] = "ignore::UserWarning"
 warnings.filterwarnings("ignore", category=UserWarning)
 
-PIPELINE_VERSION = "v2.2"
+PIPELINE_VERSION = "v2.5"
 if os.environ.get("LIGHTKURVE_CACHE_DIR"):
     os.makedirs(os.environ["LIGHTKURVE_CACHE_DIR"], exist_ok=True)
     lk.conf.cache_dir = os.environ["LIGHTKURVE_CACHE_DIR"]
@@ -669,6 +669,9 @@ def deep_vet_target(cand_row: dict) -> dict | None:
         "disposition": disposition,
         "fp_risk_percent": round(risk_pct, 1),
         "refined_period_days": round(p_ref, 6),
+        "refined_t0_btjd": round(t0_ref, 5),
+        "fitted_depth_ppm": round((rp_rs_fit ** 2) * 1e6, 1),
+        "fitted_duration_hours": round(dur_fit * 24.0, 2),
         "fitted_rp_earth": round(true_rp_earth, 2),
         "impact_param_b": round(b_fit, 3),
         "dur_to_kepler_max": round(dur_ratio_kepler, 2),

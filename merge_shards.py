@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-ALDEBARAN v8.0: Multi-Node Array Shard Reducer & Merger
+ALDEBARAN v8.5: Multi-Node Array Shard Reducer & Merger
 Aggregates candidates, logs, and scanned TICs across all parallel sector shards,
 deduplicates them, and triggers Pleiades Tier-2 deep vetting on the unified catalog.
 """
@@ -12,7 +12,7 @@ import pandas as pd
 
 def merge_shards(results_dir: str = "tess_results") -> None:
     print("=" * 70)
-    print("ALDEBARAN v8.0: Aggregating Multi-Sector Array Shards")
+    print("ALDEBARAN v8.5: Aggregating Multi-Sector Array Shards")
     print("=" * 70)
 
     # 1. Merge Candidates Reports

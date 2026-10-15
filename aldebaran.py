@@ -38,7 +38,7 @@ from astropy.timeseries import BoxLeastSquares
 import lightkurve as lk
 from astroquery.mast import Observations, Catalogs
 
-PIPELINE_VERSION = "v8.0"
+PIPELINE_VERSION = "v8.5"
 AUTO_PURGE_CACHE = True       # Automatically deletes raw FITS files of non-candidates to keep cache at ~0 MB
 
 # Lightkurve does NOT read a LIGHTKURVE_CACHE_DIR env var by itself; apply it explicitly so HPC jobs
