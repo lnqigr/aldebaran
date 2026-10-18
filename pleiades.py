@@ -515,7 +515,7 @@ def deep_vet_target(cand_row: dict, vet_dir: str = None) -> dict | None:
     print(f"[4/4] Querying Gaia DR3 neighborhood, NSS two-body & VizieR TESS EB catalogs...")
     gaia_contam = query_gaia_contamination(tic_id, depth_init_ppm)
     
-    # Enforce Stitched Primary Transit SNR Gate (prevents marginal white noise from masquerading as confirmed candidate)
+    # Enforce stitched-primary SNR gate to reduce marginal white-noise candidates.
     in_tr_mask = np.abs(ph_fit) < (0.45 * dur_fit)
     oot_mask_local = (np.abs(ph_fit) > (0.65 * dur_fit)) & (np.abs(ph_fit) <= (2.2 * dur_fit))
     oot_std_pt = float(1.4826 * np.nanmedian(np.abs(f_fit[oot_mask_local] - 1.0)) + 1e-12)
@@ -553,17 +553,17 @@ def deep_vet_target(cand_row: dict, vet_dir: str = None) -> dict | None:
         and stitched_primary_snr >= 5.5
     )
     if gaia_contam.get("is_tess_eb"):
-        disposition = f"CONFIRMED FP / CATALOGED TESS EB (TIC {gaia_contam.get('tess_eb_tic')})"
+        disposition = f"CATALOG MATCH: TESS EB (possible false-positive flag; TIC {gaia_contam.get('tess_eb_tic')})"
     elif is_sec_eb:
-        disposition = f"CONFIRMED FP / ECCENTRIC EB (Phase {sec_center_phi:.2f}, {sec_snr:.1f} sigma)"
+        disposition = f"SECONDARY-ECLIPSE FLAG: possible eccentric EB (Phase {sec_center_phi:.2f}, {sec_snr:.1f} sigma)"
     elif gaia_contam.get("is_gaia_nss"):
-        disposition = f"HIGH RISK / DUAL-STAR ARCHITECTURE (Gaia NSS {gaia_contam.get('gaia_nss_type')})"
+        disposition = f"GAIA NSS MATCH / DUAL-STAR SYSTEM FLAG ({gaia_contam.get('gaia_nss_type')})"
     elif dur_ratio_kepler < 0.35:
         disposition = "SUSPECT / UNPHYSICALLY NARROW TRANSIT"
     elif dur_ratio_kepler > 1.38:
         disposition = "SUSPECT / UNPHYSICALLY LONG TRANSIT (Subgiant/Blend)"
     elif is_clean:
-        disposition = "TIER-2 VETTED CANDIDATE (Low FP Risk)"
+        disposition = "TIER-2 HEURISTIC SCREEN PASS (candidate; no calibrated FP-risk estimate)"
     else:
         disposition = "SUSPECT / GRAZING OR CONTAMINATED"
     
@@ -696,7 +696,7 @@ def deep_vet_target(cand_row: dict, vet_dir: str = None) -> dict | None:
         "vps_version": VPS_SCHEMA_VERSION,
         "vps_producer": VPS_PRODUCER_NAME,
         "vps_score": round(vps_score, 1),
-        "fp_risk_percent": round(vps_score, 1),  # backward compatibility alias
+        "fp_risk_percent": round(vps_score, 1),  # Legacy compatibility alias for heuristic VPS points, not a probability.
         "vps_unclipped_total": float(vps_unclipped_total),
         "vps_ledger_json": vps_ledger_json,
         "sec_eclipse_zone": ledger["secondary_metadata"]["zone"],

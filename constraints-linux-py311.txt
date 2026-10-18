@@ -1,4 +1,6 @@
-# Saved Linux Python 3.11.11 freeze, TRICERATOPS 1.0.21; no fresh install verified.
+# MetaCentrum job 24793285 (exact r11 candidate): Python 3.11.11, 115/115 pins plus 3 approved bootstrap pins matched,
+# pip check clean, 339 regression + 50 PBS tests passed, and 9 required imports completed.
+# Job 24793285 completed fresh pinned Python 3.11 environment setup; this evidence applies to r11, not later edits.
 # Source: deployment_packages/aldebaran_merge_20261017_r3/expected-pip-freeze.txt
 # Source SHA256: fa60fa66e370b6bf846de533e0852e1f535238153ee8d25f7e6498306509eee2
 aiobotocore==3.9.2

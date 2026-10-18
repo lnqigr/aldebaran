@@ -65,6 +65,8 @@ Each node in the array:
 * Automatically processes its own assigned sector from `PREFERRED_SECTORS` in zero-lock isolated storage (`tess_results/sector_<sec>/`).
 * Desynchronizes MAST API calls with an initial jitter delay (`sleep $(( (PBS_ARRAY_INDEX * 3) % 20 ))`).
 
+The separate `search_toi_companions.py` command defaults to sectors 106, 105, 104, 103, 102, 101, 100, and 99. Those standalone companion-scan defaults are independent of the Tier-1 PBS array sector mapping above.
+
 ### Scan submission and explicit reduction
 
 **Deployment readiness:** Confirm the selected source revision, inputs, output paths and resource limits before real submission; this guide does not establish scientific readiness for a survey run.

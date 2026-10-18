@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-ALDEBARAN EXOPLANET SEARCH PIPELINE — MODULE: TIER-4 TRICERATOPS VALIDATOR
-Formal Bayesian False Positive Probability (FPP) and Nearby False Positive Probability (NFPP)
-Evaluator across 18 Astrophysical Blend Scenarios (Giacalone et al. 2021).
+ALDEBARAN EXOPLANET SEARCH PIPELINE — MODULE: TIER-4 TRICERATOPS BAYESIAN FPP/NFPP
+Computes Bayesian False Positive Probability (FPP) and Nearby False Positive Probability
+(NFPP) estimates conditional on the supplied data, astrophysical scenarios, and model priors.
 Optimized with Phase-Folded Adaptive Binning to prevent OOM on multi-sector datasets.
 """
 
@@ -17,7 +17,7 @@ import matplotlib.pyplot as plt
 
 def run_triceratops_validation(tic_id, period, t0_btjd, duration_hours, depth_ppm, sectors, n_mc=5, n_bins=60, results_dir: str = None):
     print(f"\n{'='*75}")
-    print(f" ALDEBARAN TIER-4 BAYESIAN STATISTICAL VALIDATION (TRICERATOPS)")
+    print(f" ALDEBARAN TIER-4 BAYESIAN FPP/NFPP ASSESSMENT (TRICERATOPS)")
     print(f" Target: TIC {tic_id}")
     print(f" Ephemeris: P = {period:.6f} d | T0 = {t0_btjd:.5f} BTJD | Depth = {depth_ppm:.1f} ppm")
     print(f" Sectors: {sectors} | Target Phase Bins: {n_bins} | MC Draws: {n_mc}")
@@ -143,24 +143,21 @@ def run_triceratops_validation(tic_id, period, t0_btjd, duration_hours, depth_pp
     std_nfpp = float(np.std(nfpps))
 
     print(f"\n{'='*65}")
-    print(f" TRICERATOPS BAYESIAN STATISTICAL VALIDATION SUMMARY")
-    print(f" False Positive Probability (FPP): {mean_fpp:.4f} ± {std_fpp:.4f} ({mean_fpp*100:.2f}%)")
-    print(f" Nearby False Positive Probability (NFPP): {mean_nfpp:.4f} ± {std_nfpp:.4f} ({mean_nfpp*100:.2f}%)")
+    print(f" BAYESIAN FPP/NFPP ASSESSMENT (TRICERATOPS)")
+    print(f" Conditional scenario-model FPP: {mean_fpp:.4f} ± {std_fpp:.4f} ({mean_fpp*100:.2f}%)")
+    print(f" Conditional nearby false-positive probability (NFPP): {mean_nfpp:.4f} ± {std_nfpp:.4f} ({mean_nfpp*100:.2f}%)")
     
-    # Statistical validation criteria (Giacalone et al. 2021):
-    # Validated: FPP < 0.015 (1.5%) and NFPP < 0.001 (0.1%)
-    # High-confidence: FPP < 0.10
-    # Moderate: FPP < 0.50
+    # These thresholds classify conditional scenario-model outputs; they are not independent validation.
     if mean_fpp < 0.015 and mean_nfpp < 0.001:
-        disposition = "STATISTICALLY VALIDATED PLANET (FPP < 0.015, NFPP < 0.001)"
+        disposition = "EXPLORATORY CONDITIONAL SCENARIO-MODEL THRESHOLD PASS (FPP < 0.015, NFPP < 0.001; not independent validation)"
     elif mean_fpp < 0.05:
-        disposition = "VERY HIGH CONFIDENCE PLANET CANDIDATE (FPP < 5%)"
+        disposition = "VERY LOW CONDITIONAL FPP CANDIDATE (TRICERATOPS FPP < 5%)"
     elif mean_fpp < 0.10:
-        disposition = "HIGH-CONFIDENCE PLANET CANDIDATE (FPP < 10%)"
+        disposition = "LOW CONDITIONAL FPP CANDIDATE (TRICERATOPS FPP < 10%)"
     elif mean_fpp < 0.50:
-        disposition = "MODERATE-CONFIDENCE CANDIDATE (FPP < 50%)"
+        disposition = "MODERATE CONDITIONAL FPP CANDIDATE (TRICERATOPS FPP < 50%)"
     else:
-        disposition = "LIKELY FALSE POSITIVE / BLEND (FPP >= 50%)"
+        disposition = "TRICERATOPS MODEL FAVORS FALSE-POSITIVE / BLEND SCENARIOS (conditional FPP >= 50%)"
     print(f" Scientific Disposition: {disposition}")
     print(f"{'='*65}\n")
 
@@ -310,7 +307,7 @@ def validate_auto(n_mc: int = 5, n_bins: int = 60, top_csv: str = None, results_
 
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description="Run TRICERATOPS Bayesian Validation on a candidate.")
+    parser = argparse.ArgumentParser(description="Report Bayesian TRICERATOPS FPP/NFPP estimates conditional on scenarios and model priors.")
     parser.add_argument("--auto", action="store_true", help="Automatically validate all targets from top3 CSV")
     parser.add_argument("--top-csv", type=str, default=None, help="Explicit path to top candidates table")
     parser.add_argument("--results-dir", type=str, default=None, help="Results directory for ranking lookup and output files")

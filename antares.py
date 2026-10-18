@@ -755,7 +755,7 @@ def run_antares_detective(tic_id: str, p_init: float, t0_init: float, dur_hr: fl
     axes[2, 1].axis("off")
     n_pos_years = sum(1 for y in years_unique if year_stats[y]["snr_white"] >= 2.0)
     verdict = (
-        "CONFIRMED MULTI-EPOCH PLANET CANDIDATE"
+        "MULTI-EPOCH CANDIDATE SIGNAL CRITERIA MET (not independent confirmation)"
         if (master_metrics["snr_red"] >= 7.1 and n_pos_years >= 2)
         else ("PERSISTENT MULTI-SECTOR CANDIDATE (Grey Zone 5-7 sigma)" if master_metrics["snr_red"] >= 5.0 else "SUSPECT / MARGINAL SNR")
     )

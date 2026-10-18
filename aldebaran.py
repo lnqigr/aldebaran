@@ -2210,6 +2210,9 @@ def _analyze_single_target_impl(
             arch_ok, arch_status, arch_info = verify_multi_epoch(
                 tic_id, last_sector, t_curr_eval, flat_f, flat_ferr, best_p, best_t0, best_dur, depth_ppm, sde
             )
+            arch_display_status = str(arch_status).replace(
+                "Confirmed_in_Sectors_", "Archival_match_in_Sectors_"
+            )
 
             # Persist bounded JSON-safe archival diagnostics for every evaluated target/peak
             from datetime import datetime, timezone
@@ -2313,7 +2316,7 @@ def _analyze_single_target_impl(
             axes[0, 1].set_xlabel("Phase (days from mid-transit)")
             axes[0, 1].set_ylabel("Normalized Flux")
             axes[0, 1].set_title(
-                f"Phase-Folded Transit: Rp = {r_planet_earth:.2f} R_Earth | Depth = {depth_ppm:.0f} ppm | {arch_status}"
+                f"Phase-Folded Transit: Rp = {r_planet_earth:.2f} R_Earth | Depth = {depth_ppm:.0f} ppm | {arch_display_status}"
             )
             axes[0, 1].legend(loc="lower right")
 
@@ -2338,7 +2341,9 @@ def _analyze_single_target_impl(
                         axes[1, 1].add_patch(rect)
             axes[1, 1].set_xlabel("Pixel Column")
             axes[1, 1].set_ylabel("Pixel Row")
-            axes[1, 1].set_title(f"Verified On-Target Difference Image (Sector {last_sector}, CROWDSAP={crowdsap:.2f})")
+            axes[1, 1].set_title(
+                f"Difference Image Localization Diagnostic (not independent verification; Sector {last_sector}, CROWDSAP={crowdsap:.2f})"
+            )
 
             plt.tight_layout()
             run_suffix = f"_{CURRENT_RUN_ID}" if CURRENT_RUN_ID else ""
@@ -2412,7 +2417,7 @@ def _analyze_single_target_impl(
             trials_str = f"Trials={arch_info.get('n_trials', 1)}, Crit={arch_info.get('snr_crit', 2.4):.1f}s"
             msg = (
                 f"{cand_tag} FOUND (Peak #{rank_idx})! P={selected_p:.5f} d | N={unique_transits} | Depth={depth_ppm:.0f} ppm | "
-                f"Rp={r_planet_earth:.2f} R_E | SDE={sde:.1f} | Archival={arch_status} ({trials_str})"
+                f"Rp={r_planet_earth:.2f} R_E | SDE={sde:.1f} | Archival={arch_display_status} ({trials_str})"
             )
             return make_res(tic_id, "CANDIDATE", msg, cand_data)
             

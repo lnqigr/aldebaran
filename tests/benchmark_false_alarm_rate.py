@@ -7,6 +7,7 @@ from scipy import stats
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from unittest.mock import patch
 from astropy.timeseries import BoxLeastSquares
 
 RESULTS_DIR = "tess_results"
@@ -39,14 +40,10 @@ def prepare_inverted_flux(
     flare_sigma: float = 3.5
 ) -> np.ndarray:
     """
-    Prepares inverted flux F_inv = 2.0 - F for empirical False Alarm Rate evaluation.
+    Prepares inverted flux F_inv = 2.0 - F for the synthetic FAR demonstration.
     
-    Argon's Physics Rule:
-    Optical flares on M/K dwarfs are physical positive excursions (F > 1.0).
-    If raw flux is inverted without pre-clipping flares, positive flares turn into
-    deep pseudo-transits, falsely inflating the measured False Alarm Rate!
-    Pre-clipping upward excursions > 3.5 MAD before inversion ensures that
-    the inverted search strictly measures Gaussian/red instrumental noise.
+    In this synthetic demonstration, pre-clipping upward excursions before
+    inversion prevents the injected positive flares from becoming artificial dips.
     """
     f = np.copy(flux)
     if pre_clip_flares:
@@ -65,8 +62,8 @@ def generate_synthetic_tess_noise(
     rng: np.random.Generator = None
 ) -> np.ndarray:
     """
-    Generates a realistic 27-day TESS SPOC 2-minute cadence quiescent light curve
-    with Gaussian white noise, autocorrelated red noise, and optional optical flares.
+    Generates an illustrative 27-day synthetic light curve with Gaussian white noise,
+    autocorrelated red noise, and optional positive excursions; it is not a TESS sample.
     """
     if rng is None:
         rng = np.random.default_rng()
@@ -91,13 +88,14 @@ def compute_empirical_far_curve(
     rng_seed: int = 42
 ) -> tuple[pd.DataFrame, dict]:
     """
-    Computes the empirical False Alarm Rate (FAR) across SDE thresholds [5.0, 7.5]
-    using Gumbel Extreme Value Statistics calibrated to 2,000 inverted light curves.
+    Computes finite-sample threshold fractions from synthetic Gumbel maxima.
+
+    The returned ``empirical_far_pct`` column is a legacy name for a synthetic
+    draw fraction, not an empirical survey false-alarm rate.
     """
     rng = np.random.default_rng(rng_seed)
     
-    # Gumbel parameters for whitened BLS maximum SDE distribution in TESS 2-min cadence data
-    # (loc = 4.35, scale = 0.42 derived from empirical BLS extrema on quiescent sectors)
+    # Fixed illustrative Gumbel parameters; they are not calibrated from real TESS sectors.
     loc_gumbel = 4.35
     scale_gumbel = 0.42
     max_sde_dist = rng.gumbel(loc=loc_gumbel, scale=scale_gumbel, size=n_sample)
@@ -131,7 +129,7 @@ def compute_empirical_far_curve(
 
 def run_false_alarm_rate_benchmark() -> dict:
     """
-    Executes the full False Alarm Rate calibration benchmark, saving summary CSV and publication plot.
+    Saves the synthetic Gumbel threshold-fraction demonstration as CSV and plot.
     """
     df_far, stats_dict = compute_empirical_far_curve(n_sample=2000, rng_seed=42)
 
@@ -140,10 +138,10 @@ def run_false_alarm_rate_benchmark() -> dict:
 
     fig, axes = plt.subplots(1, 2, figsize=(13, 5.5))
 
-    # Panel 1: Peak SDE Distribution on Inverted Flux (Noise Extrema)
+    # Panel 1: Synthetic Gumbel maxima (not measured inverted-light-curve extrema)
     max_sde = stats_dict["max_sde_dist"]
     bins = np.linspace(3.0, 8.5, 30)
-    axes[0].hist(max_sde, bins=bins, density=True, alpha=0.65, color="steelblue", edgecolor="black", label=f"Inverted Flux BLS Extrema (N=2000)")
+    axes[0].hist(max_sde, bins=bins, density=True, alpha=0.65, color="steelblue", edgecolor="black", label="Synthetic Gumbel maxima (N=2000)")
     
     # Overlay Gumbel PDF
     x_grid = np.linspace(3.0, 8.5, 300)
@@ -151,21 +149,21 @@ def run_false_alarm_rate_benchmark() -> dict:
     axes[0].plot(x_grid, gumbel_pdf, color="crimson", lw=2.2, label=f"Gumbel PDF (μ={stats_dict['loc']:.2f}, β={stats_dict['scale']:.2f})")
     axes[0].axvline(6.0, color="orange", linestyle="--", lw=2.0, label="Detection Cutoff: SDE ≥ 6.0")
     axes[0].axvline(7.0, color="green", linestyle=":", lw=2.0, label="High-Confidence Cutoff: SDE ≥ 7.0")
-    axes[0].set_xlabel("Whitened Maximum SDE (Inverted Flux)", fontsize=11)
+    axes[0].set_xlabel("Synthetic Gumbel variate (illustrative SDE scale)", fontsize=11)
     axes[0].set_ylabel("Probability Density", fontsize=11)
-    axes[0].set_title("Peak SDE Null Distribution on Inverted Flux", fontsize=12)
+    axes[0].set_title("Synthetic Gumbel Maximum-SDE Demonstration", fontsize=12)
     axes[0].legend(loc="upper right", fontsize=9.5)
     axes[0].grid(True, alpha=0.3)
 
-    # Panel 2: Empirical False Alarm Rate Curve FAR(SDE)
-    axes[1].plot(df_far["sde_threshold"], df_far["empirical_far_pct"], "o-", color="crimson", lw=2.5, ms=7, label="Empirical FAR (% of light curves)")
-    axes[1].plot(df_far["sde_threshold"], df_far["gumbel_theoretical_far_pct"], "--", color="navy", lw=1.8, label="Gumbel Analytical Model")
-    axes[1].axvline(6.0, color="orange", linestyle="--", lw=1.8, label=f"SDE = 6.0 Gate (FAR = {stats_dict['far_at_6_0']:.2f}%)")
-    axes[1].axvline(7.0, color="green", linestyle=":", lw=1.8, label=f"SDE = 7.0 Gate (FAR = {stats_dict['far_at_7_0']:.2f}%)")
+    # Panel 2: Synthetic Gumbel draw fractions by SDE threshold
+    axes[1].plot(df_far["sde_threshold"], df_far["empirical_far_pct"], "o-", color="crimson", lw=2.5, ms=7, label="Synthetic Gumbel draw fraction (%)")
+    axes[1].plot(df_far["sde_threshold"], df_far["gumbel_theoretical_far_pct"], "--", color="navy", lw=1.8, label="Gumbel model survival fraction")
+    axes[1].axvline(6.0, color="orange", linestyle="--", lw=1.8, label=f"SDE = 6.0 threshold fraction = {stats_dict['far_at_6_0']:.2f}%")
+    axes[1].axvline(7.0, color="green", linestyle=":", lw=1.8, label=f"SDE = 7.0 threshold fraction = {stats_dict['far_at_7_0']:.2f}%")
     axes[1].set_yscale("log")
     axes[1].set_xlabel("SDE Threshold", fontsize=11)
-    axes[1].set_ylabel("False Alarm Rate FAR (%) [Log Scale]", fontsize=11)
-    axes[1].set_title("Empirical False Alarm Rate vs. Detection Threshold", fontsize=12)
+    axes[1].set_ylabel("Synthetic Gumbel Draw Fraction (%) [Log Scale]", fontsize=11)
+    axes[1].set_title("Synthetic Gumbel Threshold-Fraction Demonstration", fontsize=12)
     axes[1].legend(loc="upper right", fontsize=9.5)
     axes[1].grid(True, alpha=0.3, which="both")
 
@@ -181,11 +179,13 @@ def run_false_alarm_rate_benchmark() -> dict:
     }
 
 
-class TestFalseAlarmRateCalibration(unittest.TestCase):
-    """Validates Goal 1: Empirical False Alarm Rate calibration on inverted flux."""
+class TestFalseAlarmRateSyntheticDemo(unittest.TestCase):
+    """Checks deterministic properties of the synthetic Gumbel FAR demonstration."""
 
     def test_far_benchmarks_and_flare_mitigation(self):
-        res = run_false_alarm_rate_benchmark()
+        figures = []
+        with patch.object(plt, "savefig", side_effect=lambda *args, **kwargs: figures.append(plt.gcf())):
+            res = run_false_alarm_rate_benchmark()
         df = res["df_far"]
         
         # 1. At SDE >= 6.0, FAR must be <= 2.5% (observed ~ 1.6%)
@@ -209,6 +209,11 @@ class TestFalseAlarmRateCalibration(unittest.TestCase):
         min_unclipped = float(np.min(f_inv_unclipped))
         min_clipped = float(np.min(f_inv_clipped))
         self.assertLess(min_unclipped, min_clipped, "Unclipped inverted flux should have deeper false dips from flares")
+        self.assertEqual(len(figures), 1)
+        axes = figures[0].axes
+        self.assertIn("Synthetic Gumbel", axes[0].get_title())
+        self.assertNotIn("Inverted Flux", axes[0].get_xlabel())
+        self.assertIn("Synthetic Gumbel draw fraction", " ".join(text.get_text() for text in axes[1].get_legend().texts))
 
 
 if __name__ == "__main__":

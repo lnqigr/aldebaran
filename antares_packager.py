@@ -1352,7 +1352,7 @@ def run_stage_3c_packaging(
             f"Aldebaran v8.0 / Pleiades v2.2 / Antares v3.0 Candidate (Sectors {secs_str}, N={r['n_transits']} transits, SNR_red={r['snr_red']:.1f}s). "
             f"Conditional Planetary Characterization: Teq={int(astro['teq_k'])}K, Mp_est={astro['mp_ck17_earth']:.1f} M_E, "
             f"RV K={astro['rv_k_ck17_ms']:.1f} m/s, TSM={astro['tsm']:.1f}, ESM={astro['esm']:.1f}. "
-            f"Gaia Contam={contam_pct:.1f}% ({neb_cnt} NEB neighbors). Disposition: PC (FP Risk={corr_risk:.1f}%)."
+            f"Gaia Contam={contam_pct:.1f}% ({neb_cnt} NEB neighbors). Disposition: PC (VPS heuristic points={corr_risk:.1f}/100; uncalibrated, not a probability)."
         )
 
         exofop_rows.append({
@@ -1496,7 +1496,7 @@ def run_antares_packager(
             "tic_id": r_row["tic_id"],
             "stage_3a": "REJECT",
             "stage_3b_status": "SKIPPED",
-            "decision_reason": f"Stage 3A Filter (Risk={r_row.get('corr_risk')}%, DurRatio={r_row.get('dur_ratio')}%, NEB={r_row.get('neb_count')})",
+            "decision_reason": f"Stage 3A Filter (VPS heuristic points={r_row.get('corr_risk')}/100, DurRatio={r_row.get('dur_ratio')}%, NEB={r_row.get('neb_count')})",
             "refined_period_days": r_row.get("period_d", np.nan),
             "snr_red": np.nan,
             "snr_white": np.nan,

@@ -365,7 +365,7 @@ def run_ctoi_packager():
             if col not in df_merged.columns:
                 df_merged[col] = default_v
 
-    # Step 2: Filter out confirmed False Positives
+    # Step 2: Exclude candidates flagged by catalog and diagnostic criteria
     n_initial = len(df_merged)
     has_gaia_nss = df_merged["gaia_nss_type"].notna() & (
         ~df_merged["gaia_nss_type"].astype(str).str.strip().str.upper().isin(["", "NAN", "NONE", "N/A", "FALSE"])
@@ -377,7 +377,7 @@ def run_ctoi_packager():
     df_rejected = df_merged[fp_mask]
     df_clean = df_merged[~fp_mask].copy()
     
-    print(f"Filtered out {len(df_rejected)} confirmed FPs (Gaia NSS / Secondary SNR > 3.5 / Known TESS EB).")
+    print(f"Excluded {len(df_rejected)} candidates flagged by Gaia NSS, secondary-SNR, or known-TESS-EB criteria.")
     if len(df_rejected) > 0:
         for _, r_row in df_rejected.iterrows():
             print(f"      -> Excluded TIC {r_row['tic_id']}: {r_row.get('disposition', 'FP')}")
@@ -494,7 +494,7 @@ def run_ctoi_packager():
             f"Teq={int(astro['teq_k'])}K, Mp_est={astro['mp_ck17_earth']:.1f} M_E, RV K={astro['rv_k_ck17_ms']:.1f} m/s, "
             f"TSM={astro['tsm']:.1f}, ESM={astro['esm']:.1f}. "
             f"Gaia 120arcsec Contam={contam_pct:.1f}% ({neb_cnt} NEB-capable neighbors). "
-            f"Disposition: {row.get('disposition', 'PC')} (FP Risk={fp_risk:.1f}%)."
+            f"Disposition: {row.get('disposition', 'PC')} (VPS heuristic points={fp_risk:.1f}/100; uncalibrated, not a probability)."
         )
         
         exofop_rows.append({

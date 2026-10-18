@@ -20,6 +20,7 @@ import sys
 import tempfile
 import typing
 import unittest
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -84,6 +85,70 @@ class TestVPSIsolatedPenalties(unittest.TestCase):
         self.assertAlmostEqual(ledger["unclipped_total"], 0.2, places=6)
         self.assertAlmostEqual(ledger["clipped_score"], 0.2, places=6)
         self.assertEqual(ledger["final_score"], 0.2)
+
+    def test_publication_labels_describe_heuristic_vps_not_probability(self):
+        repo = Path(__file__).resolve().parents[1]
+        ctoi_source = (repo / "ctoi_packager.py").read_text(encoding="utf-8")
+        antares_source = (repo / "antares_packager.py").read_text(encoding="utf-8")
+        pleiades_source = (repo / "pleiades.py").read_text(encoding="utf-8")
+        triceratops_source = (repo / "validate_triceratops.py").read_text(encoding="utf-8")
+        far_source = (repo / "tests" / "benchmark_false_alarm_rate.py").read_text(encoding="utf-8")
+        roc_source = (repo / "tests" / "benchmark_vps_roc.py").read_text(encoding="utf-8")
+        self.assertIn("VPS heuristic points=", ctoi_source)
+        self.assertIn("VPS heuristic points=", antares_source)
+        self.assertNotIn("Stage 3A Filter (Risk=", antares_source)
+        self.assertNotIn("FP Risk=", ctoi_source)
+        self.assertNotIn("FP Risk=", antares_source)
+        self.assertIn("Legacy compatibility alias for heuristic VPS points, not a probability.", pleiades_source)
+        self.assertNotIn("Low FP Risk", pleiades_source)
+        self.assertNotIn("CONFIRMED FP", pleiades_source)
+        self.assertIn("EXPLORATORY CONDITIONAL SCENARIO-MODEL THRESHOLD PASS", triceratops_source)
+        self.assertNotIn("STATISTICALLY VALIDATED PLANET", triceratops_source)
+        self.assertNotIn("Empirical FAR (% of light curves)", far_source)
+        self.assertNotIn("Empirical ROC Curve: Vetting Penalty Score", roc_source)
+        self.assertNotIn("Whitened Maximum SDE (Inverted Flux)", far_source)
+        self.assertNotIn("Stage-3A Gate (VPS", roc_source)
+
+        with self.assertRaises(AssertionError):
+            self.assertNotIn("FP Risk=", ctoi_source.replace("VPS heuristic points=", "FP Risk=", 1))
+        with self.assertRaises(AssertionError):
+            self.assertNotIn(
+                "Stage 3A Filter (Risk=",
+                antares_source.replace("Stage 3A Filter (VPS heuristic points=", "Stage 3A Filter (Risk=", 1),
+            )
+        with self.assertRaises(AssertionError):
+            self.assertNotIn(
+                "STATISTICALLY VALIDATED PLANET",
+                triceratops_source.replace("EXPLORATORY CONDITIONAL SCENARIO-MODEL THRESHOLD PASS", "STATISTICALLY VALIDATED PLANET", 1),
+            )
+        with self.assertRaises(AssertionError):
+            self.assertNotIn(
+                "Empirical ROC Curve: Vetting Penalty Score",
+                roc_source.replace("Synthetic-label ROC Demonstration: VPS", "Empirical ROC Curve: Vetting Penalty Score", 1),
+            )
+        with self.assertRaises(AssertionError):
+            self.assertNotIn(
+                "Empirical FAR (% of light curves)",
+                far_source.replace("Synthetic Gumbel draw fraction (%)", "Empirical FAR (% of light curves)", 1),
+            )
+        with self.assertRaises(AssertionError):
+            self.assertNotIn(
+                "Whitened Maximum SDE (Inverted Flux)",
+                far_source.replace(
+                    "Synthetic Gumbel variate (illustrative SDE scale)",
+                    "Whitened Maximum SDE (Inverted Flux)",
+                    1,
+                ),
+            )
+        with self.assertRaises(AssertionError):
+            self.assertNotIn(
+                "Stage-3A Gate (VPS",
+                roc_source.replace(
+                    "Synthetic-sample Youden optimum (not a production threshold): VPS",
+                    "Stage-3A Gate (VPS",
+                    1,
+                ),
+            )
 
     def test_impact_parameter_penalty(self):
         # b <= 0.75 -> 0.0
@@ -1815,7 +1880,7 @@ class TestPleiadesProducerCLIAndErrorRowSchema(unittest.TestCase):
             return {
                 "tic_id": str(cand_row["tic_id"]),
                 "operational_status": "SUCCESS",
-                "disposition": "TIER-2 VETTED CANDIDATE (Low FP Risk)",
+                "disposition": "TIER-2 HEURISTIC SCREEN PASS (candidate; no calibrated FP-risk estimate)",
                 "vps_version": VPS_SCHEMA_VERSION,
                 "vps_producer": VPS_PRODUCER_NAME,
                 "vps_score": round(ledger["final_score"], 1),

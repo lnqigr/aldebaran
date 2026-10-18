@@ -5,6 +5,7 @@ import pandas as pd
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from unittest.mock import patch
 
 RESULTS_DIR = "tess_results"
 os.makedirs(RESULTS_DIR, exist_ok=True)
@@ -23,8 +24,8 @@ def compute_vps_score(
     primary_snr: float = 10.0
 ) -> float:
     """
-    Computes the calibrated Vetting Penalty Score (VPS, 0-100) using dual-zone
-    Sidak-Bonferroni secondary eclipse thresholds and astrophysical blend penalties.
+    Computes the heuristic Vetting Penalty Score (VPS, 0-100) from configured
+    secondary-eclipse and blend-related penalties; it is not a calibrated probability.
     """
     if is_gaia_nss or is_tess_eb:
         return 99.9
@@ -59,8 +60,10 @@ def compute_vps_score(
 
 def compute_empirical_roc(y_true_planet: np.ndarray, vps_scores: np.ndarray) -> dict:
     """
-    Computes empirical ROC curve (TPR vs FPR), AUC via trapezoidal integration,
-    and optimal Youden's J cutoff threshold without requiring external sklearn dependencies.
+    Computes ROC statistics over the supplied labels and scores.
+
+    In this script the labels and scores are artificially generated controls, not
+    a measured real-planet / false-positive sample.
     """
     thresholds = np.linspace(0.0, 100.0, 1001)
     tpr_arr = np.zeros_like(thresholds)
@@ -99,12 +102,14 @@ def compute_empirical_roc(y_true_planet: np.ndarray, vps_scores: np.ndarray) -> 
 
 def build_control_sample_100() -> pd.DataFrame:
     """
-    Constructs the 100-target labeled benchmark sample (50 Confirmed TOIs + 50 Confirmed EBs/NEBs)
-    combining real MetaCentrum Tier-2 telemetry with representative TESS control distributions.
+    Constructs 50 artificial TOI-like and 50 artificial EB/blend-like control examples.
+
+    The distributions are illustrative and do not combine real MetaCentrum telemetry
+    or represent catalog-confirmed populations.
     """
     rng = np.random.default_rng(2026)
     
-    # Realistic overlapping distributions from Section 14.2 Priority P0
+    # Fixed overlapping artificial distributions used only for this demonstration.
     vps_tois_real = np.concatenate([
         np.clip(rng.gamma(shape=1.8, scale=5.5, size=42) + 0.2, 0.2, 24.0),
         rng.uniform(24.5, 48.0, size=8)
@@ -116,7 +121,7 @@ def build_control_sample_100() -> pd.DataFrame:
 
     rows = []
 
-    # 1. 50 Confirmed Planets (TOIs):
+    # 1. 50 synthetic TOI-like controls:
     for i in range(50):
         is_crowded_or_grazing = (i >= 42)
         vps = round(float(vps_tois_real[i]), 1)
@@ -129,7 +134,7 @@ def build_control_sample_100() -> pd.DataFrame:
 
         rows.append({
             "sample_id": f"TOI_CTRL_{i+1:02d}",
-            "class_label": "Confirmed_TOI",
+            "class_label": "Synthetic_TOI_like",
             "is_planet": 1,
             "vps_score": vps,
             "sec_snr": sec_snr,
@@ -138,7 +143,7 @@ def build_control_sample_100() -> pd.DataFrame:
             "flux_contam_percent": contam
         })
 
-    # 2. 50 Confirmed Astrophysical False Positives (EBs, SB1s, NEBs):
+    # 2. 50 synthetic EB/blend-like controls:
     for j in range(50):
         vps = round(float(vps_ebs_real[j]), 1)
         sec_snr = round(float(rng.uniform(3.5, 14.0)) if j < 43 else float(rng.uniform(1.8, 3.2)), 2)
@@ -150,7 +155,7 @@ def build_control_sample_100() -> pd.DataFrame:
 
         rows.append({
             "sample_id": f"EB_CTRL_{j+1:02d}",
-            "class_label": "Confirmed_EB_FP",
+            "class_label": "Synthetic_EB_blend_like",
             "is_planet": 0,
             "vps_score": vps,
             "sec_snr": sec_snr,
@@ -163,6 +168,7 @@ def build_control_sample_100() -> pd.DataFrame:
 
 
 def run_vps_roc_benchmark() -> dict:
+    """Save an ROC demonstration for the artificial control distributions."""
     df_ctrl = build_control_sample_100()
     roc_res = compute_empirical_roc(df_ctrl["is_planet"].to_numpy(), df_ctrl["vps_score"].to_numpy())
 
@@ -172,28 +178,28 @@ def run_vps_roc_benchmark() -> dict:
     fig, axes = plt.subplots(1, 2, figsize=(13, 5.5))
 
     # Panel 1: ROC Curve (TPR vs FPR)
-    axes[0].plot(roc_res["fpr"], roc_res["tpr"], color="crimson", lw=2.5, label=f"VPS Classifier (AUC = {roc_res['auc']:.4f})")
+    axes[0].plot(roc_res["fpr"], roc_res["tpr"], color="crimson", lw=2.5, label=f"Synthetic-control VPS classifier (AUC = {roc_res['auc']:.4f})")
     axes[0].plot([0, 1], [0, 1], color="gray", linestyle="--", lw=1.2, label="Random Guess (AUC = 0.50)")
     axes[0].scatter(
         [roc_res["opt_fpr"]], [roc_res["opt_tpr"]], color="black", s=65, zorder=5,
-        label=f"Optimal Cutoff: VPS ≤ {roc_res['opt_vps_cutoff']:.1f}\n(TPR={roc_res['opt_tpr']*100:.1f}%, FPR={roc_res['opt_fpr']*100:.1f}%)"
+        label=f"Synthetic-sample Youden optimum: VPS ≤ {roc_res['opt_vps_cutoff']:.1f}\n(TPR={roc_res['opt_tpr']*100:.1f}%, FPR={roc_res['opt_fpr']*100:.1f}%)"
     )
     axes[0].set_xlim(-0.02, 1.02)
     axes[0].set_ylim(-0.02, 1.02)
-    axes[0].set_xlabel("False Positive Rate (Contaminating EBs Admitted)", fontsize=11)
-    axes[0].set_ylabel("True Positive Rate (Genuine Planets Retained)", fontsize=11)
-    axes[0].set_title("Empirical ROC Curve: Vetting Penalty Score (VPS)", fontsize=12)
+    axes[0].set_xlabel("False-positive fraction among synthetic EB/blend-like controls", fontsize=11)
+    axes[0].set_ylabel("True-positive fraction among synthetic TOI-like controls", fontsize=11)
+    axes[0].set_title("Synthetic-label ROC Demonstration: VPS", fontsize=12)
     axes[0].legend(loc="lower right", fontsize=9.5)
     axes[0].grid(True, alpha=0.3)
 
     # Panel 2: VPS Distribution Histograms for TOIs vs EBs
     bins = np.linspace(0, 100, 21)
-    axes[1].hist(df_ctrl[df_ctrl["is_planet"] == 1]["vps_score"], bins=bins, alpha=0.65, color="royalblue", edgecolor="black", label="Confirmed Planets (N=50)")
-    axes[1].hist(df_ctrl[df_ctrl["is_planet"] == 0]["vps_score"], bins=bins, alpha=0.65, color="darkorange", edgecolor="black", label="Confirmed EBs / Blends (N=50)")
-    axes[1].axvline(roc_res["opt_vps_cutoff"], color="crimson", linestyle="--", lw=2.2, label=f"Stage-3A Gate (VPS ≤ {roc_res['opt_vps_cutoff']:.1f})")
+    axes[1].hist(df_ctrl[df_ctrl["is_planet"] == 1]["vps_score"], bins=bins, alpha=0.65, color="royalblue", edgecolor="black", label="Synthetic TOI-like controls (N=50)")
+    axes[1].hist(df_ctrl[df_ctrl["is_planet"] == 0]["vps_score"], bins=bins, alpha=0.65, color="darkorange", edgecolor="black", label="Synthetic EB/blend-like controls (N=50)")
+    axes[1].axvline(roc_res["opt_vps_cutoff"], color="crimson", linestyle="--", lw=2.2, label=f"Synthetic-sample Youden optimum (not a production threshold): VPS ≤ {roc_res['opt_vps_cutoff']:.1f}")
     axes[1].set_xlabel("Vetting Penalty Score (VPS, 0–100)", fontsize=11)
     axes[1].set_ylabel("Number of Targets", fontsize=11)
-    axes[1].set_title("Control Sample Separation (50 TOIs vs 50 EBs)", fontsize=12)
+    axes[1].set_title("Artificial Control-Distribution Separation", fontsize=12)
     axes[1].legend(loc="upper center", fontsize=9.5)
     axes[1].grid(True, alpha=0.3)
 
@@ -204,15 +210,25 @@ def run_vps_roc_benchmark() -> dict:
     return roc_res
 
 
-class TestVpsRocCalibration(unittest.TestCase):
-    """Validates Priority P0: Empirical ROC calibration of the Vetting Penalty Score (VPS)."""
+class TestVpsRocSyntheticDemo(unittest.TestCase):
+    """Checks the synthetic VPS ROC demonstration and its plot labels."""
 
     def test_roc_auc_and_optimal_cutoff(self):
-        res = run_vps_roc_benchmark()
+        figures = []
+        with patch.object(plt, "savefig", side_effect=lambda *args, **kwargs: figures.append(plt.gcf())):
+            res = run_vps_roc_benchmark()
         self.assertGreaterEqual(res["auc"], 0.92, f"ROC AUC too low: {res['auc']}")
         self.assertGreaterEqual(res["opt_tpr"], 0.80, f"Optimal TPR too low: {res['opt_tpr']}")
         self.assertLessEqual(res["opt_fpr"], 0.10, f"Optimal FPR too high: {res['opt_fpr']}")
         self.assertTrue(15.0 <= res["opt_vps_cutoff"] <= 30.0, f"Optimal cutoff out of expected [15, 30] range: {res['opt_vps_cutoff']}")
+        self.assertEqual(len(figures), 1)
+        axes = figures[0].axes
+        self.assertIn("Synthetic-label ROC", axes[0].get_title())
+        self.assertIn("Synthetic-sample Youden optimum", " ".join(text.get_text() for text in axes[0].get_legend().texts))
+        self.assertIn("Synthetic TOI-like controls", " ".join(text.get_text() for text in axes[1].get_legend().texts))
+        panel_legend = " ".join(text.get_text() for text in axes[1].get_legend().texts)
+        self.assertIn("Synthetic EB/blend-like controls", panel_legend)
+        self.assertIn("not a production threshold", panel_legend)
 
 
 if __name__ == "__main__":

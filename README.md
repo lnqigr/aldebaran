@@ -8,7 +8,7 @@ The pipeline is engineered to probe the detection grey zone ($6.0 \le \text{SDE}
 
 Aldebaran is a research candidate-search pipeline. **Real-TESS full-pipeline detection completeness, empirical false-alarm rates, and statistical validation performance have not been independently calibrated.** The benchmarks below include synthetic experiments; their results must not be interpreted as real-survey performance. Existing thresholds are implementation choices whose scientific operating characteristics remain unvalidated.
 
-Known limitations include the archival control-phase wrap defect, short-duration BLS grid coverage, small-sample odd/even statistics, and insufficient-data classification. Numerical model accuracy requires a stated independent reference, geometry and exposure regime. VPS is a heuristic score, not a calibrated probability. TRICERATOPS FPP/NFPP are conditional on their inputs and scenario model; LOYO timing outputs and candidate labels alone do not establish independent confirmation. Historical candidate examples below are not validated discoveries; reported performance figures are not independent calibration.
+Known limitations include the archival control-phase wrap defect, short-duration BLS grid coverage, small-sample odd/even statistics, insufficient-data classification, and Tier-2's secondary-eclipse phase scan selecting only the single global maximum by orbital phase rather than assessing alternate peaks. The archival control phases are stored in a signed interval from -0.5 to +0.5 cycles, so requested controls at phases 0.70–0.85 are outside that interval and are not evaluated as intended. Numerical model accuracy requires a stated independent reference, geometry and exposure regime. VPS is a heuristic score, not a calibrated probability. The legacy `fp_risk_percent` field is a compatibility alias for VPS points (0–100), not a probability. The persisted `Confirmed_in_Sectors_*` archival status is a legacy signal-match sentinel, not an independent confirmation; human-facing output calls it an archival match. TRICERATOPS FPP/NFPP are conditional on their inputs and scenario model; passing a model threshold is not independent validation. LOYO timing outputs and candidate labels alone do not establish independent confirmation. Historical candidate examples below are not validated discoveries; reported performance figures are not independent calibration.
 
 Version 9.1.0 is an engineering release. Historical feature descriptions below are not calibrated scientific performance claims. The calibration pilot is designed but not implemented or executed; known SCI01/SCI51/SCI53/SCI54 limitations remain open.
 
@@ -112,7 +112,7 @@ Version 9.1.0 is an engineering release. Historical feature descriptions below a
 ## Key Features in v9.0
 
 1. **Multi-Planet Search Engine via Known-Transit Masking (`aldebaran.py`)**:
-   Automatically queries and caches 8,036 official NASA TOI planet ephemerides from TAP (`tess_results/toi_ephemerides_cache.json`). When `SEARCH_TOI_COMPANIONS=True`, TOI host stars are prioritized in the discovery queue. Known planet transits are masked ($\pm 1.0\,T_{\text{dur}}$, a duration-dependent buffer, not a guaranteed TTV bound) with **mandatory linear interpolation across masked intervals before Savitzky-Golay filtering**, intended to reduce boundary ringing; masking losses and residual artifacts require calibration. BLS searches residual flux for possible sibling companions; sensitivity to shallow sub-Earth signals has not been established. The implementation applies heuristic fractional harmonic vetoes ($m/n \in \{1, 1/2, 2, 1/3, 3, 2/3, 3/2, 1/4, 4\}$).
+   Automatically queries and caches 8,036 official NASA TOI planet ephemerides from TAP (`tess_results/toi_ephemerides_cache.json`). When `SEARCH_TOI_COMPANIONS=True`, TOI host stars are prioritized in the discovery queue. Known planet transits are masked ($\pm 1.0\,T_{\text{dur}}$, a duration-dependent buffer, not a guaranteed TTV bound) with **mandatory linear interpolation across masked intervals before Savitzky-Golay filtering**, intended to reduce boundary ringing; masking losses and residual artifacts require calibration. BLS searches residual flux for possible sibling companions; sensitivity to shallow sub-Earth signals has not been established. The implementation applies heuristic fractional harmonic vetoes ($m/n \in \{1, 1/2, 2, 1/3, 3, 2/3, 3/2, 1/4, 4\}$). The separate `search_toi_companions.py` CLI defaults to sectors 106, 105, 104, 103, 102, 101, 100, and 99; these defaults do not change the Tier-1 PBS array mapping documented below.
 2. **Cramer-Rao Bounded Ephemeris Projection & Šidák Penalty (`verify_multi_epoch`)**:
    Implements archival search/projection restrictions; these do not by themselves establish independent confirmation or calibrated uncertainty:
    * **Contiguous sectors ($\Delta T \le 60\text{ d}$)**: Strict zero-freedom forward projection ($\Delta P = 0, \Delta T_0 = 0, N_{\text{trials}} = 1, z_{\text{crit}} = 2.4\sigma$) without BLS re-fitting.
@@ -120,11 +120,11 @@ Version 9.1.0 is an engineering release. Historical feature descriptions below a
    * **Trial penalty**: Dynamically scales critical SNR threshold via extreme-value penalty $z_{\text{crit}} = \max(2.8, \sqrt{2\ln(N_{\text{trials}})} + 1.2) \in [3.5\sigma, 4.2\sigma]$.
    * **Off-transit control (unvalidated)**: the intended eight-phase control is not a calibrated null test; the centered-phase wrap defect remains open. The historical **0.0144%** random-pass claim is unsupported and must not be used as an established probability.
 3. **Synthetic False-Alarm Demonstration (`tests/benchmark_false_alarm_rate.py`)**:
-   The reported **0.55%** comes from 2,000 sampled Gumbel maxima, not a benchmark processing 2,000 real quiet TESS stars. It establishes neither empirical survey FAR nor 99.45% real-data specificity. The script's empirical/inverted-flux plot labels do not change the synthetic origin of this calculation.
+   The reported **0.55%** is the fraction of 2,000 synthetic Gumbel draws exceeding a threshold, not a benchmark processing 2,000 real quiet TESS stars. It establishes neither empirical survey FAR nor 99.45% real-data specificity. Script labels identify the Gumbel sample and its threshold fractions as synthetic demonstrations.
 4. **Numerical Integrator and Synthetic Injection Benchmark**:
    The integrator has comparison tests, but the historical **3.09 ppm** number is not a validated universal error bound. `tests/test_mandel_agol_batman.py` uses batman when available and a related annulus reference otherwise; the latter is not independent validation. `tests/benchmark_injection.py` defaults to **288 trials (36 cells × 8)** on a synthetic baseline and a BLS-focused path, not the full production cascade on real TESS curves. Historical **100% recovery** cells describe only those synthetic trials, not population completeness; results were not rerun for this documentation correction.
 5. **Synthetic VPS ROC Demonstration (`tests/benchmark_vps_roc.py`)**:
-   The reported **AUC 0.988**, TPR 94%, FPR 2% and VPS cutoff 23.4 describe artificial scores/parameters for 50 positive and 50 negative examples. They do not establish an optimal production threshold or independent performance on real planets/EBs. No scientific thresholds are changed here.
+   The reported **AUC 0.988**, TPR 94%, FPR 2% and VPS cutoff 23.4 describe artificially generated scores/parameters for 50 synthetic TOI-like and 50 synthetic EB/blend-like controls. They do not establish an optimal production threshold or independent performance on real planets/EBs.
 6. **Production Configuration for MetaCentrum HPC (Sectors 108, 107, 98–93)**:
    Pre-configured lock-free sharding across the newest available TESS data (Sectors 108 and 107) and deep archival fields (Sectors 98–93).
 
@@ -132,8 +132,8 @@ Version 9.1.0 is an engineering release. Historical feature descriptions below a
 
 ## Key Features in v8.6
 
-1. **Tier-4 TRICERATOPS Blend-Scenario Analysis (`validate_triceratops.py`)**:
-   Evaluates 18 astrophysical blend scenarios (Giacalone et al. 2021) and reports FPP/NFPP conditional on the supplied data, priors, and scenario model; these are not independently calibrated pipeline performance metrics. Adaptive 60-bin phase folding was introduced to reduce memory use (historically reported from 11.55 GB to ~60 MB for a multi-sector case); binning changes sampling and error assumptions, and a universal SNR gain is not established.
+1. **Tier-4 Bayesian TRICERATOPS FPP/NFPP Assessment (`validate_triceratops.py`)**:
+   Evaluates 18 astrophysical blend scenarios (Giacalone et al. 2021) and reports Bayesian FPP/NFPP estimates conditional on the supplied data, model priors, and scenario model; a threshold pass is exploratory and is not independent statistical validation. Adaptive 60-bin phase folding was introduced to reduce memory use (historically reported from 11.55 GB to ~60 MB for a multi-sector case); binning changes sampling and error assumptions, and a universal SNR gain is not established.
 2. **Leave-One-Year-Out (LOYO) Timing Analysis (`loyo_validator.py`)**:
    Implements multi-year timing projections inspired by independent researcher Pavel Rabtsevich (TIC 4206066). Historical examples include a reported $+1.94\text{ min}$ timing offset over 800 days on TIC 350190949 and a 94-transit $\text{O}-\text{C}$ analysis. These examples have not been independently verified as blind holdout evidence or as population-level timing performance.
 3. **Master Scanned TICs Consolidation (`merge_scanned_tics.py`)**:
@@ -212,11 +212,11 @@ python antares_packager.py
 # 5. Run Antares multi-year archival forensic drill on a specific candidate
 python antares.py --tic 46314221
 
-# 6. Run Tier-4 Bayesian TRICERATOPS statistical blend validation
+# 6. Run Tier-4 Bayesian TRICERATOPS FPP/NFPP assessment (conditional on the supplied data, scenarios, and model priors)
 python validate_triceratops.py --tic 322051865 --period 2.831532 --t0 4154.32930 --duration 1.08 --depth 778.4 --sectors 103 104 105 106 --mc 5 --bins 60
 
-# 7. Run exploratory LOYO timing analysis
-python loyo_validator.py --tic 350190949 --period 0.926120 --t0 1325.61416 --duration 0.81 --sectors 1 28 104 105
+# 7. Run exploratory LOYO defaults (TIC 350190949, P=0.926120 d, T0=1325.61416 BTJD, duration=0.81 h; no CLI flags)
+python loyo_validator.py
 
 # 8. Merge and synchronize master scanned TICs catalog
 python merge_scanned_tics.py
