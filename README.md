@@ -17,94 +17,94 @@ Version 9.1.0 is an engineering release. Historical feature descriptions below a
 ## Pipeline Architecture
 
 ```
-                    NASA TESS 2-Minute SPOC Cadence
-                                   │
-                                   ▼
-┌─────────────────────────────────────────────────────────────────────────┐
-│               TIER 1: High-Throughput Screening (aldebaran.py v9.0)     │
-├─────────────────────────────────────────────────────────────────────────┤
-│  • Catalog Cross-Match (ExoFOP, TOIs, CTOIs, Confirmed Planets, EBs)    │
-│  • Multi-Planet Companion Search: 8,036 TOI Ephemeris Ingestion (TAP)   │
-│  • In-Transit Masking (±1.0 T_dur) + Pre-Filter Linear Interpolation    │
-│    (Intended to reduce filter ringing; harmonic veto is heuristic)    │
-│  • Bitwise Quality Filtering (QUALITY == 0) & Gap Ramp Trimming         │
-│  • Piecewise Iterative Savitzky-Golay Filtering with Transit Masking    │
-│  • Whitened Signal Residue SDE (Kovács et al. 2002, 501-pt Median/MAD)  │
-│  • Multi-Peak BLS Period Search (0.045 d <= Dur <= 0.18 d, Top 3 Peaks)│
-│  • 9-Stage Heuristic Candidate-Vetting Cascade:                         │
-│     0. Aperture Dilution: SPOC CROWDSAP >= 0.70                         │
-│     1. Detection & Duty Cycle: SDE >= 6.0, T_dur / P <= 0.095           │
-│     2. Transit Profile: Integrated SNR >= 5.5σ, Shoulder <= 35%,        │
-│        U-shape check (rejects sharp V-shaped grazing binaries)          │
-│     3. Multiplicity & Consistency: N_transits >= 3, Odd/Even < 2.8σ,   │
-│        Epoch Consistency (>= 60% with negative flux deficit)            │
-│     4. Dual-Zone Secondary Eclipse Scan:                                │
-│        - Circular (|Δφ| <= 0.04): 1 hypothesis, SNR > 3.1σ              │
-│        - Eccentric (|Δφ| > 0.04): Šidák-Bonferroni SNR > z_crit         │
-│        - Depth floor: >= 100 ppm & >= 10% primary depth                 │
-│     5. Astrometric Centroid Stability: Welch's t-test (< 2.0 arcsec)    │
-│     6. Stellar Density & Keplerian Bounds: TIC v8.2 / Gaia DR3 RUWE     │
-│        (RUWE <= 1.4, R_* <= 1.75 R_sun, 0.35*T_min <= Dur <= 1.38*T_max)│
-│     7. Target Pixel Stamp (TPF): Difference image aperture localization │
-│     8. Non-Circular Archival Verification (verify_multi_epoch v9.0):     │
-│        - Contiguous (ΔT <= 60 d): Strict zero-freedom forward project   │
-│        - Multi-Year (ΔT > 60 d): Cramer-Rao physical corridor (±2σ_P),  │
-│          Extreme-value Šidák threshold penalty (z_crit = 3.5σ - 4.2σ),  │
-│          8-phase off-transit control test (SNR_arch >= max_ctrl + 1.5σ) │
-│  • PBS Array Sharding across Sectors 108, 107, 98-93                    │
-└────────────────────────────────────┬────────────────────────────────────┘
-                                     │ candidates_report.csv
-                                     ▼
-┌─────────────────────────────────────────────────────────────────────────┐
-│             MULTI-NODE SHARD REDUCER (merge_shards.py v9.0)             │
-├─────────────────────────────────────────────────────────────────────────┤
-│  • Loads explicit manifest-declared, integrity-checked shard inputs   │
-│  • Preserves signal identities and provenance across sector inputs │
-│  • Merges scanned_tics.txt registries across parallel nodes             │
-│  • Optional downstream vetting requires explicit separate opt-in         │
-└────────────────────────────────────┬────────────────────────────────────┘
-                                     │
-                                     ▼
-┌─────────────────────────────────────────────────────────────────────────┐
-│               TIER 2: Deep Physical Vetting (pleiades.py v2.6)          │
-├─────────────────────────────────────────────────────────────────────────┤
-│  • Multi-Sector Detrending & Stitched Baseline Normalization            │
-│  • 300-Ring Gauss-Legendre Mandel-Agol Model (accuracy unvalidated)   │
-│  • Export of Multi-Sector Ephemeris: refined_t0, fitted_depth, dur_hr   │
-│  • Full-Orbit Eccentric Secondary Eclipse Scan with Šidák Threshold     │
-│  • Astrophysical Catalog Cross-Match:                                   │
-│     - VizieR TESS Eclipsing Binary Catalogue (Prša et al. 2022)         │
-│     - Gaia DR3 Non-Single Star (NSS) Two-Body Orbit Solutions (SB1/SB2) │
-│  • Gaia DR3 Field Contamination & Nearby Eclipsing Binary (NEB) Scoring │
-│  • 4-Panel Publication Dossiers in tess_results/deep_vetting/           │
-└────────────────────────────────────┬────────────────────────────────────┘
-                                     │ scientific_dossier_summary.csv
-                                     ▼
-┌─────────────────────────────────────────────────────────────────────────┐
-│       TIER 3: Archival Drill & CTOI Packager (antares_packager.py)      │
-├─────────────────────────────────────────────────────────────────────────┤
+                       NASA TESS 2-Minute SPOC Cadence                       
+                                      │
+                                      ▼
+┌───────────────────────────────────────────────────────────────────────────┐
+│           TIER 1: High-Throughput Screening (aldebaran.py v9.0)           │
+├───────────────────────────────────────────────────────────────────────────┤
+│  • Catalog Cross-Match (ExoFOP, TOIs, CTOIs, Confirmed Planets, EBs)      │
+│  • Multi-Planet Companion Search: 8,036 TOI Ephemeris Ingestion (TAP)     │
+│  • In-Transit Masking (±1.0 T_dur) + Pre-Filter Linear Interpolation      │
+│    (Intended to reduce filter ringing; harmonic veto is heuristic)        │
+│  • Bitwise Quality Filtering (QUALITY == 0) & Gap Ramp Trimming           │
+│  • Piecewise Iterative Savitzky-Golay Filtering with Transit Masking      │
+│  • Whitened Signal Residue SDE (Kovács et al. 2002, 501-pt Median/MAD)    │
+│  • Multi-Peak BLS Period Search (0.045 d <= Dur <= 0.18 d, Top 3 Peaks)   │
+│  • 9-Stage Heuristic Candidate-Vetting Cascade:                           │
+│     0. Aperture Dilution: SPOC CROWDSAP >= 0.70                           │
+│     1. Detection & Duty Cycle: SDE >= 6.0, T_dur / P <= 0.095             │
+│     2. Transit Profile: Integrated SNR >= 5.5σ, Shoulder <= 35%,          │
+│        U-shape check (rejects sharp V-shaped grazing binaries)            │
+│     3. Multiplicity & Consistency: N_transits >= 3, Odd/Even < 2.8σ,      │
+│        Epoch Consistency (>= 60% with negative flux deficit)              │
+│     4. Dual-Zone Secondary Eclipse Scan:                                  │
+│        - Circular (|Δφ| <= 0.04): 1 hypothesis, SNR > 3.1σ                │
+│        - Eccentric (|Δφ| > 0.04): Šidák-Bonferroni SNR > z_crit           │
+│        - Depth floor: >= 100 ppm & >= 10% primary depth                   │
+│     5. Astrometric Centroid Stability: Welch's t-test (< 2.0 arcsec)      │
+│     6. Stellar Density & Keplerian Bounds: TIC v8.2 / Gaia DR3 RUWE       │
+│        (RUWE <= 1.4, R_* <= 1.75 R_sun, 0.35*T_min <= Dur <= 1.38*T_max)  │
+│     7. Target Pixel Stamp (TPF): Difference image aperture localization   │
+│     8. Non-Circular Archival Verification (verify_multi_epoch v9.0):      │
+│        - Contiguous (ΔT <= 60 d): Strict zero-freedom forward project     │
+│        - Multi-Year (ΔT > 60 d): Cramer-Rao physical corridor (±2σ_P),    │
+│          Extreme-value Šidák threshold penalty (z_crit = 3.5σ - 4.2σ),    │
+│          8-phase off-transit control test (SNR_arch >= max_ctrl + 1.5σ)   │
+│  • PBS Array Sharding across Sectors 108, 107, 98-93                      │
+└─────────────────────────────────────┬─────────────────────────────────────┘
+                                      │ candidates_report.csv
+                                      ▼
+┌───────────────────────────────────────────────────────────────────────────┐
+│              MULTI-NODE SHARD REDUCER (merge_shards.py v9.0)              │
+├───────────────────────────────────────────────────────────────────────────┤
+│  • Loads explicit manifest-declared, integrity-checked shard inputs       │
+│  • Preserves signal identities and provenance across sector inputs        │
+│  • Merges scanned_tics.txt registries across parallel nodes               │
+│  • Optional downstream vetting requires explicit separate opt-in          │
+└─────────────────────────────────────┬─────────────────────────────────────┘
+                                      │
+                                      ▼
+┌───────────────────────────────────────────────────────────────────────────┐
+│              TIER 2: Deep Physical Vetting (pleiades.py v2.6)             │
+├───────────────────────────────────────────────────────────────────────────┤
+│  • Multi-Sector Detrending & Stitched Baseline Normalization              │
+│  • 300-Ring Gauss-Legendre Mandel-Agol Model (accuracy unvalidated)       │
+│  • Export of Multi-Sector Ephemeris: refined_t0, fitted_depth, dur_hr     │
+│  • Full-Orbit Eccentric Secondary Eclipse Scan with Šidák Threshold       │
+│  • Astrophysical Catalog Cross-Match:                                     │
+│     - VizieR TESS Eclipsing Binary Catalogue (Prša et al. 2022)           │
+│     - Gaia DR3 Non-Single Star (NSS) Two-Body Orbit Solutions (SB1/SB2)   │
+│  • Gaia DR3 Field Contamination & Nearby Eclipsing Binary (NEB) Scoring   │
+│  • 4-Panel Publication Dossiers in tess_results/deep_vetting/             │
+└─────────────────────────────────────┬─────────────────────────────────────┘
+                                      │ scientific_dossier_summary.csv
+                                      ▼
+┌───────────────────────────────────────────────────────────────────────────┐
+│        TIER 3: Archival Drill & CTOI Packager (antares_packager.py)       │
+├───────────────────────────────────────────────────────────────────────────┤
 │  • Stage 3A: Heuristic VPS Score & Pre-Filtering Gate                     │
-│  • Stage 3B: Decoupled Archival Drill (SPOC vs FFI Isolation)           │
-│     - Earliest-Transit Anchoring (t0_anchor) avoids epoch drift         │
-│     - Clean SPOC-only coherent folding and SNR_red metrics              │
-│  • Stage 3C: Planetary Follow-Up Prioritization (K m/s, TSM, ESM)       │
-│  • Stage 3D: ExoFOP CTOI Export with Multi-Sector Parameter Sync        │
-│  • 4-Panel Archival Posters saved in tess_results/archival_vetting/     │
-└────────────────────────────────────┬────────────────────────────────────┘
-                                     │ prioritized_targets_ranking.csv
-                                     ▼
-┌─────────────────────────────────────────────────────────────────────────┐
-│         TIER 4: Blend-Scenario and Timing Tools (v9.0)                  │
-├─────────────────────────────────────────────────────────────────────────┤
-│  • TRICERATOPS Blend-Scenario Analysis (validate_triceratops.py)         │
-│     - 18 astrophysical blend scenarios (Giacalone et al. 2021)          │
-│     - Input- and scenario-dependent FPP / NFPP calculations             │
-│     - Memory-optimized 60-bin phase folding (prevents 11 GB OOM)        │
-│  • Leave-One-Year-Out (LOYO) Timing Analysis (loyo_validator.py)        │
-│     - Multi-year blind timing prediction across 800+ day gaps           │
-│     - 94-transit O - C timing analysis & Keplerian clock verification   │
-│  • Master Scanned TICs Catalog Reducer (merge_scanned_tics.py)          │
-└─────────────────────────────────────────────────────────────────────────┘
+│  • Stage 3B: Decoupled Archival Drill (SPOC vs FFI Isolation)             │
+│     - Earliest-Transit Anchoring (t0_anchor) avoids epoch drift           │
+│     - Clean SPOC-only coherent folding and SNR_red metrics                │
+│  • Stage 3C: Planetary Follow-Up Prioritization (K m/s, TSM, ESM)         │
+│  • Stage 3D: ExoFOP CTOI Export with Multi-Sector Parameter Sync          │
+│  • 4-Panel Archival Posters saved in tess_results/archival_vetting/       │
+└─────────────────────────────────────┬─────────────────────────────────────┘
+                                      │ prioritized_targets_ranking.csv
+                                      ▼
+┌───────────────────────────────────────────────────────────────────────────┐
+│               TIER 4: Blend-Scenario and Timing Tools (v9.0)              │
+├───────────────────────────────────────────────────────────────────────────┤
+│  • TRICERATOPS Blend-Scenario Analysis (validate_triceratops.py)          │
+│     - 18 astrophysical blend scenarios (Giacalone et al. 2021)            │
+│     - Input- and scenario-dependent FPP / NFPP calculations               │
+│     - Memory-optimized 60-bin phase folding (prevents 11 GB OOM)          │
+│  • Leave-One-Year-Out (LOYO) Timing Analysis (loyo_validator.py)          │
+│     - Multi-year blind timing prediction across 800+ day gaps             │
+│     - 94-transit O - C timing analysis & Keplerian clock verification     │
+│  • Master Scanned TICs Catalog Reducer (merge_scanned_tics.py)            │
+└───────────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
