@@ -17,53 +17,614 @@
 
 export ALDEBARAN_MAX_TARGETS="${ALDEBARAN_MAX_TARGETS:-15000}"
 export ALDEBARAN_WORKERS="${PBS_NCPUS:-8}"
-
-# Locate project root directory regardless of whether qsub was called from root or cluster/
-REPO_DIR="$PBS_O_WORKDIR"
-if [ ! -f "$REPO_DIR/aldebaran.py" ] && [ -f "$REPO_DIR/../aldebaran.py" ]; then
-    REPO_DIR="$(cd "$REPO_DIR/.." && pwd)"
-fi
+export ALDEBARAN_SIGNAL_TIMEOUT="${ALDEBARAN_SIGNAL_TIMEOUT:-10}"
 
 # ------------------------------------------------------------------------------
-# 1. Safe sync & cleanup. Runs exactly once on normal exit, crash, walltime SIGTERM or qdel.
+# State tracking and global variables
 # ------------------------------------------------------------------------------
-SYNCED=0
+JOB_START_TIME="$(date -u +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || date)"
+STAGE_REACHED="STARTUP"
+SETUP_OK=0
+PIPELINE_EXIT_CODE=0
+FINAL_TRANSFER_SUCCESS=0
+SCRATCH_CLEANED=0
+CLEANUP_FAILED=0
+SIGNAL_RECEIVED=0
+FAILURE_REASON=""
+OVERALL_EXIT_CODE=0
+PERIODIC_ERRORS=0
+FINALIZATION_DONE=0
 PY_PID=""
 SYNC_LOOP_PID=""
+OWNED_OUTPUT_DIR=""
 
-sync_results() {
-    if [ -d "$SCRATCHDIR/tess_results" ]; then
-        mkdir -p "$REPO_DIR/tess_results"
-        cp -rf "$SCRATCHDIR/tess_results"/. "$REPO_DIR/tess_results/" 2>/dev/null || true
+# Determine cleaned diagnostic job identifier
+JOB_ID_CLEAN="$(echo "${PBS_JOBID:-local}" | tr ':/[]' '____')"
+if [ -n "${PBS_ARRAY_INDEX:-}" ]; then
+    DIAG_ID="${JOB_ID_CLEAN}_idx${PBS_ARRAY_INDEX}"
+else
+    DIAG_ID="${JOB_ID_CLEAN}_single"
+fi
+DIAG_FILENAME="job_diagnostics_${DIAG_ID}.json"
+
+# ------------------------------------------------------------------------------
+# Authoritative output ownership resolution (delegated to Python)
+# ------------------------------------------------------------------------------
+determine_owned_output_dir() {
+    local target_dir=""
+    local py_cmd=""
+    if command -v python >/dev/null 2>&1; then
+        py_cmd="python"
+    elif command -v python3 >/dev/null 2>&1; then
+        py_cmd="python3"
+    fi
+
+    if [ -n "$py_cmd" ]; then
+        target_dir=$("$py_cmd" -c '
+import os, sys
+try:
+    import aldebaran as ald
+    print(getattr(ald, "OUTPUT_DIR", "tess_results"))
+except Exception:
+    sys.exit(1)
+' 2>/dev/null || true)
+    fi
+    target_dir=$(echo "$target_dir" | tr '\\' '/')
+    target_dir="${target_dir%/}"
+    echo "$target_dir"
+}
+
+# ------------------------------------------------------------------------------
+# Sync lock mechanism to prevent periodic / final copy race
+# ------------------------------------------------------------------------------
+acquire_sync_lock() {
+    local holder="${1:-unknown}"
+    [ -z "${SCRATCHDIR:-}" ] && return 0
+    local lock_dir="$SCRATCHDIR/.sync_lock"
+    local timeout=30
+    local waited=0
+    while ! mkdir "$lock_dir" 2>/dev/null; do
+        sleep 0.5
+        waited=$((waited + 1))
+        if [ "$waited" -ge "$((timeout * 2))" ]; then
+            echo "[!] WARNING: Sync lock wait exceeded ${timeout}s" >&2
+            return 1
+        fi
+    done
+    echo "$holder" > "$SCRATCHDIR/.sync_lock_holder" 2>/dev/null || true
+    return 0
+}
+
+release_sync_lock() {
+    [ -z "${SCRATCHDIR:-}" ] && return 0
+    rm -f "$SCRATCHDIR/.sync_lock_holder" 2>/dev/null || true
+    rmdir "$SCRATCHDIR/.sync_lock" 2>/dev/null || rm -rf "$SCRATCHDIR/.sync_lock" 2>/dev/null || true
+}
+
+# ------------------------------------------------------------------------------
+# Process tree inspection and termination (portable across Linux PBS and Git Bash)
+# ------------------------------------------------------------------------------
+get_descendants() {
+    local root="$1"
+    [ -z "$root" ] && return 0
+    local all=""
+    local queue="$root"
+    while [ -n "$queue" ]; do
+        local next=""
+        for p in $queue; do
+            local ch
+            ch=$(ps -ef 2>/dev/null | awk -v parent="$p" '$3 == parent {print $2}')
+            for c in $ch; do
+                if [ -n "$c" ] && [ "$c" != "$p" ]; then
+                    case " $all " in
+                        *" $c "*) ;;
+                        *)
+                            all="$all $c"
+                            next="$next $c"
+                            ;;
+                    esac
+                fi
+            done
+        done
+        queue="$next"
+    done
+    echo "$all"
+}
+
+kill_process_tree() {
+    local target_pid="$1"
+    local sig="${2:-TERM}"
+    [ -z "$target_pid" ] && return 0
+
+    local descendants
+    descendants=$(get_descendants "$target_pid")
+    for p in $descendants "$target_pid"; do
+        kill -"$sig" "$p" 2>/dev/null || true
+    done
+
+    if command -v pkill >/dev/null 2>&1; then
+        pkill -"$sig" -P "$target_pid" 2>/dev/null || true
     fi
 }
 
-sync_and_clean() {
-    [ "$SYNCED" -eq 1 ] && return
-    SYNCED=1
-    echo "======================================================================"
-    echo "[TRAP] Final result synchronization at: $(date)"
-    [ -n "$SYNC_LOOP_PID" ] && kill "$SYNC_LOOP_PID" 2>/dev/null
-    sync_results
-    echo "[TRAP] Reports, logs and dossiers synced to: $REPO_DIR/tess_results"
-    clean_scratch
-    echo "[TRAP] Local scratch cleaned."
-    echo "======================================================================"
+# ------------------------------------------------------------------------------
+# Results synchronization
+# Checked success of cp is the minimum transfer success criterion.
+# This confirms filesystem copy completion, but is not a checksum or durable-storage certification.
+# ------------------------------------------------------------------------------
+sync_results() {
+    local mode="${1:-final}"
+
+    if [ -z "${SCRATCHDIR:-}" ] || [ ! -d "$SCRATCHDIR" ]; then
+        echo "[!] sync_results: SCRATCHDIR is unset or not a directory: '${SCRATCHDIR:-}'" >&2
+        return 1
+    fi
+    if [ -z "${REPO_DIR:-}" ] || [ ! -d "$REPO_DIR" ]; then
+        echo "[!] sync_results: REPO_DIR is unset or not a directory: '${REPO_DIR:-}'" >&2
+        return 1
+    fi
+
+    if ! acquire_sync_lock "$mode"; then
+        echo "[!] sync_results: Failed to acquire sync lock ($mode)" >&2
+        return 1
+    fi
+
+    local target_subdir="$OWNED_OUTPUT_DIR"
+    if [ -z "$target_subdir" ]; then
+        target_subdir=$(determine_owned_output_dir)
+    fi
+
+    local status=0
+    if [ -n "${PBS_ARRAY_INDEX:-}" ]; then
+        # Safety requirement: in array mode, worker must never sync entire tess_results or empty dir
+        if [ -z "$target_subdir" ] || [ "$target_subdir" = "tess_results" ] || [ "$target_subdir" = "." ]; then
+            echo "[!] ERROR: Unsafe transfer refused in array mode (PBS_ARRAY_INDEX=${PBS_ARRAY_INDEX}): OWNED_OUTPUT_DIR='$target_subdir'" >&2
+            release_sync_lock
+            return 1
+        fi
+
+        if [ -d "$SCRATCHDIR/$target_subdir" ]; then
+            if ! mkdir -p "$REPO_DIR/$target_subdir"; then
+                echo "[!] ERROR: Failed to create destination directory '$REPO_DIR/$target_subdir'" >&2
+                status=1
+            elif ! cp -rf "$SCRATCHDIR/$target_subdir"/. "$REPO_DIR/$target_subdir/"; then
+                echo "[!] ERROR: Failed to copy results from '$SCRATCHDIR/$target_subdir' to '$REPO_DIR/$target_subdir'" >&2
+                status=1
+            fi
+        else
+            if [ "$mode" = "final" ] && [ "$STAGE_REACHED" = "PIPELINE_COMPLETE" ]; then
+                echo "[!] ERROR: Expected output directory '$SCRATCHDIR/$target_subdir' missing after pipeline completion!" >&2
+                status=1
+            fi
+        fi
+    else
+        # Single-job mode
+        if [ -d "$SCRATCHDIR/tess_results" ]; then
+            if ! mkdir -p "$REPO_DIR/tess_results"; then
+                echo "[!] ERROR: Failed to create destination directory '$REPO_DIR/tess_results'" >&2
+                status=1
+            elif ! cp -rf "$SCRATCHDIR/tess_results"/. "$REPO_DIR/tess_results/"; then
+                echo "[!] ERROR: Failed to copy results from '$SCRATCHDIR/tess_results' to '$REPO_DIR/tess_results'" >&2
+                status=1
+            fi
+        else
+            if [ "$mode" = "final" ] && [ "$STAGE_REACHED" = "PIPELINE_COMPLETE" ]; then
+                echo "[!] ERROR: Expected output directory '$SCRATCHDIR/tess_results' missing after pipeline completion!" >&2
+                status=1
+            fi
+        fi
+    fi
+
+    release_sync_lock
+    return $status
 }
 
+# ------------------------------------------------------------------------------
+# Write job diagnostics JSON with strict escaping, atomic replacement, and return status
+# ------------------------------------------------------------------------------
+write_job_diagnostics() {
+    local target_dir="${1:-$SCRATCHDIR}"
+    local est_rc="${2:-$OVERALL_EXIT_CODE}"
+    if [ -z "$target_dir" ] || [ ! -d "$target_dir" ]; then
+        echo "[!] write_job_diagnostics: target directory invalid: '$target_dir'" >&2
+        return 1
+    fi
+
+    local diag_file="$target_dir/$DIAG_FILENAME"
+    local tmp_file="$target_dir/.tmp_${DIAG_FILENAME}.$$"
+    local now_iso
+    now_iso="$(date -u +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || date)"
+
+    local cleaned_str="false"
+    [ "$SCRATCH_CLEANED" -eq 1 ] && cleaned_str="true"
+    local setup_str="false"
+    [ "$SETUP_OK" -eq 1 ] && setup_str="true"
+    local final_sync_str="false"
+    [ "$FINAL_TRANSFER_SUCCESS" -eq 1 ] && final_sync_str="true"
+
+    local scratch_posix
+    scratch_posix=$(printf '%s' "${SCRATCHDIR:-}" | tr '\\' '/')
+    local repo_posix
+    repo_posix=$(printf '%s' "${REPO_DIR:-}" | tr '\\' '/')
+    local owned_posix
+    owned_posix=$(printf '%s' "${OWNED_OUTPUT_DIR:-}" | tr '\\' '/')
+
+    # Robust JSON string escaping via Python if available, with pure bash fallback
+    local reason_escaped
+    if command -v python >/dev/null 2>&1; then
+        reason_escaped=$(python -c 'import sys, json; print(json.dumps(sys.argv[1])[1:-1])' "${FAILURE_REASON:-none}" 2>/dev/null || true)
+    elif command -v python3 >/dev/null 2>&1; then
+        reason_escaped=$(python3 -c 'import sys, json; print(json.dumps(sys.argv[1])[1:-1])' "${FAILURE_REASON:-none}" 2>/dev/null || true)
+    fi
+    if [ -z "$reason_escaped" ]; then
+        reason_escaped=$(printf '%s' "${FAILURE_REASON:-none}" | sed 's/\\/\\\\/g; s/"/\\"/g; s/\t/\\t/g; s/\r/\\r/g')
+    fi
+
+    cat <<EOF > "$tmp_file"
+{
+  "pbs_jobid": "${PBS_JOBID:-local}",
+  "pbs_array_index": "${PBS_ARRAY_INDEX:-single}",
+  "hostname": "$(hostname 2>/dev/null || echo 'unknown')",
+  "start_time": "${JOB_START_TIME}",
+  "end_time": "${now_iso}",
+  "stage_reached": "${STAGE_REACHED}",
+  "setup_ok": ${setup_str},
+  "pipeline_exit_code": ${PIPELINE_EXIT_CODE},
+  "signal_received": ${SIGNAL_RECEIVED},
+  "periodic_sync_errors": ${PERIODIC_ERRORS},
+  "final_transfer_success": ${final_sync_str},
+  "scratch_cleaned": ${cleaned_str},
+  "overall_exit_code": ${est_rc},
+  "scratch_dir": "${scratch_posix}",
+  "repo_dir": "${repo_posix}",
+  "owned_output_dir": "${owned_posix}",
+  "failure_reason": "${reason_escaped}"
+}
+EOF
+    local write_status=$?
+    if [ "$write_status" -ne 0 ] || [ ! -s "$tmp_file" ]; then
+        echo "[!] write_job_diagnostics: Failed to write JSON to '$tmp_file'" >&2
+        rm -f "$tmp_file" 2>/dev/null || true
+        return 1
+    fi
+
+    if ! mv -f "$tmp_file" "$diag_file"; then
+        echo "[!] write_job_diagnostics: Failed to replace '$diag_file'" >&2
+        rm -f "$tmp_file" 2>/dev/null || true
+        return 1
+    fi
+
+    return 0
+}
+
+# ------------------------------------------------------------------------------
+# Periodic background synchronization management
+# Prevents orphaned sleep processes and pipe leaks by redirecting loop I/O
+# and explicitly tracking/killing child sleep processes.
+# ------------------------------------------------------------------------------
+start_periodic_sync() {
+    (
+        SLEEP_PID=""
+        cleanup_loop() {
+            if [ -n "$SLEEP_PID" ]; then
+                kill_process_tree "$SLEEP_PID" 9
+                wait "$SLEEP_PID" 2>/dev/null || true
+            fi
+            exit 0
+        }
+        trap cleanup_loop TERM INT EXIT
+
+        while true; do
+            sleep 1200 &
+            SLEEP_PID=$!
+            echo "$SLEEP_PID" > "$SCRATCHDIR/.sync_sleep_pid" 2>/dev/null || true
+            wait "$SLEEP_PID" 2>/dev/null || break
+            if ! sync_results "periodic"; then
+                echo "PERIODIC_FAIL $(date +%s)" >> "$SCRATCHDIR/.periodic_sync_errors"
+            fi
+        done
+    ) </dev/null >> "$SCRATCHDIR/.periodic_sync.log" 2>&1 &
+    SYNC_LOOP_PID=$!
+    echo "$SYNC_LOOP_PID" > "$SCRATCHDIR/.sync_loop_pid" 2>/dev/null || true
+}
+
+stop_periodic_sync() {
+    if [ -n "$SYNC_LOOP_PID" ]; then
+        if [ -n "${SCRATCHDIR:-}" ] && [ -f "$SCRATCHDIR/.sync_sleep_pid" ]; then
+            local slp_pid
+            slp_pid=$(cat "$SCRATCHDIR/.sync_sleep_pid" 2>/dev/null || true)
+            if [ -n "$slp_pid" ]; then
+                kill_process_tree "$slp_pid" 9
+            fi
+            rm -f "$SCRATCHDIR/.sync_sleep_pid" 2>/dev/null || true
+        fi
+
+        # 1. Snapshot all descendants of periodic sync loop (sleep, cp, etc.) before signalling
+        local sync_desc
+        sync_desc=$(get_descendants "$SYNC_LOOP_PID")
+        local sync_targets="$SYNC_LOOP_PID $sync_desc"
+
+        # 2. Deliver TERM to periodic sync loop and any active child (e.g. cp)
+        for p in $sync_targets; do
+            kill -TERM "$p" 2>/dev/null || true
+        done
+
+        # 3. Bounded wait for periodic sync processes to exit
+        local timeout=5
+        local waited=0
+        while [ "$waited" -lt "$((timeout * 2))" ]; do
+            local any_alive=0
+            for p in $sync_targets; do
+                if kill -0 "$p" 2>/dev/null; then
+                    any_alive=1
+                    break
+                fi
+            done
+            [ "$any_alive" -eq 0 ] && break
+            sleep 0.5
+            waited=$((waited + 1))
+        done
+
+        # 4. Escalate to KILL if any periodic sync processes survived
+        for p in $sync_targets; do
+            if kill -0 "$p" 2>/dev/null; then
+                kill -KILL "$p" 2>/dev/null || true
+            fi
+        done
+        wait "$SYNC_LOOP_PID" 2>/dev/null || true
+        SYNC_LOOP_PID=""
+
+        rm -f "${SCRATCHDIR:-}/.sync_sleep_pid" 2>/dev/null || true
+        rm -f "${SCRATCHDIR:-}/.sync_loop_pid" 2>/dev/null || true
+
+        # 5. Clean stale lock if left behind by terminated periodic sync
+        if [ -n "${SCRATCHDIR:-}" ] && [ -d "$SCRATCHDIR/.sync_lock" ]; then
+            local holder
+            holder=$(cat "$SCRATCHDIR/.sync_lock_holder" 2>/dev/null || true)
+            if [ "$holder" = "periodic" ] || [ -z "$holder" ]; then
+                echo "[SYNC] Releasing stale lock left by terminated periodic sync" >&2
+                release_sync_lock
+            fi
+        fi
+    fi
+}
+
+# ------------------------------------------------------------------------------
+# Safe finalization & conditional cleanup
+# Runs exactly once on normal exit, error, or termination signal.
+# ------------------------------------------------------------------------------
+sync_and_finalize() {
+    local incoming_rc="${1:-$?}"
+    [ "$FINALIZATION_DONE" -eq 1 ] && return
+    FINALIZATION_DONE=1
+
+    echo "======================================================================"
+    echo "[TRAP] Finalization started at: $(date)"
+    echo "[TRAP] Incoming return code: $incoming_rc | Stage reached: $STAGE_REACHED"
+
+    # 1. Stop periodic sync loop and await completion before final transfer
+    stop_periodic_sync
+
+    # 2. Check periodic sync failure records
+    PERIODIC_ERRORS=0
+    if [ -n "${SCRATCHDIR:-}" ] && [ -f "$SCRATCHDIR/.periodic_sync_errors" ]; then
+        PERIODIC_ERRORS=$(wc -l < "$SCRATCHDIR/.periodic_sync_errors" 2>/dev/null | tr -d ' ')
+    fi
+
+    # 3. Perform final results synchronization
+    if sync_results "final"; then
+        FINAL_TRANSFER_SUCCESS=1
+        if [ "$PERIODIC_ERRORS" -gt 0 ]; then
+            echo "[SYNC] Recovered: $PERIODIC_ERRORS earlier transient periodic sync failure(s) succeeded on final transfer."
+        fi
+        echo "[TRAP] Reports, logs and dossiers synced to permanent storage."
+    else
+        FINAL_TRANSFER_SUCCESS=0
+        if [ -z "$FAILURE_REASON" ]; then
+            FAILURE_REASON="Final result transfer failed"
+        else
+            FAILURE_REASON="${FAILURE_REASON}; Final result transfer failed"
+        fi
+        echo "[TRAP] ERROR: Final result transfer failed!" >&2
+    fi
+
+    # 4. Compute projected exit status for accurate diagnostic recording
+    local proj_rc=0
+    if [ "$SIGNAL_RECEIVED" -ne 0 ]; then
+        proj_rc="$SIGNAL_RECEIVED"
+    elif [ "$PIPELINE_EXIT_CODE" -ne 0 ]; then
+        proj_rc="$PIPELINE_EXIT_CODE"
+    elif [ "$SETUP_OK" -ne 1 ]; then
+        proj_rc="${incoming_rc:-1}"
+        [ "$proj_rc" -eq 0 ] && proj_rc=1
+    elif [ "$FINAL_TRANSFER_SUCCESS" -ne 1 ]; then
+        proj_rc=4
+    fi
+
+    # 5. Determine permanent diagnostics destination and write diagnostics to scratch
+    local diag_dest_dir="$REPO_DIR/tess_results"
+    if [ -n "$OWNED_OUTPUT_DIR" ] && [ "$OWNED_OUTPUT_DIR" != "tess_results" ]; then
+        diag_dest_dir="$REPO_DIR/$OWNED_OUTPUT_DIR"
+    fi
+
+    local scratch_diag_ok=0
+    if [ -n "${SCRATCHDIR:-}" ] && [ -d "$SCRATCHDIR" ]; then
+        if write_job_diagnostics "$SCRATCHDIR" "$proj_rc"; then
+            scratch_diag_ok=1
+        fi
+    fi
+
+    # 6. Save and verify diagnostic evidence to permanent storage BEFORE cleanup
+    local perm_diag_ok=0
+    if [ -n "${REPO_DIR:-}" ] && [ -d "$REPO_DIR" ]; then
+        if mkdir -p "$diag_dest_dir" 2>/dev/null; then
+            if write_job_diagnostics "$diag_dest_dir" "$proj_rc"; then
+                if [ -s "$diag_dest_dir/$DIAG_FILENAME" ]; then
+                    perm_diag_ok=1
+                    echo "[DIAGNOSTICS] Diagnostics saved to: $diag_dest_dir/$DIAG_FILENAME"
+                fi
+            fi
+        fi
+    fi
+
+    if [ "$perm_diag_ok" -eq 0 ]; then
+        echo "[!] ERROR: Failed to save diagnostic evidence to permanent storage: '$diag_dest_dir/$DIAG_FILENAME'" >&2
+        if [ "$scratch_diag_ok" -eq 1 ]; then
+            echo "[DIAGNOSTICS] Diagnostics retained in scratch at: $SCRATCHDIR/$DIAG_FILENAME"
+        fi
+    fi
+
+    # 7. Conditional scratch cleanup (R2: MUST ensure permanent diagnostic evidence is verified)
+    if [ "$SETUP_OK" -eq 1 ] && [ "$PIPELINE_EXIT_CODE" -eq 0 ] && [ "$SIGNAL_RECEIVED" -eq 0 ] && [ "$FINAL_TRANSFER_SUCCESS" -eq 1 ] && [ "$perm_diag_ok" -eq 1 ]; then
+        if [ -n "$SCRATCHDIR" ] && [ -d "$SCRATCHDIR" ] && [ "$SCRATCHDIR" != "/" ] && [ "$SCRATCHDIR" != "$HOME" ]; then
+            if command -v clean_scratch >/dev/null 2>&1; then
+                if clean_scratch; then
+                    SCRATCH_CLEANED=1
+                    echo "[TRAP] Local scratch cleaned."
+                else
+                    CLEANUP_FAILED=1
+                    echo "[TRAP] ERROR: clean_scratch command failed with exit code $?!" >&2
+                fi
+            else
+                SCRATCH_CLEANED=1
+                echo "[TRAP] clean_scratch not found (mock environment); scratch cleanup skipped."
+            fi
+        else
+            echo "[TRAP] ERROR: Refusing cleanup on invalid/unsafe scratch path: '${SCRATCHDIR:-}'" >&2
+            CLEANUP_FAILED=1
+        fi
+    else
+        echo "======================================================================"
+        echo "[TRAP] Scratch preserved at: $SCRATCHDIR"
+        echo "[TRAP] Reason: ${FAILURE_REASON:-Non-zero exit, signal, transfer failure, or unverified diagnostics}"
+        echo "======================================================================"
+    fi
+
+    # 8. Calculate final authoritative exit status
+    local final_rc=0
+    if [ "$SIGNAL_RECEIVED" -ne 0 ]; then
+        final_rc="$SIGNAL_RECEIVED"
+    elif [ "$PIPELINE_EXIT_CODE" -ne 0 ]; then
+        final_rc="$PIPELINE_EXIT_CODE"
+    elif [ "$SETUP_OK" -ne 1 ]; then
+        final_rc="${incoming_rc:-1}"
+        [ "$final_rc" -eq 0 ] && final_rc=1
+    elif [ "$FINAL_TRANSFER_SUCCESS" -ne 1 ]; then
+        final_rc=4
+    elif [ "$perm_diag_ok" -ne 1 ]; then
+        final_rc=6
+    elif [ "$CLEANUP_FAILED" -ne 0 ]; then
+        final_rc=5
+    fi
+    OVERALL_EXIT_CODE="$final_rc"
+
+    # 9. Post-cleanup diagnostics update (record actual cleanup outcome and final_rc)
+    if [ "$perm_diag_ok" -eq 1 ]; then
+        if ! write_job_diagnostics "$diag_dest_dir" "$final_rc"; then
+            echo "[TRAP] ERROR: Failed to publish final post-cleanup job diagnostics to '$diag_dest_dir/$DIAG_FILENAME'!" >&2
+            echo "[TRAP] Prior pre-cleanup diagnostics preserved at: '$diag_dest_dir/$DIAG_FILENAME'" >&2
+            if [ "$SCRATCH_CLEANED" -eq 1 ]; then
+                echo "[TRAP] Scratch was cleaned ($SCRATCHDIR); scratch copy is not recoverable." >&2
+            elif [ -n "${SCRATCHDIR:-}" ] && [ -d "$SCRATCHDIR" ]; then
+                write_job_diagnostics "$SCRATCHDIR" 7 2>/dev/null || true
+                echo "[TRAP] Diagnostics updated in retained scratch at: $SCRATCHDIR/$DIAG_FILENAME" >&2
+            fi
+            [ "$final_rc" -eq 0 ] && final_rc=7
+            OVERALL_EXIT_CODE="$final_rc"
+        else
+            if [ "$SCRATCH_CLEANED" -ne 1 ] && [ -n "${SCRATCHDIR:-}" ] && [ -d "$SCRATCHDIR" ]; then
+                write_job_diagnostics "$SCRATCHDIR" "$final_rc" 2>/dev/null || true
+            fi
+        fi
+    fi
+
+    echo "======================================================================"
+    echo "Finalization complete at: $(date) with exit code: $final_rc"
+    echo "======================================================================"
+    exit "$final_rc"
+}
+
+# ------------------------------------------------------------------------------
+# Signal handling with bounded termination
+# ------------------------------------------------------------------------------
 on_signal() {
-    echo "[TRAP] Termination signal received (walltime / qdel). Stopping pipeline..."
-    # Forward SIGTERM so aldebaran.py writes its Run Summary, give it a few seconds.
-    [ -n "$PY_PID" ] && kill -TERM "$PY_PID" 2>/dev/null && sleep 5
-    sync_and_clean
-    exit 143   # IMPORTANT: without exit, bash would resume the next step on a wiped scratch
-}
+    local sig_name="$1"
+    local sig_code="$2"
+    SIGNAL_RECEIVED="$sig_code"
+    FAILURE_REASON="Termination signal received ($sig_name)"
+    echo "[TRAP] Termination signal received ($sig_name / code $sig_code). Stopping pipeline..." >&2
 
-trap sync_and_clean EXIT
-trap on_signal TERM INT
+    if [ -n "$PY_PID" ]; then
+        echo "[TRAP] Forwarding $sig_name to child process tree rooted at $PY_PID..." >&2
+
+        # 1. Snapshot entire descendant tree BEFORE sending any signal
+        local descendants
+        descendants=$(get_descendants "$PY_PID")
+        local tracked_pids="$PY_PID $descendants"
+
+        # 2. Forward signal to all tracked processes
+        for p in $tracked_pids; do
+            kill -"$sig_name" "$p" 2>/dev/null || true
+        done
+
+        # 3. Wait boundedly for ALL tracked processes to exit (not just PY_PID)
+        local timeout="${ALDEBARAN_SIGNAL_TIMEOUT:-10}"
+        local waited=0
+        while [ "$waited" -lt "$timeout" ]; do
+            local any_alive=0
+            for p in $tracked_pids; do
+                if kill -0 "$p" 2>/dev/null; then
+                    any_alive=1
+                    # Track any new descendants spawned by still-living children
+                    local new_desc
+                    new_desc=$(get_descendants "$p")
+                    for nd in $new_desc; do
+                        case " $tracked_pids " in
+                            *" $nd "*) ;;
+                            *)
+                                tracked_pids="$tracked_pids $nd"
+                                kill -"$sig_name" "$nd" 2>/dev/null || true
+                                ;;
+                        esac
+                    done
+                fi
+            done
+            [ "$any_alive" -eq 0 ] && break
+            sleep 0.5
+            waited=$((waited + 1))
+        done
+
+        # 4. Escalate to KILL for any surviving tracked descendants
+        for p in $tracked_pids; do
+            if kill -0 "$p" 2>/dev/null; then
+                echo "[TRAP] Process $p survived ${timeout}s grace period; escalating to KILL..." >&2
+                kill -KILL "$p" 2>/dev/null || true
+            fi
+        done
+
+        # 5. Bounded wait for KILL to finalize
+        local k_waited=0
+        while [ "$k_waited" -lt 10 ]; do
+            local any_alive=0
+            for p in $tracked_pids; do
+                if kill -0 "$p" 2>/dev/null; then
+                    any_alive=1
+                    break
+                fi
+            done
+            [ "$any_alive" -eq 0 ] && break
+            sleep 0.1
+            k_waited=$((k_waited + 1))
+        done
+
+        wait "$PY_PID" 2>/dev/null || true
+        PY_PID=""
+    fi
+
+    sync_and_finalize "$sig_code"
+}
 
 # Runs a Python step in the background and waits on it, so bash can react to SIGTERM
-# immediately (bash defers traps while a FOREGROUND child is running).
 run_py() {
     python "$@" &
     PY_PID=$!
@@ -73,62 +634,180 @@ run_py() {
     return $rc
 }
 
+# Sourcing guard: allows testing individual functions without executing pipeline
+if [ "${ALDEBARAN_PBS_SOURCE_ONLY:-0}" = "1" ]; then
+    return 0 2>/dev/null || exit 0
+fi
+
+trap 'sync_and_finalize "$?"' EXIT
+trap 'on_signal TERM 143' TERM
+trap 'on_signal INT 130' INT
+
+# Locate project root directory regardless of whether qsub was called from root or cluster/
+REPO_DIR="${PBS_O_WORKDIR:-$PWD}"
+if [ ! -f "$REPO_DIR/aldebaran.py" ] && [ -f "$REPO_DIR/../aldebaran.py" ]; then
+    REPO_DIR="$(cd "$REPO_DIR/.." && pwd)"
+fi
+
 echo "======================================================================"
-echo "Starting Aldebaran TESS Job on MetaCentrum node: $(hostname)"
-echo "Job ID: $PBS_JOBID | Array Index: ${PBS_ARRAY_INDEX:-Single-Job}"
+echo "Starting Aldebaran TESS Job on MetaCentrum node: $(hostname 2>/dev/null || echo 'localhost')"
+echo "Job ID: ${PBS_JOBID:-manual} | Array Index: ${PBS_ARRAY_INDEX:-Single-Job}"
 echo "Workers: $ALDEBARAN_WORKERS | Batch Limit: $ALDEBARAN_MAX_TARGETS"
-echo "PBS Working Directory: $PBS_O_WORKDIR"
-echo "Local Scratch Directory: $SCRATCHDIR"
-echo "Start time: $(date)"
+echo "PBS Working Directory: ${PBS_O_WORKDIR:-$PWD}"
+echo "Local Scratch Directory: ${SCRATCHDIR:-unset}"
+echo "Start time: $JOB_START_TIME"
 echo "======================================================================"
 
 # ------------------------------------------------------------------------------
-# 2. Python >= 3.10 is required
+# Preflight Validation
 # ------------------------------------------------------------------------------
+STAGE_REACHED="PREFLIGHT"
+
+if [ -z "${REPO_DIR:-}" ] || [ ! -d "$REPO_DIR" ] || [ ! -f "$REPO_DIR/aldebaran.py" ]; then
+    FAILURE_REASON="Invalid REPO_DIR or missing aldebaran.py: '${REPO_DIR:-}'"
+    echo "[!] ERROR: $FAILURE_REASON" >&2
+    exit 1
+fi
+
+if [ -z "${SCRATCHDIR:-}" ] || [ ! -d "$SCRATCHDIR" ]; then
+    FAILURE_REASON="SCRATCHDIR unset or invalid directory: '${SCRATCHDIR:-}'"
+    echo "[!] ERROR: $FAILURE_REASON" >&2
+    exit 1
+fi
+
+if [ "$SCRATCHDIR" = "/" ] || [ "$SCRATCHDIR" = "$HOME" ]; then
+    FAILURE_REASON="SCRATCHDIR points to unsafe path: '$SCRATCHDIR'"
+    echo "[!] ERROR: $FAILURE_REASON" >&2
+    exit 1
+fi
+
+# ------------------------------------------------------------------------------
+# Module / Python Version Check
+# ------------------------------------------------------------------------------
+STAGE_REACHED="PYTHON_CHECK"
 module add python/3.11 2>/dev/null || module add python 2>/dev/null || true
 if ! python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3, 10) else 1)'; then
-    echo "[!] python3 >= 3.10 required, found: $(python3 --version 2>&1). Fix the 'module add' line."
+    FAILURE_REASON="python3 >= 3.10 required, found: $(python3 --version 2>&1)"
+    echo "[!] ERROR: $FAILURE_REASON" >&2
     exit 3
 fi
 echo "Python: $(python3 --version)"
 
 # ------------------------------------------------------------------------------
-# 3. All caches on node-local NVMe scratch (nothing is written to the shared $HOME quota).
+# Cache Configuration
 # ------------------------------------------------------------------------------
 export XDG_CACHE_HOME="$SCRATCHDIR/.cache"
 export PIP_CACHE_DIR="$SCRATCHDIR/.cache/pip"
 export LIGHTKURVE_CACHE_DIR="$SCRATCHDIR/.cache/lightkurve"
 export ASTROPY_CACHE_DIR="$SCRATCHDIR/.cache/astropy"
 export MPLCONFIGDIR="$SCRATCHDIR/.cache/matplotlib"
-mkdir -p "$XDG_CACHE_HOME" "$PIP_CACHE_DIR" "$LIGHTKURVE_CACHE_DIR" "$ASTROPY_CACHE_DIR" "$MPLCONFIGDIR"
+if ! mkdir -p "$XDG_CACHE_HOME" "$PIP_CACHE_DIR" "$LIGHTKURVE_CACHE_DIR" "$ASTROPY_CACHE_DIR" "$MPLCONFIGDIR"; then
+    FAILURE_REASON="Failed to create required cache directories in '$SCRATCHDIR/.cache'"
+    echo "[!] ERROR: $FAILURE_REASON" >&2
+    exit 2
+fi
 
 # ------------------------------------------------------------------------------
-# 4. Copy code AND existing tess_results to local scratch
+# Staging Code and Caches
 # ------------------------------------------------------------------------------
-cp "$REPO_DIR"/*.py "$SCRATCHDIR/"
-cp "$REPO_DIR"/requirements.txt "$SCRATCHDIR/" 2>/dev/null || true
-mkdir -p "$SCRATCHDIR/tess_results"
+STAGE_REACHED="STAGING"
+if ! cp "$REPO_DIR"/*.py "$SCRATCHDIR/"; then
+    FAILURE_REASON="Failed to copy Python scripts from '$REPO_DIR' to '$SCRATCHDIR'"
+    echo "[!] ERROR: $FAILURE_REASON" >&2
+    exit 2
+fi
+
+# Requirements.txt is optional, but if present in repo, copying it must succeed
+if [ -f "$REPO_DIR/requirements.txt" ]; then
+    if ! cp "$REPO_DIR/requirements.txt" "$SCRATCHDIR/"; then
+        FAILURE_REASON="Failed to copy existing requirements.txt from '$REPO_DIR' to '$SCRATCHDIR'"
+        echo "[!] ERROR: $FAILURE_REASON" >&2
+        exit 2
+    fi
+fi
+
+if ! mkdir -p "$SCRATCHDIR/tess_results"; then
+    FAILURE_REASON="Failed to create '$SCRATCHDIR/tess_results' directory"
+    echo "[!] ERROR: $FAILURE_REASON" >&2
+    exit 2
+fi
+
+# If existing history/results exist in repo, copying them must succeed
 if [ -d "$REPO_DIR/tess_results" ]; then
-    cp -rf "$REPO_DIR/tess_results"/. "$SCRATCHDIR/tess_results/" 2>/dev/null || true
+    if ! cp -rf "$REPO_DIR/tess_results"/. "$SCRATCHDIR/tess_results/"; then
+        FAILURE_REASON="Failed to copy existing tess_results from '$REPO_DIR' to '$SCRATCHDIR'"
+        echo "[!] ERROR: $FAILURE_REASON" >&2
+        exit 2
+    fi
 fi
-cd "$SCRATCHDIR" || exit 1
+if ! cd "$SCRATCHDIR"; then
+    FAILURE_REASON="Failed to change directory into '$SCRATCHDIR'"
+    echo "[!] ERROR: $FAILURE_REASON" >&2
+    exit 2
+fi
+
+# Export PYTHONPATH to include scratch and repo
+export PYTHONPATH="$SCRATCHDIR:$REPO_DIR:$PYTHONPATH"
+
+# Authoritatively query Python for output ownership
+OWNED_OUTPUT_DIR=$(determine_owned_output_dir)
+echo "Authoritative output directory: ${OWNED_OUTPUT_DIR:-tess_results}"
 
 # ------------------------------------------------------------------------------
-# 5. Virtual environment on scratch (node-local build avoids glibc mismatches)
+# Virtual Environment Setup
 # ------------------------------------------------------------------------------
+STAGE_REACHED="VENV_SETUP"
 echo "[1/4] Setting up Python virtual environment in scratch..."
-python3 -m venv "$SCRATCHDIR/venv"
-source "$SCRATCHDIR/venv/bin/activate"
-pip install --upgrade pip --no-cache-dir --quiet
-if [ -f requirements.txt ]; then
-    pip install --no-cache-dir --quiet -r requirements.txt certifi
-else
-    pip install --no-cache-dir --quiet numpy scipy astropy pandas lightkurve astroquery matplotlib requests urllib3 certifi
+if ! python3 -m venv "$SCRATCHDIR/venv"; then
+    FAILURE_REASON="Failed to create venv in '$SCRATCHDIR/venv'"
+    echo "[!] ERROR: $FAILURE_REASON" >&2
+    exit 3
 fi
+
+ACTIVATE_SCRIPT=""
+if [ -f "$SCRATCHDIR/venv/bin/activate" ]; then
+    ACTIVATE_SCRIPT="$SCRATCHDIR/venv/bin/activate"
+elif [ -f "$SCRATCHDIR/venv/Scripts/activate" ]; then
+    ACTIVATE_SCRIPT="$SCRATCHDIR/venv/Scripts/activate"
+else
+    FAILURE_REASON="Virtual environment activation script missing in '$SCRATCHDIR/venv'"
+    echo "[!] ERROR: $FAILURE_REASON" >&2
+    exit 3
+fi
+
+# Source activation script with explicit status check
+if ! source "$ACTIVATE_SCRIPT"; then
+    FAILURE_REASON="Failed to source virtualenv activation script '$ACTIVATE_SCRIPT'"
+    echo "[!] ERROR: $FAILURE_REASON" >&2
+    exit 3
+fi
+
+if ! pip install --upgrade pip --no-cache-dir --quiet; then
+    FAILURE_REASON="pip upgrade failed"
+    echo "[!] ERROR: $FAILURE_REASON" >&2
+    exit 3
+fi
+
+if [ -f requirements.txt ]; then
+    if ! pip install --no-cache-dir --quiet -r requirements.txt certifi; then
+        FAILURE_REASON="pip install -r requirements.txt failed"
+        echo "[!] ERROR: $FAILURE_REASON" >&2
+        exit 3
+    fi
+else
+    if ! pip install --no-cache-dir --quiet numpy scipy astropy pandas lightkurve astroquery matplotlib requests urllib3 certifi; then
+        FAILURE_REASON="pip install default packages failed"
+        echo "[!] ERROR: $FAILURE_REASON" >&2
+        exit 3
+    fi
+fi
+
+# Re-check output directory using venv Python if needed
+OWNED_OUTPUT_DIR=$(determine_owned_output_dir)
+SETUP_OK=1
 
 # Periodic sync every 20 min in case the node dies hard
-( while true; do sleep 1200; sync_results; done ) &
-SYNC_LOOP_PID=$!
+start_periodic_sync
 
 # Initial jitter (0-20s) if running as array to desynchronize batch downloads
 if [ -n "${PBS_ARRAY_INDEX:-}" ]; then
@@ -138,24 +817,58 @@ if [ -n "${PBS_ARRAY_INDEX:-}" ]; then
 fi
 
 # ------------------------------------------------------------------------------
-# 6. Tier-1 screening
+# Tier-1 screening
 # ------------------------------------------------------------------------------
 echo "[2/4] Launching Aldebaran Tier-1 Pipeline..."
+STAGE_REACHED="TIER1_RUNNING"
 run_py aldebaran.py
+TIER1_RC=$?
+
+if [ "$TIER1_RC" -ne 0 ]; then
+    echo "[!] ERROR: Tier-1 screening failed with exit code $TIER1_RC" >&2
+    PIPELINE_EXIT_CODE="$TIER1_RC"
+    STAGE_REACHED="TIER1_FAILED"
+    FAILURE_REASON="Tier-1 screening failed with exit code $TIER1_RC"
+else
+    STAGE_REACHED="TIER1_COMPLETE"
+fi
 
 # ------------------------------------------------------------------------------
-# 7. Tier-2 deep vetting (if single job) or shard registration (if array)
+# Tier-2 deep vetting (if single job and Tier-1 succeeded) or shard registration (if array)
 # ------------------------------------------------------------------------------
-if [ -z "${PBS_ARRAY_INDEX:-}" ]; then
-    if [ -s "tess_results/candidates_report.csv" ]; then
-        echo "[3/4] Candidates found! Launching Pleiades Tier-2 Deep Vetting..."
-        run_py pleiades.py
+if [ "$PIPELINE_EXIT_CODE" -eq 0 ]; then
+    if [ -z "${PBS_ARRAY_INDEX:-}" ]; then
+        HAS_CANDIDATES=0
+        if [ -f "tess_results/candidates_report.csv" ]; then
+            CAND_LINES=$(wc -l < "tess_results/candidates_report.csv" 2>/dev/null | tr -d ' ')
+            if [ -n "$CAND_LINES" ] && [ "$CAND_LINES" -gt 1 ]; then
+                HAS_CANDIDATES=1
+            fi
+        fi
+
+        if [ "$HAS_CANDIDATES" -eq 1 ]; then
+            echo "[3/4] Candidates found! Launching Pleiades Tier-2 Deep Vetting..."
+            STAGE_REACHED="TIER2_RUNNING"
+            run_py pleiades.py
+            TIER2_RC=$?
+            if [ "$TIER2_RC" -ne 0 ]; then
+                echo "[!] ERROR: Tier-2 deep vetting failed with exit code $TIER2_RC" >&2
+                PIPELINE_EXIT_CODE="$TIER2_RC"
+                STAGE_REACHED="TIER2_FAILED"
+                FAILURE_REASON="Tier-2 deep vetting failed with exit code $TIER2_RC"
+            else
+                STAGE_REACHED="PIPELINE_COMPLETE"
+            fi
+        else
+            echo "[3/4] No candidates found in this batch. Tier-2 vetting skipped."
+            STAGE_REACHED="PIPELINE_COMPLETE"
+        fi
     else
-        echo "[3/4] No candidates found in this batch. Tier-2 vetting skipped."
+        echo "[3/4] Array shard complete. Output staged in ${OWNED_OUTPUT_DIR:-tess_results/sector_*}. Run merge_shards.py after array completes."
+        STAGE_REACHED="PIPELINE_COMPLETE"
     fi
-else
-    echo "[3/4] Array shard complete. Output staged in tess_results/sector_*. Run merge_shards.py after array completes."
 fi
 
 # Final sync + scratch cleanup are performed by the EXIT trap.
 echo "[4/4] Pipeline execution finished at: $(date)"
+exit "$PIPELINE_EXIT_CODE"

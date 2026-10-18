@@ -48,6 +48,11 @@ tess_results/cluster_deep_vetting/
 tess_results/sector_*/
 
 # Internal AI context & local dev notes (not needed for public repo users)
+/AGENTS.md
+/.agents/
+/GEMINI.md
+/.gemini/
+/.codex/
 PROJECT_CONTEXT.md
 tess_results/archive*/
 tess_results/archive/

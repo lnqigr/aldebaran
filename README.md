@@ -1,4 +1,4 @@
-# Aldebaran: TESS Transit-Candidate Search and Vetting Pipeline (v9.0)
+# Aldebaran: TESS Transit-Candidate Search and Vetting Pipeline (v9.1.0)
 
 **Aldebaran** is an automated, high-throughput digital signal processing (DSP) pipeline designed to search archival and newly released sectors of the NASA TESS Extended Mission (2-minute SPOC cadence) for low-SNR transit candidates and route them through follow-up checks.
 
@@ -10,7 +10,7 @@ Aldebaran is a research candidate-search pipeline. **Real-TESS full-pipeline det
 
 Known limitations include the archival control-phase wrap defect, short-duration BLS grid coverage, small-sample odd/even statistics, and insufficient-data classification. Numerical model accuracy requires a stated independent reference, geometry and exposure regime. VPS is a heuristic score, not a calibrated probability. TRICERATOPS FPP/NFPP are conditional on their inputs and scenario model; LOYO timing outputs and candidate labels alone do not establish independent confirmation. Historical candidate examples below are not validated discoveries; reported performance figures are not independent calibration.
 
-This documentation correction changes no algorithms or selection thresholds. The architecture/version history describes intended or historical behavior, not a guarantee of scientific performance; local unreleased changes may differ from the published v9.0 baseline.
+Version 9.1.0 is an engineering release. Historical feature descriptions below are not calibrated scientific performance claims. The calibration pilot is designed but not implemented or executed; known SCI01/SCI51/SCI53/SCI54 limitations remain open.
 
 ---
 
@@ -58,10 +58,10 @@ This documentation correction changes no algorithms or selection thresholds. The
 ┌─────────────────────────────────────────────────────────────────────────┐
 │             MULTI-NODE SHARD REDUCER (merge_shards.py v9.0)             │
 ├─────────────────────────────────────────────────────────────────────────┤
-│  • Aggregates all tess_results/sector_*/candidates_report.csv shards   │
-│  • Deduplicates multi-sector detections prioritizing highest Kovács SDE │
+│  • Loads explicit manifest-declared, integrity-checked shard inputs   │
+│  • Preserves signal identities and provenance across sector inputs │
 │  • Merges scanned_tics.txt registries across parallel nodes             │
-│  • Automatically triggers Pleiades Tier-2 deep vetting on merged catalog│
+│  • Optional downstream vetting requires explicit separate opt-in         │
 └────────────────────────────────────┬────────────────────────────────────┘
                                      │
                                      ▼
@@ -184,8 +184,8 @@ python -m unittest discover tests
 
 For large-scale runs across tens of thousands of stars, PBS Pro scripts are available:
 * `cluster/run_aldebaran.pbs`: PBS script optimized for MetaCentrum HPC with Job Arrays (`qsub -J 1-8`) and local NVMe `$SCRATCHDIR` I/O (8 CPUs, 24 GB RAM, 35 GB local scratch, 8h walltime).
-* `cluster/run_merge.pbs`: Dependent reducer PBS job that executes automatically when the array finishes.
-* `cluster/submit_all.sh`: One-command automated launcher submitting both the 8-node array and the dependent reducer job.
+* `cluster/run_merge.pbs`: Manifest-driven reducer PBS job requiring separate explicit submission.
+* `cluster/submit_all.sh`: Explicit scan-only launcher; manifest reduction is submitted separately.
 * `merge_shards.py`: Reducer script to merge shard outputs after array execution.
 * See [README_METACENTRUM.md](docs/README_METACENTRUM.md) for full deployment and monitoring instructions.
 
@@ -196,7 +196,9 @@ For large-scale runs across tens of thousands of stars, PBS Pro scripts are avai
 ### Local Execution (Single Machine)
 ```bash
 # 1. Install dependencies
-pip install -r requirements.txt
+python -m pip install pip==26.2.1 setuptools==80.10.2 wheel==0.45.1 || exit 1
+python -m pip install --no-build-isolation -c constraints-linux-py311.txt -r requirements.txt || exit 1
+python -m pip check || exit 1
 
 # 2. Run Tier-1 screening
 python aldebaran.py
@@ -220,12 +222,63 @@ python loyo_validator.py --tic 350190949 --period 0.926120 --t0 1325.61416 --dur
 python merge_scanned_tics.py
 ```
 
-### HPC End-to-End Automated Array Execution (MetaCentrum)
+### HPC scan submission and captured environments
 
-**Deployment readiness:** The commands below submit real cluster work. Confirm that the selected source revision, data inputs, output paths, and resource limits are appropriate before running them; this README does not establish scientific readiness for a survey run.
+**Deployment readiness:** These commands submit real cluster work. Confirm the selected source revision, inputs, output paths and resource limits before submission; this guide does not establish scientific readiness for a survey run.
+
+Use `bash cluster/submit_all.sh --scan-only --array 1-8` (or a single index or
+ascending range within 1-8). No arguments, automatic merge, and unknown options
+are refused before submission. `afterany` does not prove input completeness.
+Check shard completion, real persistent paths, run identity and hashes before
+preparing the explicit manifest required by `merge_shards.py`.
+
+Submit reduction separately from the repository root, replacing all placeholders:
 
 ```bash
-# One-command fully automated workflow (Tier-1 array + automatic Tier-2 deep vetting reducer):
-chmod +x cluster/submit_all.sh cluster/run_merge.pbs cluster/run_aldebaran.pbs
-./cluster/submit_all.sh
+qsub -v MANIFEST_PATH=/storage/USER/run/manifest.json,RUN_ID=verified-run-id,OUTPUT_DIR=/storage/USER/run/fresh-merge cluster/run_merge.pbs
 ```
+
+Use a fresh output directory. Partial reduction requires explicit `ALLOW_PARTIAL=1`
+and remains incomplete. `RUN_PLEIADES`, `RUN_ANTARES`, `RUN_TRICERATOPS` default
+to 0. Inspect the manifest schema and `python merge_shards.py --help`; the launcher
+never constructs a manifest.
+
+`constraints-windows-py314.txt` captures installed Windows AMD64 Python 3.14.3
+versions (TRICERATOPS 1.1.0). Its header lists missing transitive metadata; this
+is an incomplete installed-environment constraint set, not a validated lock.
+`constraints-linux-py311.txt` preserves the saved Linux Python 3.11.11 freeze
+(TRICERATOPS 1.0.21), with source path and SHA256. Versions differ by environment;
+neither dependency pins nor these contract tests establish scientific validity.
+The pinned Linux engineering verification passed on Python 3.11.11: MetaCentrum job 24793285, 339 regression tests and 50 PBS contract tests, with no failures or skips, plus two synthetic standalone checks. Dependency checks and imports passed; the network guard recorded 19 expected blocked probes and zero unexpected attempts. This does not establish scientific validation or production-survey readiness.
+
+Installation profile used by the isolated Linux verifier: select Python 3.11.11,
+create/activate a fresh venv, and use the bootstrap and constraints below. Stop on
+any install or dependency-check failure; do not run tests or jobs until resolved:
+
+```bash
+python -m venv .venv
+# Activate .venv for your shell first.
+python -m pip install pip==26.2.1 setuptools==80.10.2 wheel==0.45.1 || exit 1
+python -m pip install --no-build-isolation -c constraints-linux-py311.txt -r requirements.txt || exit 1
+python -m pip check || exit 1
+ALDEBARAN_OFFLINE=1 python -m unittest tests.test_known_signals tests.test_submit_all tests.test_ephemeris_and_provenance tests.test_toi_companions_auditable
+```
+
+The Windows snapshot is for observed component testing only and is not a
+supported reproducible full runtime. A fresh environment and successful
+`python -m pip check` are mandatory before runtime use. PowerShell must stop on
+nonzero `$LASTEXITCODE`; set `$env:ALDEBARAN_OFFLINE='1'` for offline tests. Required known-signal tests generate **SYNTHETIC** fixtures for
+API/cache contracts. Optional observational replay is separately invoked with
+`python -m unittest tests.historical_known_signals` and requires unchanged
+`24702696_20261016_025524/audit/catalog_audit` files and original provenance.
+Synthetic success is not equivalent to historical recovery.
+
+PBS pip honors `PIP_CONSTRAINT`. Pass an absolute persistent path with `qsub -v`;
+ensure that path is visible on compute nodes:
+
+```bash
+qsub -v PIP_CONSTRAINT="$PWD/constraints-linux-py311.txt" -J 1-8 cluster/run_aldebaran.pbs
+```
+
+For separate reduction include `PIP_CONSTRAINT=/storage/USER/repo/constraints-linux-py311.txt`
+in its `qsub -v` list. The isolated engineering verification did not run scientific scans or validate these production submission examples against real candidates.

@@ -1,6 +1,7 @@
 import os
 import io
 import ssl
+import json
 import urllib.parse
 import urllib.request
 import logging
@@ -13,6 +14,12 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from scipy import stats
+from vps_contract import (
+    compute_vps_ledger,
+    VPS_SCHEMA_VERSION,
+    VPS_PRODUCER_NAME,
+    PLEIADES_CLEAN_VPS_THRESHOLD
+)
 from scipy.optimize import curve_fit
 from scipy.ndimage import median_filter
 from astropy.timeseries import BoxLeastSquares
@@ -56,7 +63,6 @@ if os.environ.get("LIGHTKURVE_CACHE_DIR"):
     lk.conf.cache_dir = os.environ["LIGHTKURVE_CACHE_DIR"]
 INPUT_CSV = os.path.join("tess_results", "candidates_report.csv")
 VET_DIR = os.path.join("tess_results", "deep_vetting")
-os.makedirs(VET_DIR, exist_ok=True)
 
 
 def to_numpy(col) -> np.ndarray:
@@ -400,7 +406,9 @@ def query_gaia_contamination(tic_id: str, depth_ppm: float) -> dict:
     return info
 
 
-def deep_vet_target(cand_row: dict) -> dict | None:
+def deep_vet_target(cand_row: dict, vet_dir: str = None) -> dict | None:
+    if vet_dir is None:
+        vet_dir = VET_DIR
     tic_id = str(int(cand_row["tic_id"]))
     p_init = safe_float(cand_row.get("period_days"), 5.0)
     t0_init = safe_float(cand_row.get("t0_btjd"), 3500.0)
@@ -507,51 +515,35 @@ def deep_vet_target(cand_row: dict) -> dict | None:
     print(f"[4/4] Querying Gaia DR3 neighborhood, NSS two-body & VizieR TESS EB catalogs...")
     gaia_contam = query_gaia_contamination(tic_id, depth_init_ppm)
     
-    # Composite Heuristic False-Positive Risk Score (0.0% = clean, 100% = definite FP)
-    risk_score = 0.2
-    if b_fit > 0.75:
-        risk_score += 25.0 * ((b_fit - 0.75) / 0.25) ** 2
-    
-    # Secondary eclipse significance calibration (Šidák-Bonferroni correction across ~30 phase bins):
-    # Pure Gaussian white noise across ~30 independent windows has E[max(z)] ~ 2.1-2.5 sigma.
-    # Penalize only when exceeding the true statistical significance threshold:
-    # Circular zone (|phase - 0.50| <= 0.04): SNR > 2.8 sigma
-    # Eccentric zone (|phase - 0.50| > 0.04): SNR > 3.4 sigma
-    is_circular_sec = abs(sec_center_phi - 0.50) <= 0.04
-    sec_snr_threshold = 2.8 if is_circular_sec else 3.4
-    if sec_snr > sec_snr_threshold:
-        risk_score += 45.0 * (sec_snr / 3.0)
-    if is_sec_eb:
-        risk_score += 65.0
-    if gaia_contam.get("is_tess_eb"):
-        risk_score += 90.0
-    if gaia_contam.get("is_gaia_nss"):
-        risk_score += 80.0
-    if gaia_contam["neb_capable_stars"] > 0:
-        risk_score += 8.0 * gaia_contam["neb_capable_stars"]
-    if gaia_contam["contamination_ratio"] > 0.25:
-        risk_score += 35.0 * gaia_contam["contamination_ratio"]
-    if dur_ratio_kepler > 1.38:
-        risk_score += 40.0 * (dur_ratio_kepler - 1.0)
-    elif dur_ratio_kepler < 0.35:
-        risk_score += 85.0 * ((0.35 - dur_ratio_kepler) / 0.35)
-    if np.isfinite(gaia_contam["ruwe"]) and gaia_contam["ruwe"] > 1.25:
-        risk_score += 15.0
-        
     # Enforce Stitched Primary Transit SNR Gate (prevents marginal white noise from masquerading as confirmed candidate)
     in_tr_mask = np.abs(ph_fit) < (0.45 * dur_fit)
     oot_mask_local = (np.abs(ph_fit) > (0.65 * dur_fit)) & (np.abs(ph_fit) <= (2.2 * dur_fit))
     oot_std_pt = float(1.4826 * np.nanmedian(np.abs(f_fit[oot_mask_local] - 1.0)) + 1e-12)
     n_in = int(np.sum(in_tr_mask))
     stitched_primary_snr = float((1.0 - np.nanmean(f_fit[in_tr_mask])) / (oot_std_pt / np.sqrt(max(1, n_in)))) if n_in >= 3 else 0.0
-    if stitched_primary_snr < 5.5:
-        risk_score += min(65.0, max(0.0, (5.5 - stitched_primary_snr) * 22.0))
-        
-    risk_pct = float(np.clip(risk_score, 0.1, 99.9))
-    vps_score = risk_pct
-    
+
+    # Versioned Vetting Penalty Score (VPS) Ledger and Score Calculation (ALD-012 / SCI-16)
+    ledger = compute_vps_ledger(
+        b_fit=b_fit,
+        sec_center_phi=sec_center_phi,
+        sec_snr=sec_snr,
+        is_sec_eb=is_sec_eb,
+        is_tess_eb=bool(gaia_contam.get("is_tess_eb", False)),
+        is_gaia_nss=bool(gaia_contam.get("is_gaia_nss", False)),
+        neb_capable_stars=gaia_contam["neb_capable_stars"],
+        contamination_ratio=gaia_contam["contamination_ratio"],
+        dur_ratio_kepler=dur_ratio_kepler,
+        ruwe=gaia_contam["ruwe"],
+        stitched_primary_snr=stitched_primary_snr
+    )
+    vps_score = ledger["final_score"]
+    vps_unclipped_total = ledger["unclipped_total"]
+    vps_ledger_json = json.dumps(ledger)
+    sec_snr_threshold = ledger["secondary_metadata"]["threshold"]
+    vps_score_clipped_raw = ledger["clipped_score"]
+
     is_clean = (
-        vps_score < 5.0
+        vps_score_clipped_raw < PLEIADES_CLEAN_VPS_THRESHOLD
         and b_fit < 0.82
         and sec_snr <= sec_snr_threshold
         and not is_sec_eb
@@ -583,7 +575,7 @@ def deep_vet_target(cand_row: dict) -> dict | None:
         print(f"      -> [!] VizieR TESS EB Match: TIC {gaia_contam.get('tess_eb_tic')} (P={gaia_contam.get('tess_eb_period')} d)")
     if gaia_contam.get("is_gaia_nss"):
         print(f"      -> [!] Gaia NSS Two-Body Orbit: {gaia_contam.get('gaia_nss_type')} (P={gaia_contam.get('gaia_nss_period')} d)")
-    print(f"      -> Vetting Penalty Score (VPS): {vps_score:.1f} (Gate <= 24.0) -> {disposition}")
+    print(f"      -> Vetting Penalty Score (VPS): {vps_score:.1f} (Pleiades Clean Criterion < {PLEIADES_CLEAN_VPS_THRESHOLD:.1f}) -> {disposition}")
     
     fig, axes = plt.subplots(2, 2, figsize=(15, 10))
     
@@ -668,7 +660,7 @@ def deep_vet_target(cand_row: dict) -> dict | None:
         f"SCIENTIFIC VETTING DOSSIER: TIC {tic_id}\n"
         f"{'-'*48}\n"
         f"Disposition:       {disposition}\n"
-        f"Vetting Score VPS: {vps_score:.1f} / 100 (Optimal Gate <= 24.0)\n\n"
+        f"Vetting Score VPS: {vps_score:.1f} / 100 (Pleiades Clean Criterion < {PLEIADES_CLEAN_VPS_THRESHOLD:.1f})\n\n"
         f"ORBITAL & PHYSICAL PARAMETERS (300-Ring Fit):\n"
         f"  Refined Period:  {p_ref:.6f} days\n"
         f"  Mid-Transit T0:  {t0_ref:.5f} BTJD\n"
@@ -692,15 +684,29 @@ def deep_vet_target(cand_row: dict) -> dict | None:
                     bbox=dict(boxstyle="round,pad=0.6", facecolor="#f4f6f9", edgecolor="gray"))
     
     plt.tight_layout()
-    out_img = os.path.join(VET_DIR, f"dossier_TIC_{tic_id}.png")
+    os.makedirs(vet_dir, exist_ok=True)
+    out_img = os.path.join(vet_dir, f"dossier_TIC_{tic_id}.png")
     plt.savefig(out_img, dpi=160)
     plt.close(fig)
     
     return {
         "tic_id": tic_id,
+        "operational_status": "SUCCESS",
         "disposition": disposition,
+        "vps_version": VPS_SCHEMA_VERSION,
+        "vps_producer": VPS_PRODUCER_NAME,
         "vps_score": round(vps_score, 1),
         "fp_risk_percent": round(vps_score, 1),  # backward compatibility alias
+        "vps_unclipped_total": float(vps_unclipped_total),
+        "vps_ledger_json": vps_ledger_json,
+        "sec_eclipse_zone": ledger["secondary_metadata"]["zone"],
+        "sec_snr_threshold": ledger["secondary_metadata"]["threshold"],
+        "sec_penalty_applied": ledger["secondary_metadata"]["penalty_applied"],
+        "vps_clean_criterion": ledger["clean_criterion"],
+        "input_period_days": float(cand_row.get("period_days", float("nan"))),
+        "input_t0_btjd": float(cand_row.get("t0_btjd", float("nan"))),
+        "input_depth_ppm": float(cand_row.get("depth_ppm", float("nan"))),
+        "input_duration_hours": float(cand_row.get("duration_hours", float("nan"))),
         "refined_period_days": round(p_ref, 6),
         "refined_t0_btjd": round(t0_ref, 5),
         "fitted_depth_ppm": round((rp_rs_fit ** 2) * 1e6, 1),
@@ -715,25 +721,125 @@ def deep_vet_target(cand_row: dict) -> dict | None:
         "gaia_nss_type": gaia_contam.get("gaia_nss_type"),
         "flux_contam_percent": round(gaia_contam["contamination_ratio"] * 100, 2),
         "neb_capable_neighbors": gaia_contam["neb_capable_stars"],
-        "sectors_stitched": ",".join(str(s) for s in sectors_used)
+        "sectors_stitched": ",".join(str(s) for s in sectors_used),
+        "error_message": ""
     }
 
 
 if __name__ == "__main__":
-    if not os.path.exists(INPUT_CSV):
-        print(f"File '{INPUT_CSV}' not found. Run aldebaran.py first.")
+    import argparse
+    from vps_contract import VPS_PRODUCER_NAME
+    parser = argparse.ArgumentParser(description=f"Pleiades Tier-2 Deep Vetting {PIPELINE_VERSION}")
+    parser.add_argument("--input-csv", type=str, default=INPUT_CSV, help="Input candidates CSV report")
+    parser.add_argument("--output-dir", type=str, default=VET_DIR, help="Output directory for vetting dossiers")
+    args = parser.parse_args()
+
+    input_csv = args.input_csv
+    vet_dir = args.output_dir
+
+    if not os.path.exists(input_csv):
+        print(f"File '{input_csv}' not found. Run aldebaran.py first.")
+        sys.exit(1)
     else:
-        df_cands = pd.read_csv(INPUT_CSV)
-        print(f"Loaded {len(df_cands)} candidates from '{INPUT_CSV}' for Pleiades Tier-2 Deep Vetting {PIPELINE_VERSION}.")
+        os.makedirs(vet_dir, exist_ok=True)
+        df_cands = pd.read_csv(input_csv, dtype={"tic_id": str})
+        print(f"Loaded {len(df_cands)} candidates from '{input_csv}' for Pleiades Tier-2 Deep Vetting {PIPELINE_VERSION}.")
         vet_results = []
         for _, row in df_cands.iterrows():
+            tic_val = str(row["tic_id"]).split(".")[0].strip() if pd.notna(row.get("tic_id")) else ""
             try:
-                res = deep_vet_target(row.to_dict())
+                res = deep_vet_target(row.to_dict(), vet_dir=vet_dir)
                 if res is not None:
                     vet_results.append(res)
+                else:
+                    vet_results.append({
+                        "tic_id": tic_val,
+                        "operational_status": "NO_LIGHTCURVE",
+                        "disposition": None,
+                        "vps_version": "",
+                        "vps_producer": VPS_PRODUCER_NAME,
+                        "vps_score": float("nan"),
+                        "fp_risk_percent": float("nan"),
+                        "vps_unclipped_total": float("nan"),
+                        "vps_ledger_json": "",
+                        "sec_eclipse_zone": "",
+                        "sec_snr_threshold": float("nan"),
+                        "sec_penalty_applied": None,
+                        "vps_clean_criterion": "",
+                        "input_period_days": float(row.get("period_days", float("nan"))),
+                        "input_t0_btjd": float(row.get("t0_btjd", float("nan"))),
+                        "input_depth_ppm": float(row.get("depth_ppm", float("nan"))),
+                        "input_duration_hours": float(row.get("duration_hours", float("nan"))),
+                        "refined_period_days": float("nan"),
+                        "refined_t0_btjd": float("nan"),
+                        "fitted_depth_ppm": float("nan"),
+                        "fitted_duration_hours": float("nan"),
+                        "fitted_rp_earth": float("nan"),
+                        "impact_param_b": float("nan"),
+                        "dur_to_kepler_max": float("nan"),
+                        "stitched_primary_snr": float("nan"),
+                        "secondary_snr_sigma": float("nan"),
+                        "sec_eclipse_phase": float("nan"),
+                        "is_known_tess_eb": None,
+                        "gaia_nss_type": None,
+                        "flux_contam_percent": float("nan"),
+                        "neb_capable_neighbors": float("nan"),
+                        "sectors_stitched": "",
+                        "error_message": "No light curve found"
+                    })
             except Exception as e:
-                print(f"[!] Error vetting TIC {row['tic_id']}: {e}")
+                print(f"[!] Error vetting TIC {tic_val}: {e}")
+                vet_results.append({
+                    "tic_id": tic_val,
+                    "operational_status": "ERROR",
+                    "disposition": None,
+                    "vps_version": "",
+                    "vps_producer": VPS_PRODUCER_NAME,
+                    "vps_score": float("nan"),
+                    "fp_risk_percent": float("nan"),
+                    "vps_unclipped_total": float("nan"),
+                    "vps_ledger_json": "",
+                    "sec_eclipse_zone": "",
+                    "sec_snr_threshold": float("nan"),
+                    "sec_penalty_applied": None,
+                    "vps_clean_criterion": "",
+                    "input_period_days": float(row.get("period_days", float("nan"))),
+                    "input_t0_btjd": float(row.get("t0_btjd", float("nan"))),
+                    "input_depth_ppm": float(row.get("depth_ppm", float("nan"))),
+                    "input_duration_hours": float(row.get("duration_hours", float("nan"))),
+                    "refined_period_days": float("nan"),
+                    "refined_t0_btjd": float("nan"),
+                    "fitted_depth_ppm": float("nan"),
+                    "fitted_duration_hours": float("nan"),
+                    "fitted_rp_earth": float("nan"),
+                    "impact_param_b": float("nan"),
+                    "dur_to_kepler_max": float("nan"),
+                    "stitched_primary_snr": float("nan"),
+                    "secondary_snr_sigma": float("nan"),
+                    "sec_eclipse_phase": float("nan"),
+                    "is_known_tess_eb": None,
+                    "gaia_nss_type": None,
+                    "flux_contam_percent": float("nan"),
+                    "neb_capable_neighbors": float("nan"),
+                    "sectors_stitched": "",
+                    "error_message": str(e)
+                })
+        out_csv = os.path.join(vet_dir, "scientific_dossier_summary.csv")
         if vet_results:
-            out_csv = os.path.join(VET_DIR, "scientific_dossier_summary.csv")
             pd.DataFrame(vet_results).to_csv(out_csv, index=False)
-            print(f"\nPleiades deep vetting complete! Dossiers saved to '{VET_DIR}'.")
+            print(f"\nPleiades deep vetting complete! Dossiers saved to '{vet_dir}'.")
+        else:
+            pd.DataFrame(columns=[
+                "tic_id", "operational_status", "disposition",
+                "vps_version", "vps_producer", "vps_score", "fp_risk_percent",
+                "vps_unclipped_total", "vps_ledger_json", "sec_eclipse_zone",
+                "sec_snr_threshold", "sec_penalty_applied", "vps_clean_criterion",
+                "input_period_days", "input_t0_btjd", "input_depth_ppm", "input_duration_hours",
+                "refined_period_days", "refined_t0_btjd", "fitted_depth_ppm",
+                "fitted_duration_hours", "fitted_rp_earth", "impact_param_b",
+                "dur_to_kepler_max", "stitched_primary_snr", "secondary_snr_sigma",
+                "sec_eclipse_phase", "is_known_tess_eb", "gaia_nss_type",
+                "flux_contam_percent", "neb_capable_neighbors", "sectors_stitched",
+                "error_message"
+            ]).to_csv(out_csv, index=False)
+            print(f"\nPleiades deep vetting complete (0 survivors). Empty summary saved to '{out_csv}'.")

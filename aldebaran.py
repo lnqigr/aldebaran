@@ -3,12 +3,14 @@ import io
 import ssl
 import json
 import shutil
+import hashlib
 import glob
 import logging
 import warnings
 import urllib.request
 import urllib.parse
-from datetime import datetime
+from datetime import datetime, timezone
+from typing import Any, Optional
 import certifi
 import requests
 
@@ -72,8 +74,112 @@ from scipy.ndimage import median_filter
 from astropy.timeseries import BoxLeastSquares
 import lightkurve as lk
 from astroquery.mast import Observations, Catalogs
+import known_signals
 
 PIPELINE_VERSION = "v9.0"
+CANDIDATE_SCHEMA_VERSION = "v1.1"
+
+CANDIDATE_COLUMNS = [
+    "schema_version",
+    "pipeline_version",
+    "run_id",
+    "tic_id",
+    "sector",
+    "is_toi_host",
+    "known_toi_context",
+    "candidate_type",
+    "ephemeris_source",
+    "ephemeris_status",
+    "ephemeris_fallback_reason",
+    "time_system",
+    "time_standard",
+    "epoch_offset_btjd",
+    "period_units",
+    "duration_units",
+    "depth_units",
+    "transit_measurement_source",
+    "timing_uncertainty_source",
+    "period_days",
+    "t0_btjd",
+    "discovery_period_days",
+    "discovery_t0_btjd",
+    "refined_period_days",
+    "refined_t0_btjd",
+    "duration_hours",
+    "min_kepler_dur_hours",
+    "max_kepler_dur_hours",
+    "n_transits",
+    "depth_ppm",
+    "crowdsap",
+    "sde",
+    "r_planet_earth",
+    "r_star_sun",
+    "m_star_sun",
+    "teff_k",
+    "gaia_ruwe",
+    "odd_even_sigma",
+    "centroid_shift_arcsec",
+    "archival_sectors",
+    "n_archival_sectors",
+    "archival_sectors_requested",
+    "archival_sectors_attempted",
+    "archival_sectors_used",
+    "archival_products_requested",
+    "archival_products_attempted",
+    "archival_products_used",
+    "archival_products_failed",
+    "archival_snr_sigma",
+    "archival_trials",
+    "archival_snr_crit",
+    "est_multi_sde_proxy",
+    "multi_sde",
+    "cramer_rao_sigma_p_sec",
+    "cramer_rao_sigma_t0_sec",
+    "covariance_p_t0",
+    "plot_path",
+    "exofop_url"
+]
+
+
+def _get_stable_product_id(row, sec_num: int, idx: int) -> str:
+    """Extract a stable product ID from search result row if available, otherwise explicit fallback."""
+    for attr in ("obsid", "productFilename", "obs_id", "target_name"):
+        try:
+            val = getattr(row, attr, None)
+            if val is not None and str(val).strip():
+                return str(val).strip()
+        except Exception:
+            pass
+    try:
+        table_row = getattr(row, "table", row)
+        for key in ("obsid", "productFilename", "obs_id", "target_name"):
+            if hasattr(table_row, "colnames") and key in table_row.colnames:
+                val = table_row[key]
+                if val is not None and str(val).strip():
+                    return str(val).strip()
+    except Exception:
+        pass
+    try:
+        if hasattr(row, "__getitem__"):
+            for key in ("obsid", "productFilename", "obs_id", "target_name"):
+                if key in row:
+                    val = row[key]
+                    if val is not None and str(val).strip():
+                        return str(val).strip()
+    except Exception:
+        pass
+    return f"UNAVAILABLE_attempt_{idx}_sec_{int(sec_num):04d}"
+
+
+def _serialize_metadata_list(items) -> str:
+    """Serializes a list or dict of provenance items into an unambiguous JSON string."""
+    if items is None:
+        return "[]"
+    if isinstance(items, str):
+        return items
+    return json.dumps(items)
+
+
 AUTO_PURGE_CACHE = True       # Automatically deletes raw FITS files of non-candidates to keep cache at ~0 MB
 
 # Lightkurve does NOT read a LIGHTKURVE_CACHE_DIR env var by itself; apply it explicitly so HPC jobs
@@ -111,25 +217,199 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 HISTORY_FILE = os.path.join(OUTPUT_DIR, "scanned_tics.txt")
 CATALOG_CACHE_FILE = os.path.join("tess_results", "known_catalog_cache.txt")
 TOI_EPHEMERIS_CACHE_FILE = os.path.join("tess_results", "toi_ephemerides_cache.json")
+KNOWN_SIGNALS_REGISTRY_CACHE_FILE = os.path.join("tess_results", "known_signals_registry.json")
 SEARCH_TOI_COMPANIONS = os.environ.get("ALDEBARAN_SEARCH_TOI_COMPANIONS", "1").lower() not in ("0", "false", "no")
 GLOBAL_TOI_EPHEMERIDES = {}
+GLOBAL_KNOWN_SIGNALS_REGISTRY = None
 REPORT_FILE = os.path.join(OUTPUT_DIR, "candidates_report.csv")
 LOG_FILE = os.path.join(OUTPUT_DIR, "pipeline_run.log")
 EVENTS_LOG_FILE = os.path.join(OUTPUT_DIR, "pipeline_events.log")
+CURRENT_RUN_ID = os.environ.get("ALDEBARAN_RUN_ID", "default_run")
+ARCHIVAL_DIAGNOSTICS_FILE = os.path.join(OUTPUT_DIR, "archival_vetting_diagnostics.jsonl")
+
+
+def configure_environment(
+    output_dir: str = None,
+    toi_ephemerides: dict = None,
+    log_file: str = None,
+    run_id: str = None,
+    known_signals_registry = None,
+    catalog_cache_file: str = None,
+    toi_ephemeris_cache_file: str = None,
+    known_signals_registry_cache_file: str = None,
+):
+    """
+    Explicitly configure pipeline paths and global catalog context.
+    Ensures that worker processes (under both fork and spawn) have consistent
+    output directories, log file locations, in-memory TOI ephemeris tables,
+    known signals registry context, cache file locations, and run identifiers for isolated artifact generation.
+    """
+    global OUTPUT_DIR, LOG_FILE, EVENTS_LOG_FILE, REPORT_FILE, HISTORY_FILE, GLOBAL_TOI_EPHEMERIDES, CURRENT_RUN_ID, ARCHIVAL_DIAGNOSTICS_FILE, GLOBAL_KNOWN_SIGNALS_REGISTRY
+    global CATALOG_CACHE_FILE, TOI_EPHEMERIS_CACHE_FILE, KNOWN_SIGNALS_REGISTRY_CACHE_FILE
+    if run_id is not None:
+        CURRENT_RUN_ID = run_id
+    if output_dir is not None:
+        OUTPUT_DIR = output_dir
+        os.makedirs(OUTPUT_DIR, exist_ok=True)
+        LOG_FILE = os.path.join(OUTPUT_DIR, "pipeline_run.log") if log_file is None else log_file
+        EVENTS_LOG_FILE = os.path.join(OUTPUT_DIR, "pipeline_events.log")
+        REPORT_FILE = os.path.join(OUTPUT_DIR, "candidates_report.csv")
+        HISTORY_FILE = os.path.join(OUTPUT_DIR, "scanned_tics.txt")
+        ARCHIVAL_DIAGNOSTICS_FILE = os.path.join(OUTPUT_DIR, "archival_vetting_diagnostics.jsonl")
+    elif log_file is not None:
+        LOG_FILE = log_file
+    if toi_ephemerides is not None:
+        GLOBAL_TOI_EPHEMERIDES = dict(toi_ephemerides)
+    if known_signals_registry is not None:
+        GLOBAL_KNOWN_SIGNALS_REGISTRY = known_signals_registry
+    if catalog_cache_file is not None:
+        CATALOG_CACHE_FILE = catalog_cache_file
+    if toi_ephemeris_cache_file is not None:
+        TOI_EPHEMERIS_CACHE_FILE = toi_ephemeris_cache_file
+    if known_signals_registry_cache_file is not None:
+        KNOWN_SIGNALS_REGISTRY_CACHE_FILE = known_signals_registry_cache_file
+
+
+
+class AnalysisResult(tuple):
+    """
+    4-element tuple (tic_id, status_code, message, cand_data) preserving strict
+    backwards-compatibility for unpacking, while providing result-owned metadata
+    for current attempt isolation (run_id, attempt_id, archival_diagnostic, archival_diagnostics).
+    """
+    def __new__(cls, tic_id, status, message, cand_data, run_id=None, attempt_id=None, archival_diagnostics=None):
+        return super().__new__(cls, (tic_id, status, message, cand_data))
+
+    def __init__(self, tic_id, status, message, cand_data, run_id=None, attempt_id=None, archival_diagnostics=None):
+        self.run_id = run_id
+        self.attempt_id = attempt_id
+        self.archival_diagnostics = list(archival_diagnostics or [])
+        self.archival_diagnostic = self.archival_diagnostics[-1] if self.archival_diagnostics else None
+
+    def __reduce__(self):
+        return (AnalysisResult, (self[0], self[1], self[2], self[3], self.run_id, self.attempt_id, self.archival_diagnostics))
+
+
+def record_archival_diagnostic(target_diag: dict):
+    """
+    Persists bounded JSON-safe archival vetting diagnostics for an inspected target/peak.
+    Ensures that run_id, attempt_id, timestamp, product IDs, failure stages, and fallback
+    reasons survive all exits, including archival rejections and post-preparation evaluation failures.
+    On failure to persist, raises RuntimeError to avoid silently dropping evidence.
+    """
+    global ARCHIVAL_DIAGNOSTICS_FILE
+    if not ARCHIVAL_DIAGNOSTICS_FILE:
+        ARCHIVAL_DIAGNOSTICS_FILE = os.path.join(OUTPUT_DIR, "archival_vetting_diagnostics.jsonl")
+    diag_dir = os.path.dirname(os.path.abspath(ARCHIVAL_DIAGNOSTICS_FILE))
+    os.makedirs(diag_dir, exist_ok=True)
+    diag_copy = dict(target_diag)
+    if "run_id" not in diag_copy or not diag_copy["run_id"]:
+        diag_copy["run_id"] = CURRENT_RUN_ID
+    if "attempt_id" not in diag_copy or not diag_copy["attempt_id"]:
+        diag_copy["attempt_id"] = "unknown_attempt"
+    if "timestamp" not in diag_copy or not diag_copy["timestamp"]:
+        from datetime import datetime, timezone
+        diag_copy["timestamp"] = datetime.now(timezone.utc).isoformat()
+    line = json.dumps(diag_copy) + "\n"
+    try:
+        with open(ARCHIVAL_DIAGNOSTICS_FILE, "a", encoding="utf-8") as f:
+            f.write(line)
+            f.flush()
+    except Exception as exc:
+        raise RuntimeError(
+            f"Failed to persist archival vetting diagnostic to '{ARCHIVAL_DIAGNOSTICS_FILE}': {exc}"
+        ) from exc
+
+
+def get_latest_archival_diagnostic(
+    tic_id: str,
+    sector: int = None,
+    output_dir: str = None,
+    run_id: str = None,
+    attempt_id: str = None
+) -> dict | None:
+    """
+    Retrieves the most recent archival vetting diagnostic record matching tic_id,
+    and optionally sector, run_id, and attempt_id.
+    Searches archival_vetting_diagnostics.jsonl in output_dir (or configured OUTPUT_DIR).
+    Returns dict or None.
+    """
+    base_dir = output_dir if output_dir is not None else OUTPUT_DIR
+    diag_file = os.path.join(base_dir, "archival_vetting_diagnostics.jsonl")
+    if not os.path.exists(diag_file) or os.path.getsize(diag_file) == 0:
+        return None
+    tid_str = str(tic_id).lstrip("0")
+    matching = []
+    try:
+        with open(diag_file, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                    if str(rec.get("tic_id", "")).lstrip("0") != tid_str:
+                        continue
+                    if sector is not None and int(rec.get("sector", -1)) != int(sector):
+                        continue
+                    if run_id is not None and str(rec.get("run_id", "")) != str(run_id):
+                        continue
+                    if attempt_id is not None and str(rec.get("attempt_id", "")) != str(attempt_id):
+                        continue
+                    matching.append(rec)
+                except Exception:
+                    continue
+    except Exception:
+        return None
+    return matching[-1] if matching else None
+
+
+def load_archival_diagnostics(output_dir: str = None) -> list:
+    """Reads all diagnostic records from archival_vetting_diagnostics.jsonl."""
+    base_dir = output_dir if output_dir is not None else OUTPUT_DIR
+    diag_file = os.path.join(base_dir, "archival_vetting_diagnostics.jsonl")
+    if not os.path.exists(diag_file) or os.path.getsize(diag_file) == 0:
+        return []
+    records = []
+    try:
+        with open(diag_file, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    records.append(json.loads(line))
+                except Exception:
+                    continue
+    except Exception:
+        return []
+    return records
 
 
 def write_log(message: str, print_to_console: bool = True):
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     if print_to_console:
         print(message, flush=True)
-    with open(LOG_FILE, "a", encoding="utf-8") as f:
-        f.write(f"[{timestamp}] {message}\n")
+    try:
+        log_dir = os.path.dirname(os.path.abspath(LOG_FILE))
+        if log_dir:
+            os.makedirs(log_dir, exist_ok=True)
+        with open(LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(f"[{timestamp}] {message}\n")
+    except Exception:
+        pass
 
 
 def write_event(message: str):
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    with open(EVENTS_LOG_FILE, "a", encoding="utf-8") as f:
-        f.write(f"[{timestamp}] {message}\n")
+    try:
+        event_dir = os.path.dirname(os.path.abspath(EVENTS_LOG_FILE))
+        if event_dir:
+            os.makedirs(event_dir, exist_ok=True)
+        with open(EVENTS_LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(f"[{timestamp}] {message}\n")
+    except Exception:
+        pass
 
 
 def fetch_csv_with_headers(url: str) -> pd.DataFrame:
@@ -144,22 +424,110 @@ def fetch_csv_with_headers(url: str) -> pd.DataFrame:
             return pd.read_csv(io.StringIO(raw_text), comment="#", on_bad_lines="skip")
 
 
-def load_known_catalogs_and_toi_ephemerides() -> tuple:
+def _extract_source_input(fix_entry: Any, catalog_name: str, default_url: str):
     """
-    Ingests official TOI catalog ephemerides (P, T0, T_dur, depth, disp), confirmed planet hosts,
-    ExoFOP CTOIs, and cataloged EBs from VizieR (Prša et al. 2022).
+    Extracts DataFrame, raw payload sha256, payload_hash_kind, raw_source_path_or_url, and original_retrieval_utc.
+    Accurately distinguishes raw file bytes vs in-memory string vs dataframe serialization.
+    """
+    df = None
+    raw_sha = None
+    hash_kind = "dataframe_serialization"
+    source_path_or_url = default_url
+    orig_utc = None
+
+    repo_root = os.path.dirname(os.path.abspath(__file__))
+    manifest_info = {}
+    manifest_paths = [
+        os.path.join(repo_root, "24702696_20261016_025524", "audit", "catalog_audit", "source_manifest.json"),
+        os.path.join(os.path.dirname(str(fix_entry)), "source_manifest.json") if isinstance(fix_entry, str) else "",
+        "24702696_20261016_025524/audit/catalog_audit/source_manifest.json",
+    ]
+    for mp in manifest_paths:
+        if mp and os.path.isfile(mp):
+            try:
+                with open(mp, "r", encoding="utf-8") as f:
+                    mf = json.load(f)
+                    if catalog_name in mf:
+                        manifest_info = mf[catalog_name]
+                        break
+            except Exception:
+                pass
+
+    if isinstance(fix_entry, pd.DataFrame):
+        df = fix_entry
+        raw_sha = known_signals.compute_payload_sha256(fix_entry)
+        hash_kind = "dataframe_serialization"
+        source_path_or_url = "in_memory_dataframe"
+        orig_utc = None
+    elif isinstance(fix_entry, bytes):
+        raw_sha = hashlib.sha256(fix_entry).hexdigest()
+        hash_kind = "raw_bytes"
+        source_path_or_url = "in_memory_bytes"
+        df = pd.read_csv(io.BytesIO(fix_entry), comment="#", on_bad_lines="skip")
+    elif isinstance(fix_entry, str):
+        file_candidate = fix_entry if os.path.isfile(fix_entry) else os.path.join(repo_root, fix_entry)
+        if "\n" not in fix_entry and os.path.isfile(file_candidate):
+            with open(file_candidate, "rb") as f:
+                b = f.read()
+            raw_sha = hashlib.sha256(b).hexdigest()
+            hash_kind = "raw_file_bytes"
+            source_path_or_url = file_candidate
+            df = pd.read_csv(io.BytesIO(b), comment="#", on_bad_lines="skip")
+            if manifest_info and manifest_info.get("sha256") == raw_sha:
+                orig_utc = manifest_info.get("retrieved_utc")
+                if manifest_info.get("url"):
+                    source_path_or_url = manifest_info.get("url")
+        else:
+            b = fix_entry.encode("utf-8")
+            raw_sha = hashlib.sha256(b).hexdigest()
+            hash_kind = "raw_string_bytes"
+            source_path_or_url = "in_memory_string"
+            df = pd.read_csv(io.StringIO(fix_entry), comment="#", on_bad_lines="skip")
+            if manifest_info and manifest_info.get("sha256") == raw_sha:
+                orig_utc = manifest_info.get("retrieved_utc")
+                if manifest_info.get("url"):
+                    source_path_or_url = manifest_info.get("url")
+
+    return df, raw_sha, hash_kind, source_path_or_url, orig_utc
+
+
+def load_known_catalogs_and_toi_ephemerides(offline_fixtures: Optional[dict] = None) -> tuple:
+    """
+    Ingests official TOI catalog ephemerides (P, T0, T_dur, depth, disp), confirmed planet hosts
+    (preserving all planets, transit ephemerides, durations, and depths), ExoFOP CTOIs,
+    and cataloged EBs from VizieR (Prša et al. 2022).
+    
+    Populates the canonical versioned KnownSignalsRegistry (available via get_known_signals_registry()
+    and get_known_signal_context_for_tic(tic_id)) while strictly preserving the legacy return tuple.
     
     Returns:
         known_catalog_tics: set of all cataloged TICs (legacy union)
         known_eb_tics: set of confirmed/cataloged Eclipsing Binary stars (Prša et al. 2022)
         toi_ephemerides: dict[str, list[dict]] mapping TIC string to list of known TOI planets
     """
-    global GLOBAL_TOI_EPHEMERIDES
+    global GLOBAL_TOI_EPHEMERIDES, GLOBAL_KNOWN_SIGNALS_REGISTRY
     known_catalog_tics = set()
     known_eb_tics = set()
     toi_ephemerides = {}
 
-    if os.path.exists(TOI_EPHEMERIS_CACHE_FILE):
+    registry = None
+    if os.path.exists(KNOWN_SIGNALS_REGISTRY_CACHE_FILE):
+        try:
+            registry = known_signals.KnownSignalsRegistry.load_from_json(
+                KNOWN_SIGNALS_REGISTRY_CACHE_FILE, mark_as_cached=True
+            )
+            GLOBAL_KNOWN_SIGNALS_REGISTRY = registry
+            known_catalog_tics.update(registry.export_legacy_catalog_tics())
+            known_eb_tics.update(registry.export_legacy_eb_tics())
+            toi_ephemerides.update(registry.export_legacy_toi_ephemerides())
+            GLOBAL_TOI_EPHEMERIDES = toi_ephemerides
+        except Exception as exc:
+            write_log(f"      [!] Warning: Failed to load known_signals_registry from cache ({exc})")
+
+    if registry is None:
+        registry = known_signals.KnownSignalsRegistry()
+
+    if not toi_ephemerides and os.path.exists(TOI_EPHEMERIS_CACHE_FILE):
         try:
             with open(TOI_EPHEMERIS_CACHE_FILE, "r", encoding="utf-8") as f:
                 toi_ephemerides = json.load(f)
@@ -167,7 +535,7 @@ def load_known_catalogs_and_toi_ephemerides() -> tuple:
         except Exception:
             pass
 
-    if os.path.exists(CATALOG_CACHE_FILE):
+    if not known_catalog_tics and os.path.exists(CATALOG_CACHE_FILE):
         try:
             with open(CATALOG_CACHE_FILE, "r", encoding="utf-8") as f:
                 cached = set(line.strip() for line in f if line.strip())
@@ -175,89 +543,241 @@ def load_known_catalogs_and_toi_ephemerides() -> tuple:
         except Exception:
             pass
 
+    fixtures = offline_fixtures or {}
+    is_offline = os.environ.get("ALDEBARAN_OFFLINE", "0").lower() in ("1", "true", "yes")
+    allow_network = (offline_fixtures is None) and (not is_offline)
+
+    def _apply_source_or_preserve(src_name: str, signals: list, snap, df_len: int, log_desc: str):
+        if snap.status == "FAILED":
+            if src_name in registry.source_snapshots and registry.source_snapshots[src_name].status in ("SUCCESS", "CACHED"):
+                existing = registry.source_snapshots[src_name]
+                existing.last_attempt_status = "FAILED"
+                existing.last_attempt_utc = snap.retrieval_utc
+                existing.last_attempt_error = snap.error_message
+                registry.record_failed_attempt(snap, signals)
+                cov = registry.get_coverage_status()
+                for host in registry.hosts.values():
+                    host.coverage_status = cov
+                write_log(f"      [!] Warning: Failed to parse {log_desc} table: {snap.error_message}. Preserving existing coherent data.")
+                return
+            registry.replace_source_signals(src_name, signals, snap)
+            write_log(f"      [!] Warning: Failed to parse {log_desc} table: {snap.error_message}.")
+        else:
+            if src_name in registry.source_snapshots and registry.source_snapshots[src_name].status in ("SUCCESS", "CACHED"):
+                existing = registry.source_snapshots[src_name]
+                if existing.payload_sha256 == snap.payload_sha256:
+                    existing.last_attempt_status = "SUCCESS"
+                    existing.last_attempt_utc = snap.retrieval_utc
+                    existing.last_attempt_error = None
+                    existing.status = "SUCCESS"
+                    cov = registry.get_coverage_status()
+                    statuses = registry.get_source_statuses()
+                    for host in registry.hosts.values():
+                        host.source_statuses = dict(statuses)
+                        host.coverage_status = cov
+                    write_log(f"      -> Loaded {df_len} {log_desc} entries (re-verified coherent selected snapshot {existing.snapshot_id}).")
+                    return
+            registry.replace_source_signals(src_name, signals, snap)
+            write_log(f"      -> Loaded {df_len} {log_desc} entries.")
+
+    # [1/5] NASA TOI
     write_log("[1/5] Fetching official TOI catalog & ephemerides from NASA Exoplanet Archive...")
-    try:
-        toi_query = (
-            "select tid, toi, pl_tranmid, pl_orbper, pl_trandurh, pl_trandep, tfopwg_disp "
-            "from toi where pl_orbper is not null and pl_tranmid is not null"
+    df_toi = None
+    toi_sha = None
+    toi_hash_kind = "dataframe_serialization"
+    toi_src_path = "offline_fixture"
+    toi_orig_utc = None
+    toi_retrieval_utc = datetime.now(timezone.utc).isoformat()
+    toi_query = (
+        "select tid, toi, pl_tranmid, pl_tranmiderr1, pl_tranmiderr2, pl_orbper, "
+        "pl_orbpererr1, pl_orbpererr2, pl_trandurh, pl_trandurherr1, pl_trandurherr2, "
+        "pl_trandep, pl_trandeperr1, pl_trandeperr2, tfopwg_disp from toi"
+    )
+    toi_url_or_src = "offline_fixture" if "nasa_toi" in fixtures else "https://exoplanetarchive.ipac.caltech.edu/TAP/sync?query=" + urllib.parse.quote(toi_query) + "&format=csv"
+
+    if "nasa_toi" in fixtures:
+        raw_fix = fixtures["nasa_toi"]
+        try:
+            df_toi, toi_sha, toi_hash_kind, toi_src_path, toi_orig_utc = _extract_source_input(raw_fix, "nasa_toi", toi_url_or_src)
+        except Exception as exc:
+            registry.record_source_attempt("nasa_toi", status="FAILED", error_message=f"Failed to parse fixture: {exc}", provider="NASA Exoplanet Archive", query_or_url=toi_url_or_src)
+    elif allow_network:
+        try:
+            df_toi = fetch_csv_with_headers(toi_url_or_src)
+            toi_src_path = toi_url_or_src
+        except Exception as e:
+            write_log(f"      [!] Warning: Could not load TOI ephemeris table (using cache): {e}")
+            registry.record_source_attempt("nasa_toi", status="FAILED", error_message=str(e), provider="NASA Exoplanet Archive", query_or_url=toi_url_or_src)
+    else:
+        if "nasa_toi" not in registry.source_snapshots:
+            registry.record_source_attempt("nasa_toi", status="UNAVAILABLE", error_message="Offline mode and no fixture provided", provider="NASA Exoplanet Archive", query_or_url=toi_url_or_src)
+
+    if df_toi is not None and not df_toi.empty:
+        signals_toi, snap_toi = known_signals.ingest_nasa_toi_df(
+            df_toi,
+            query_or_url=toi_url_or_src,
+            retrieval_utc=toi_retrieval_utc,
+            raw_payload_sha256=toi_sha,
+            payload_hash_kind=toi_hash_kind,
+            raw_source_path_or_url=toi_src_path,
+            original_retrieval_utc=toi_orig_utc,
         )
-        toi_url = "https://exoplanetarchive.ipac.caltech.edu/TAP/sync?query=" + urllib.parse.quote(toi_query) + "&format=csv"
-        df_toi = fetch_csv_with_headers(toi_url)
-        
-        toi_ephem_fresh = {}
-        for _, row in df_toi.iterrows():
-            try:
-                tid_str = str(int(row["tid"]))
-                tmid = float(row["pl_tranmid"])
-                t0_btjd = tmid - 2457000.0 if tmid > 2400000.0 else tmid
-                per = float(row["pl_orbper"])
-                dur = float(row["pl_trandurh"]) / 24.0 if pd.notna(row["pl_trandurh"]) else 0.08
-                dep = float(row["pl_trandep"]) if pd.notna(row["pl_trandep"]) else np.nan
-                disp = str(row["tfopwg_disp"]) if pd.notna(row["tfopwg_disp"]) else "PC"
-                
-                if tid_str not in toi_ephem_fresh:
-                    toi_ephem_fresh[tid_str] = []
-                toi_ephem_fresh[tid_str].append({
-                    "toi": str(row["toi"]),
-                    "period": per,
-                    "t0": t0_btjd,
-                    "duration": dur,
-                    "depth_ppm": dep,
-                    "disp": disp
-                })
-                known_catalog_tics.add(tid_str)
-            except Exception:
-                continue
+        _apply_source_or_preserve("nasa_toi", signals_toi, snap_toi, len(df_toi), "TOI planet")
+    elif df_toi is not None and df_toi.empty:
+        registry.record_source_attempt("nasa_toi", status="INCOMPLETE", error_message="Empty TOI response/fixture", provider="NASA Exoplanet Archive", query_or_url=toi_url_or_src)
 
-        if toi_ephem_fresh:
-            toi_ephemerides = toi_ephem_fresh
-            GLOBAL_TOI_EPHEMERIDES = toi_ephemerides
-            try:
-                with open(TOI_EPHEMERIS_CACHE_FILE, "w", encoding="utf-8") as f:
-                    json.dump(toi_ephemerides, f)
-            except Exception:
-                pass
-        write_log(f"      -> Loaded {len(df_toi)} TOI planet entries across {len(toi_ephemerides)} unique host stars.")
-    except Exception as e:
-        write_log(f"      [!] Warning: Could not load TOI ephemeris table (using cache): {e}")
-
+    # [2/5] NASA Confirmed (pscomppars)
     write_log("[2/5] Fetching confirmed exoplanets (pscomppars) from NASA Exoplanet Archive...")
-    try:
-        ps_url = "https://exoplanetarchive.ipac.caltech.edu/TAP/sync?query=select+distinct+tic_id+from+pscomppars+where+tic_id+is+not+null&format=csv"
-        df_ps = fetch_csv_with_headers(ps_url)
-        ps_tics = set(
-            str(val).replace("TIC", "").strip().lstrip("0")
-            for val in df_ps["tic_id"].dropna()
-            if str(val).replace("TIC", "").strip().isdigit()
+    df_ps = None
+    ps_sha = None
+    ps_hash_kind = "dataframe_serialization"
+    ps_src_path = "offline_fixture"
+    ps_orig_utc = None
+    ps_retrieval_utc = datetime.now(timezone.utc).isoformat()
+    ps_query = (
+        "select tic_id, pl_name, hostname, discoverymethod, pl_orbper, pl_orbpererr1, pl_orbpererr2, "
+        "pl_tranmid, pl_tranmiderr1, pl_tranmiderr2, pl_trandur, pl_trandurerr1, pl_trandurerr2, "
+        "pl_trandep, pl_trandeperr1, pl_trandeperr2 from pscomppars where tic_id is not null"
+    )
+    ps_url_or_src = "offline_fixture" if "nasa_confirmed" in fixtures else "https://exoplanetarchive.ipac.caltech.edu/TAP/sync?query=" + urllib.parse.quote(ps_query) + "&format=csv"
+
+    if "nasa_confirmed" in fixtures:
+        raw_fix = fixtures["nasa_confirmed"]
+        try:
+            df_ps, ps_sha, ps_hash_kind, ps_src_path, ps_orig_utc = _extract_source_input(raw_fix, "nasa_confirmed", ps_url_or_src)
+        except Exception as exc:
+            registry.record_source_attempt("nasa_confirmed", status="FAILED", error_message=f"Failed to parse fixture: {exc}", provider="NASA Exoplanet Archive", query_or_url=ps_url_or_src)
+    elif allow_network:
+        try:
+            df_ps = fetch_csv_with_headers(ps_url_or_src)
+            ps_src_path = ps_url_or_src
+        except Exception as e:
+            write_log(f"      [!] Warning: Could not load confirmed planets table (using cache): {e}")
+            registry.record_source_attempt("nasa_confirmed", status="FAILED", error_message=str(e), provider="NASA Exoplanet Archive", query_or_url=ps_url_or_src)
+    else:
+        if "nasa_confirmed" not in registry.source_snapshots:
+            registry.record_source_attempt("nasa_confirmed", status="UNAVAILABLE", error_message="Offline mode and no fixture provided", provider="NASA Exoplanet Archive", query_or_url=ps_url_or_src)
+
+    if df_ps is not None and not df_ps.empty:
+        signals_ps, snap_ps = known_signals.ingest_nasa_confirmed_df(
+            df_ps,
+            query_or_url=ps_url_or_src,
+            retrieval_utc=ps_retrieval_utc,
+            raw_payload_sha256=ps_sha,
+            payload_hash_kind=ps_hash_kind,
+            raw_source_path_or_url=ps_src_path,
+            original_retrieval_utc=ps_orig_utc,
         )
-        known_catalog_tics.update(ps_tics)
-        write_log(f"      -> Loaded {len(ps_tics)} confirmed planet host stars.")
-    except Exception as e:
-        write_log(f"      [!] Warning: Could not load confirmed planets table (using cache): {e}")
+        _apply_source_or_preserve("nasa_confirmed", signals_ps, snap_ps, len(signals_ps), "confirmed planet")
+    elif df_ps is not None and df_ps.empty:
+        registry.record_source_attempt("nasa_confirmed", status="INCOMPLETE", error_message="Empty confirmed planets response/fixture", provider="NASA Exoplanet Archive", query_or_url=ps_url_or_src)
 
+    # [3/5] ExoFOP CTOI
     write_log("[3/5] Fetching Community TOI (CTOI) catalog from ExoFOP-TESS...")
-    try:
-        ctoi_url = "https://exofop.ipac.caltech.edu/tess/download_ctoi.php?sort=ctoi&output=csv"
-        df_ctoi = fetch_csv_with_headers(ctoi_url)
-        tic_col = next((c for c in df_ctoi.columns if "tic" in c.lower()), None)
-        if tic_col:
-            ctois = set(df_ctoi[tic_col].dropna().astype(int).astype(str))
-            known_catalog_tics.update(ctois)
-            write_log(f"      -> Loaded {len(ctois)} Community TOI (CTOI) targets.")
-    except Exception as e:
-        write_log(f"      [!] Warning: Could not load ExoFOP CTOI table (using cache): {e}")
+    df_ctoi = None
+    ctoi_sha = None
+    ctoi_hash_kind = "dataframe_serialization"
+    ctoi_src_path = "offline_fixture"
+    ctoi_orig_utc = None
+    ctoi_retrieval_utc = datetime.now(timezone.utc).isoformat()
+    ctoi_url_or_src = "offline_fixture" if "exofop_ctoi" in fixtures else "https://exofop.ipac.caltech.edu/tess/download_ctoi.php?sort=ctoi&output=csv"
 
+    if "exofop_ctoi" in fixtures:
+        raw_fix = fixtures["exofop_ctoi"]
+        try:
+            df_ctoi, ctoi_sha, ctoi_hash_kind, ctoi_src_path, ctoi_orig_utc = _extract_source_input(raw_fix, "exofop_ctoi", ctoi_url_or_src)
+        except Exception as exc:
+            registry.record_source_attempt("exofop_ctoi", status="FAILED", error_message=f"Failed to parse fixture: {exc}", provider="ExoFOP-TESS", query_or_url=ctoi_url_or_src)
+    elif allow_network:
+        try:
+            df_ctoi = fetch_csv_with_headers(ctoi_url_or_src)
+            ctoi_src_path = ctoi_url_or_src
+        except Exception as e:
+            write_log(f"      [!] Warning: Could not load ExoFOP CTOI table (using cache): {e}")
+            registry.record_source_attempt("exofop_ctoi", status="FAILED", error_message=str(e), provider="ExoFOP-TESS", query_or_url=ctoi_url_or_src)
+    else:
+        if "exofop_ctoi" not in registry.source_snapshots:
+            registry.record_source_attempt("exofop_ctoi", status="UNAVAILABLE", error_message="Offline mode and no fixture provided", provider="ExoFOP-TESS", query_or_url=ctoi_url_or_src)
+
+    if df_ctoi is not None and not df_ctoi.empty:
+        signals_ctoi, snap_ctoi = known_signals.ingest_exofop_ctoi_df(
+            df_ctoi,
+            query_or_url=ctoi_url_or_src,
+            retrieval_utc=ctoi_retrieval_utc,
+            raw_payload_sha256=ctoi_sha,
+            payload_hash_kind=ctoi_hash_kind,
+            raw_source_path_or_url=ctoi_src_path,
+            original_retrieval_utc=ctoi_orig_utc,
+        )
+        _apply_source_or_preserve("exofop_ctoi", signals_ctoi, snap_ctoi, len(signals_ctoi), "Community TOI (CTOI)")
+    elif df_ctoi is not None and df_ctoi.empty:
+        registry.record_source_attempt("exofop_ctoi", status="INCOMPLETE", error_message="Empty CTOI response/fixture", provider="ExoFOP-TESS", query_or_url=ctoi_url_or_src)
+
+    # [4/5] VizieR TESS EB
     write_log("[4/5] Fetching TESS Eclipsing Binary Catalogue (Prša et al. 2022) from VizieR TAP...")
-    try:
-        adql_eb = 'SELECT distinct TIC FROM "J/ApJS/258/16/tess-ebs"'
-        eb_url = "https://tapvizier.cds.unistra.fr/TAPVizieR/tap/sync?REQUEST=doQuery&LANG=ADQL&FORMAT=csv&QUERY=" + urllib.parse.quote(adql_eb)
-        df_eb = fetch_csv_with_headers(eb_url)
-        eb_tics = set(df_eb["TIC"].dropna().astype(int).astype(str))
-        known_eb_tics.update(eb_tics)
-        known_catalog_tics.update(eb_tics)
-        write_log(f"      -> Loaded {len(eb_tics)} cataloged TESS Eclipsing Binary (EB) stars.")
-    except Exception as e:
-        write_log(f"      [!] Warning: Could not load VizieR TESS EB table (using cache): {e}")
+    df_eb = None
+    eb_sha = None
+    eb_hash_kind = "dataframe_serialization"
+    eb_src_path = "offline_fixture"
+    eb_orig_utc = None
+    eb_retrieval_utc = datetime.now(timezone.utc).isoformat()
+    adql_eb = 'SELECT distinct TIC FROM "J/ApJS/258/16/tess-ebs"'
+    eb_url_or_src = "offline_fixture" if "vizier_tess_eb" in fixtures else "https://tapvizier.cds.unistra.fr/TAPVizieR/tap/sync?REQUEST=doQuery&LANG=ADQL&FORMAT=csv&QUERY=" + urllib.parse.quote(adql_eb)
+
+    if "vizier_tess_eb" in fixtures:
+        raw_fix = fixtures["vizier_tess_eb"]
+        try:
+            df_eb, eb_sha, eb_hash_kind, eb_src_path, eb_orig_utc = _extract_source_input(raw_fix, "vizier_tess_eb", eb_url_or_src)
+        except Exception as exc:
+            registry.record_source_attempt("vizier_tess_eb", status="FAILED", error_message=f"Failed to parse fixture: {exc}", provider="VizieR TAP (Prsa et al. 2022)", query_or_url=eb_url_or_src)
+    elif allow_network:
+        try:
+            df_eb = fetch_csv_with_headers(eb_url_or_src)
+            eb_src_path = eb_url_or_src
+        except Exception as e:
+            write_log(f"      [!] Warning: Could not load VizieR TESS EB table (using cache): {e}")
+            registry.record_source_attempt("vizier_tess_eb", status="FAILED", error_message=str(e), provider="VizieR TAP (Prsa et al. 2022)", query_or_url=eb_url_or_src)
+    else:
+        if "vizier_tess_eb" not in registry.source_snapshots:
+            registry.record_source_attempt("vizier_tess_eb", status="UNAVAILABLE", error_message="Offline mode and no fixture provided", provider="VizieR TAP (Prsa et al. 2022)", query_or_url=eb_url_or_src)
+
+    if df_eb is not None and not df_eb.empty:
+        signals_eb, snap_eb = known_signals.ingest_vizier_eb_df(
+            df_eb,
+            query_or_url=eb_url_or_src,
+            retrieval_utc=eb_retrieval_utc,
+            raw_payload_sha256=eb_sha,
+            payload_hash_kind=eb_hash_kind,
+            raw_source_path_or_url=eb_src_path,
+            original_retrieval_utc=eb_orig_utc,
+        )
+        _apply_source_or_preserve("vizier_tess_eb", signals_eb, snap_eb, len(signals_eb), "TESS Eclipsing Binary (EB)")
+    elif df_eb is not None and df_eb.empty:
+        registry.record_source_attempt("vizier_tess_eb", status="INCOMPLETE", error_message="Empty VizieR EB response/fixture", provider="VizieR TAP (Prsa et al. 2022)", query_or_url=eb_url_or_src)
+
+    GLOBAL_KNOWN_SIGNALS_REGISTRY = registry
+
+    # Synchronize legacy active return structures
+    if "nasa_toi" in registry.source_snapshots and registry.source_snapshots["nasa_toi"].status in ("SUCCESS", "CACHED"):
+        toi_ephem_export = registry.export_legacy_toi_ephemerides()
+        toi_ephemerides = toi_ephem_export
+        GLOBAL_TOI_EPHEMERIDES = dict(toi_ephemerides)
+        try:
+            with open(TOI_EPHEMERIS_CACHE_FILE, "w", encoding="utf-8") as f:
+                json.dump(toi_ephemerides, f)
+        except Exception:
+            pass
+
+    known_catalog_tics.update(registry.export_legacy_catalog_tics())
+    known_eb_tics.update(registry.export_legacy_eb_tics())
+
+    if registry.total_signals() > 0 or len(registry.source_snapshots) > 0:
+        try:
+            registry.save_to_json(KNOWN_SIGNALS_REGISTRY_CACHE_FILE)
+        except Exception as exc:
+            registry.persistence_status = "FAILED"
+            registry.persistence_error = str(exc)
+            write_log(f"      [!] Warning: Could not persist known_signals_registry to cache: {exc}")
 
     if known_catalog_tics:
         try:
@@ -267,6 +787,42 @@ def load_known_catalogs_and_toi_ephemerides() -> tuple:
             pass
 
     return known_catalog_tics, known_eb_tics, toi_ephemerides
+
+
+def get_known_signals_registry():
+    """
+    Retrieves the canonical KnownSignalsRegistry instance, loading from cache if uninitialized.
+    Returns None or KnownSignalsRegistry.
+    """
+    global GLOBAL_KNOWN_SIGNALS_REGISTRY
+    if GLOBAL_KNOWN_SIGNALS_REGISTRY is not None:
+        return GLOBAL_KNOWN_SIGNALS_REGISTRY
+    if os.path.exists(KNOWN_SIGNALS_REGISTRY_CACHE_FILE):
+        try:
+            GLOBAL_KNOWN_SIGNALS_REGISTRY = known_signals.KnownSignalsRegistry.load_from_json(
+                KNOWN_SIGNALS_REGISTRY_CACHE_FILE, mark_as_cached=True
+            )
+            return GLOBAL_KNOWN_SIGNALS_REGISTRY
+        except Exception as exc:
+            logger.warning("Failed to load known_signals_registry from cache %s: %s", KNOWN_SIGNALS_REGISTRY_CACHE_FILE, exc)
+    return None
+
+
+def get_known_signal_context_for_tic(tic_id: str):
+    """
+    Retrieves structured HostCatalogContext for a target star from the canonical registry.
+    Distinguishes star with no signals in complete coverage from unavailable coverage.
+    """
+    reg = get_known_signals_registry()
+    if reg is not None:
+        return reg.get_host_context(tic_id)
+    return known_signals.HostCatalogContext(
+        tic_id=str(tic_id),
+        signals=[],
+        source_statuses={src: "UNAVAILABLE" for src in known_signals.CANONICAL_SOURCES},
+        coverage_status="UNAVAILABLE",
+        registry_available=False,
+    )
 
 
 def get_known_transits_for_tic(tic_id: str) -> list:
@@ -287,6 +843,9 @@ def get_known_transits_for_tic(tic_id: str) -> list:
 
 def get_known_exoplanet_tics() -> set:
     """Legacy compatibility helper."""
+    reg = get_known_signals_registry()
+    if reg is not None and reg.total_signals() > 0:
+        return reg.export_legacy_catalog_tics()
     known_cats, _, _ = load_known_catalogs_and_toi_ephemerides()
     return known_cats
 
@@ -563,6 +1122,8 @@ def scan_full_orbit_secondary_eclipse(
     box of width 0.85 * dur to detect eccentric secondary eclipses (e > 0.1).
     Applies Sidak-Bonferroni trials-factor correction for alpha = 0.001 false-alarm rate.
     Returns: (is_eb_flag, max_sec_snr, max_sec_depth_ppm, best_sec_phase, z_crit_threshold)
+    Note: z_crit is the eccentric trials-factor threshold and is retained in the return tuple
+    even when the circular branch is selected. When circular is selected, best_sec_phase is 0.50.
     """
     phase_0to1 = ((t - t0) % period) / period
     dur_phase = dur / period
@@ -623,16 +1184,21 @@ def scan_full_orbit_secondary_eclipse(
     # Eccentric zone (|phi - 0.50| > 0.04): N independent trials -> Sidak-Bonferroni z_crit
     ecc_eb = (ecc_max_snr > z_crit) and (ecc_max_depth > 100.0) and (ecc_max_depth >= 0.10 * primary_depth_ppm)
     
-    if circ_eb and (circ_max_snr >= ecc_max_snr):
+    # ALD-013: Independent circular and eccentric qualifying branches (logical OR).
+    # Selection occurs only among qualifying branches. A nonqualifying raw peak in one
+    # zone must not suppress an independently qualifying peak in the other zone.
+    if circ_eb and ecc_eb:
         is_eb = True
-        max_snr = circ_max_snr
-        max_depth_ppm = circ_max_depth
-        best_phi = 0.50
+        if circ_max_snr >= ecc_max_snr:
+            max_snr, max_depth_ppm, best_phi = circ_max_snr, circ_max_depth, 0.50
+        else:
+            max_snr, max_depth_ppm, best_phi = ecc_max_snr, ecc_max_depth, ecc_best_phi
+    elif circ_eb:
+        is_eb = True
+        max_snr, max_depth_ppm, best_phi = circ_max_snr, circ_max_depth, 0.50
     elif ecc_eb:
         is_eb = True
-        max_snr = ecc_max_snr
-        max_depth_ppm = ecc_max_depth
-        best_phi = ecc_best_phi
+        max_snr, max_depth_ppm, best_phi = ecc_max_snr, ecc_max_depth, ecc_best_phi
     else:
         is_eb = False
         if circ_max_snr > ecc_max_snr:
@@ -859,101 +1425,230 @@ def verify_multi_epoch(
     depth_ppm_curr: float,
     sde_curr: float
 ) -> tuple:
+    products_requested = []
+    sectors_requested = []
+    products_attempted = []
+    sectors_attempted = []
+    products_used = []
+    sectors_used = []
+    products_failed = []
+
+    # Stage 0: Archival search query
     try:
         all_search = lk.search_lightcurve(f"TIC {tic_id}", mission="TESS", author="SPOC", exptime=120)
-        prior_indices = []
-        prior_sec_nums = []
-        
-        for i, row in enumerate(all_search):
-            sec_num = int(str(row.mission[0]).split()[-1])
-            if sec_num != current_sector:
-                prior_indices.append(i)
-                prior_sec_nums.append(sec_num)
-                
-        if len(prior_indices) == 0:
-            if sde_curr < 6.5:
-                return False, f"Single-sector only and borderline SDE ({sde_curr:.1f} < 6.5)", None
-            return True, "Single-Sector_Only", {
-                "n_archival_sectors": 0,
-                "archival_sectors_str": "None",
-                "refined_p": best_p,
-                "refined_t0": best_t0,
-                "archival_snr": np.nan,
-                "est_multi_sde_proxy": sde_curr,
-                "multi_sde": sde_curr,
-                "arch_bin_centers": None,
-                "arch_bin_means": None,
-                "n_trials": 1,
-                "snr_crit": 2.4,
-                "is_projected_strict": True,
-                "delta_t_arch_days": 0.0,
-                "sigma_p_sec": np.nan
-            }
-            
-        chosen_idx = prior_indices[-3:]
-        chosen_secs = prior_sec_nums[-3:]
-        
-        t_raw_list, f_raw_list, ferr_raw_list, f_init_list = [], [], [], []
-        for idx in chosen_idx:
-            try:
-                lc_p = safe_download(all_search[idx], tic_id, download_all=False)
-                tp, fp, ferrp, _, _, _ = extract_and_stitch_arrays([lc_p], edge_trim_days=0.10)
-                tp_c, fp_c, ferrp_c = clip_upper_outliers(tp, fp, ferrp)
-                tr_init = piecewise_savgol_detrend(tp_c, fp_c, mask=None, max_win=601)
-                t_raw_list.append(tp_c)
-                f_raw_list.append(fp_c)
-                ferr_raw_list.append(ferrp_c / tr_init)
-                f_init_list.append(fp_c / tr_init)
-            except Exception:
-                continue
-                
-        if not t_raw_list:
-            if sde_curr < 6.5:
-                return False, "Archival sectors unreadable and SDE < 6.5", None
-            return True, "Single-Sector_Only (Archival Download Failed)", {
-                "n_archival_sectors": 0,
-                "archival_sectors_str": "None",
-                "refined_p": best_p,
-                "refined_t0": best_t0,
-                "archival_snr": np.nan,
-                "est_multi_sde_proxy": sde_curr,
-                "multi_sde": sde_curr,
-                "arch_bin_centers": None,
-                "arch_bin_means": None,
-                "n_trials": 1,
-                "snr_crit": 2.4,
-                "is_projected_strict": True,
-                "delta_t_arch_days": 0.0,
-                "sigma_p_sec": np.nan
-            }
-            
+    except Exception as exc:
+        logger.warning("Archival search query failed for TIC %s (%s)", tic_id, exc)
+        products_failed.append({
+            "product_id": "UNAVAILABLE",
+            "sector": int(current_sector),
+            "stage": "QUERY",
+            "reason": f"{type(exc).__name__}: {str(exc)}"[:150]
+        })
+        diag_info = {
+            "n_archival_sectors": 0,
+            "archival_sectors_str": "None",
+            "refined_p": np.nan,
+            "refined_t0": np.nan,
+            "archival_snr": np.nan,
+            "est_multi_sde_proxy": float(sde_curr),
+            "multi_sde": float(sde_curr),
+            "arch_bin_centers": None,
+            "arch_bin_means": None,
+            "n_trials": 1,
+            "snr_crit": 2.4,
+            "is_projected_strict": True,
+            "delta_t_arch_days": 0.0,
+            "sigma_p_sec": np.nan,
+            "sigma_t0_sec": np.nan,
+            "archival_sectors_requested": [],
+            "archival_sectors_attempted": [],
+            "archival_sectors_used": [],
+            "archival_products_requested": [],
+            "archival_products_attempted": [],
+            "archival_products_used": [],
+            "archival_products_failed": products_failed,
+            "ephemeris_source": "DISCOVERY_SINGLE_SECTOR",
+            "ephemeris_status": "FALLBACK_DISCOVERY",
+            "ephemeris_fallback_reason": f"ARCHIVAL_QUERY_FAILED: {type(exc).__name__}"
+        }
+        if sde_curr < 6.5:
+            return False, f"Archival lookup failed ({type(exc).__name__}) and single-sector SDE < 6.5", diag_info
+        return True, "Single-Sector_Only (Archival Query Error)", diag_info
+
+    prior_indices = []
+    prior_sec_nums = []
+    for i, row in enumerate(all_search):
+        try:
+            mission_val = row.mission[0] if isinstance(row.mission, (list, tuple, np.ndarray)) else row.mission
+            sec_num = int(str(mission_val).split()[-1])
+        except Exception:
+            sec_num = -1
+        if sec_num != current_sector and sec_num > 0:
+            prior_indices.append(i)
+            prior_sec_nums.append(sec_num)
+
+    if len(prior_indices) == 0:
+        diag_no_prior = {
+            "n_archival_sectors": 0,
+            "archival_sectors_str": "None",
+            "refined_p": np.nan,
+            "refined_t0": np.nan,
+            "archival_snr": np.nan,
+            "est_multi_sde_proxy": float(sde_curr),
+            "multi_sde": float(sde_curr),
+            "arch_bin_centers": None,
+            "arch_bin_means": None,
+            "n_trials": 1,
+            "snr_crit": 2.4,
+            "is_projected_strict": True,
+            "delta_t_arch_days": 0.0,
+            "sigma_p_sec": np.nan,
+            "sigma_t0_sec": np.nan,
+            "archival_sectors_requested": [],
+            "archival_sectors_attempted": [],
+            "archival_sectors_used": [],
+            "archival_products_requested": [],
+            "archival_products_attempted": [],
+            "archival_products_used": [],
+            "archival_products_failed": [],
+            "ephemeris_source": "DISCOVERY_SINGLE_SECTOR",
+            "ephemeris_status": "FALLBACK_DISCOVERY",
+            "ephemeris_fallback_reason": "SINGLE_SECTOR_ONLY_NO_PRIOR"
+        }
+        if sde_curr < 6.5:
+            return False, f"Single-sector only and borderline SDE ({sde_curr:.1f} < 6.5)", diag_no_prior
+        return True, "Single-Sector_Only", diag_no_prior
+
+    chosen_idx = prior_indices[-3:]
+    chosen_secs = [prior_sec_nums[i] for i, idx in enumerate(prior_indices) if idx in chosen_idx]
+
+    products_requested = [_get_stable_product_id(all_search[idx], sec, idx) for idx, sec in zip(chosen_idx, chosen_secs)]
+    sectors_requested = sorted(list(dict.fromkeys(chosen_secs)))
+
+    t_raw_list, f_raw_list, ferr_raw_list, f_init_list = [], [], [], []
+    for idx, sec_num in zip(chosen_idx, chosen_secs):
+        pid = _get_stable_product_id(all_search[idx], sec_num, idx)
+        products_attempted.append(pid)
+        if sec_num not in sectors_attempted:
+            sectors_attempted.append(sec_num)
+        stage = "DOWNLOAD"
+        try:
+            lc_p = safe_download(all_search[idx], tic_id, download_all=False)
+            if lc_p is None:
+                raise ValueError("safe_download returned None")
+
+            stage = "EXTRACTION"
+            tp, fp, ferrp, _, _, _ = extract_and_stitch_arrays([lc_p], edge_trim_days=0.10)
+            if tp is None or len(tp) == 0:
+                raise ValueError("Extracted arrays empty or None")
+            if np.any(~np.isfinite(tp)) or np.any(~np.isfinite(fp)) or np.any(~np.isfinite(ferrp)):
+                raise ValueError("Extracted arrays contain non-finite values")
+
+            stage = "CLIPPING"
+            tp_c, fp_c, ferrp_c = clip_upper_outliers(tp, fp, ferrp)
+            if tp_c is None or len(tp_c) == 0:
+                raise ValueError("Empty arrays after outlier clipping")
+
+            stage = "DETRENDING"
+            tr_init = piecewise_savgol_detrend(tp_c, fp_c, mask=None, max_win=601)
+            if tr_init is None or len(tr_init) != len(tp_c):
+                raise ValueError("Detrending returned invalid trend")
+            if np.any(~np.isfinite(tr_init)) or np.any(tr_init <= 0):
+                raise ValueError("Trend contains non-finite or non-positive values")
+
+            norm_f = fp_c / tr_init
+            norm_ferr = ferrp_c / tr_init
+            if np.any(~np.isfinite(norm_f)) or np.any(~np.isfinite(norm_ferr)):
+                raise ValueError("Normalized flux or error contains non-finite values")
+
+            t_raw_list.append(tp_c)
+            f_raw_list.append(fp_c)
+            ferr_raw_list.append(norm_ferr)
+            f_init_list.append(norm_f)
+            products_used.append(pid)
+            sectors_used.append(sec_num)
+        except Exception as exc:
+            products_failed.append({
+                "product_id": pid,
+                "sector": int(sec_num),
+                "stage": stage,
+                "reason": f"{type(exc).__name__}: {str(exc)}"[:150]
+            })
+            continue
+
+    if not t_raw_list:
+        diag_all_failed = {
+            "n_archival_sectors": 0,
+            "archival_sectors_str": "None",
+            "refined_p": np.nan,
+            "refined_t0": np.nan,
+            "archival_snr": np.nan,
+            "est_multi_sde_proxy": float(sde_curr),
+            "multi_sde": float(sde_curr),
+            "arch_bin_centers": None,
+            "arch_bin_means": None,
+            "n_trials": 1,
+            "snr_crit": 2.4,
+            "is_projected_strict": True,
+            "delta_t_arch_days": 0.0,
+            "sigma_p_sec": np.nan,
+            "sigma_t0_sec": np.nan,
+            "archival_sectors_requested": sectors_requested,
+            "archival_sectors_attempted": sorted(list(dict.fromkeys(sectors_attempted))),
+            "archival_sectors_used": [],
+            "archival_products_requested": products_requested,
+            "archival_products_attempted": products_attempted,
+            "archival_products_used": [],
+            "archival_products_failed": products_failed,
+            "ephemeris_source": "DISCOVERY_SINGLE_SECTOR",
+            "ephemeris_status": "FALLBACK_DISCOVERY",
+            "ephemeris_fallback_reason": "ARCHIVAL_DOWNLOAD_OR_PREPARATION_FAILED"
+        }
+        if sde_curr < 6.5:
+            return False, "Archival sectors unreadable and SDE < 6.5", diag_all_failed
+        return True, "Single-Sector_Only (Archival Download Failed)", diag_all_failed
+
+    unique_secs_used = sorted(list(dict.fromkeys(sectors_used)))
+    n_used_secs = len(unique_secs_used)
+    used_secs_str = ",".join(str(s) for s in unique_secs_used)
+
+    # Stage 5: Combined multi-sector concatenation, detrending, refinement, and evaluation
+    try:
+        comb_stage = "CONCATENATION"
         t_prior = np.concatenate(t_raw_list)
         f_prior_raw = np.concatenate(f_raw_list)
         f_prior_init = np.concatenate(f_init_list)
         ferr_prior = np.concatenate(ferr_raw_list)
-        
+
         t_comb = np.concatenate([t_prior, t_curr])
         f_comb = np.concatenate([f_prior_init, flat_f_curr])
         ferr_comb = np.concatenate([ferr_prior, flat_ferr_curr])
         sort_c = np.argsort(t_comb)
         t_comb, f_comb, ferr_comb = t_comb[sort_c], f_comb[sort_c], ferr_comb[sort_c]
-        
+
+        comb_stage = "TIMING_UNCERTAINTY"
         delta_t_arch = abs(float(np.median(t_curr) - np.median(t_prior)))
         baseline_curr = float(np.max(t_curr) - np.min(t_curr))
 
-        # Goal 3: Cramer-Rao Fisher timing uncertainty from discovery sector (Carter et al. 2008)
+        # Cramer-Rao Fisher timing uncertainty from discovery sector (Carter et al. 2008)
         sigma_t0 = (0.5 * best_dur) / max(sde_curr, 5.0)
         n_cyc_disc = max(1.0, baseline_curr / best_p)
         sigma_p = np.sqrt(12.0) * sigma_t0 / n_cyc_disc
 
         if delta_t_arch <= 60.0:
+            comb_stage = "PROJECTION"
             # Contiguous or near-contiguous sectors: strict zero-freedom forward projection (N_trials = 1)
-            refined_p = best_p
-            refined_t0 = best_t0
+            # Refined ephemeris fit not performed; unused refinement is np.nan
+            refined_p = np.nan
+            refined_t0 = np.nan
             n_trials = 1
             snr_crit = 2.4
             is_projected_strict = True
+            ephem_src = "DISCOVERY_SINGLE_SECTOR"
+            ephem_stat = "FALLBACK_DISCOVERY"
+            fallback_reas = "STRICT_PROJECTION_NEARBY_SECTOR"
         else:
+            comb_stage = "REFINEMENT"
             # Multi-year archival baseline: search strictly within Cramer-Rao 2-sigma corridor
             # with Sidak-Bonferroni trial penalty (eliminates circular overfitting of noise dips)
             p_hw = 2.0 * sigma_p
@@ -963,38 +1658,90 @@ def verify_multi_epoch(
             n_trials = max(1, int(np.ceil((2.0 * p_hw) / max(delta_p_indep, 1e-6))))
             snr_crit = max(2.8, float(np.sqrt(2.0 * np.log(max(n_trials, 2))) + 1.2))
             is_projected_strict = False
-            
+
             n_grid_pts = int(np.clip(n_trials * 4, 60, 4000))
             fine_periods = np.linspace(p_min, p_max, n_grid_pts)
             fine_durs = np.array([max(0.03, best_dur * 0.90), best_dur, min(0.22, best_dur * 1.10)])
-            
+
             bls_comb = BoxLeastSquares(t_comb, f_comb, dy=ferr_comb)
             res_comb = bls_comb.power(fine_periods, fine_durs)
             best_c_idx = int(np.nanargmax(res_comb.power))
-            refined_p = float(res_comb.period[best_c_idx])
-            refined_t0 = float(res_comb.transit_time[best_c_idx])
-            
-        phase_prior = ((t_prior - refined_t0 + 0.5 * refined_p) % refined_p) - 0.5 * refined_p
+            cand_refined_p = float(res_comb.period[best_c_idx])
+            cand_refined_t0 = float(res_comb.transit_time[best_c_idx])
+            if (
+                cand_refined_p is not None
+                and cand_refined_t0 is not None
+                and np.isfinite(cand_refined_p)
+                and cand_refined_p > 0
+                and np.isfinite(cand_refined_t0)
+            ):
+                refined_p = cand_refined_p
+                refined_t0 = cand_refined_t0
+                ephem_src = "REFINED_MULTI_SECTOR"
+                ephem_stat = "REFINED_VALID"
+                fallback_reas = "NONE"
+            else:
+                refined_p = np.nan
+                refined_t0 = np.nan
+                ephem_src = "DISCOVERY_SINGLE_SECTOR"
+                ephem_stat = "FALLBACK_DISCOVERY"
+                fallback_reas = "REFINED_EPHEMERIS_INVALID"
+
+        comb_stage = "DETRENDING"
+        eff_p = refined_p if (refined_p is not None and np.isfinite(refined_p)) else best_p
+        eff_t0 = refined_t0 if (refined_t0 is not None and np.isfinite(refined_t0)) else best_t0
+
+        phase_prior = ((t_prior - eff_t0 + 0.5 * eff_p) % eff_p) - 0.5 * eff_p
         tr_mask_prior = np.abs(phase_prior) < (0.6 * best_dur)
         trend_prior_ref = piecewise_savgol_detrend(t_prior, f_prior_raw, mask=tr_mask_prior, max_win=601)
         f_prior = f_prior_raw / trend_prior_ref
-        
+
+        comb_stage = "EVALUATION"
         in_tr_p = np.abs(phase_prior) < (0.45 * best_dur)
         out_tr_p = np.abs(phase_prior) > (0.65 * best_dur)
-        
+
+        base_diag = {
+            "n_archival_sectors": n_used_secs,
+            "archival_sectors_str": used_secs_str,
+            "refined_p": refined_p,
+            "refined_t0": refined_t0,
+            "archival_snr": np.nan,
+            "est_multi_sde_proxy": float(sde_curr),
+            "multi_sde": float(sde_curr),
+            "arch_bin_centers": None,
+            "arch_bin_means": None,
+            "n_trials": n_trials,
+            "snr_crit": snr_crit,
+            "is_projected_strict": is_projected_strict,
+            "delta_t_arch_days": delta_t_arch,
+            "sigma_p_sec": float(sigma_p * 86400.0),
+            "sigma_t0_sec": float(sigma_t0 * 86400.0),
+            "archival_sectors_requested": sectors_requested,
+            "archival_sectors_attempted": sorted(list(dict.fromkeys(sectors_attempted))),
+            "archival_sectors_used": unique_secs_used,
+            "archival_products_requested": products_requested,
+            "archival_products_attempted": products_attempted,
+            "archival_products_used": products_used,
+            "archival_products_failed": products_failed,
+            "ephemeris_source": ephem_src,
+            "ephemeris_status": ephem_stat,
+            "ephemeris_fallback_reason": fallback_reas
+        }
+
         if np.sum(in_tr_p) < 5:
-            return False, f"Insufficient archival in-transit points in sectors {chosen_secs}", None
-            
+            return False, f"Insufficient archival in-transit points in sectors {used_secs_str}", base_diag
+
         base_p = float(np.nanmedian(f_prior[out_tr_p]))
         depth_prior_ppm = float((base_p - np.nanmean(f_prior[in_tr_p])) * 1e6)
         err_prior_ppm = float(np.nanstd(f_prior[out_tr_p]) / np.sqrt(np.sum(in_tr_p)) * 1e6)
         archival_snr = depth_prior_ppm / max(err_prior_ppm, 1.0)
-        
+        base_diag["archival_snr"] = archival_snr
+
         # Control Phase Null Test: measure flux deficit at 8 off-transit control phases
         ctrl_phases = [0.15, 0.20, 0.25, 0.30, 0.70, 0.75, 0.80, 0.85]
         ctrl_snrs = []
         for cp in ctrl_phases:
-            in_cp = np.abs(phase_prior - cp * refined_p) < (0.45 * best_dur)
+            in_cp = np.abs(phase_prior - cp * eff_p) < (0.45 * best_dur)
             if np.sum(in_cp) >= 5:
                 cp_depth = float((base_p - np.nanmean(f_prior[in_cp])) * 1e6)
                 ctrl_snrs.append(cp_depth / max(err_prior_ppm, 1.0))
@@ -1003,94 +1750,146 @@ def verify_multi_epoch(
         if archival_snr < snr_crit or depth_prior_ppm < 0.25 * depth_ppm_curr:
             return (
                 False,
-                f"Archival non-detection in sectors {chosen_secs} (Prior Depth={depth_prior_ppm:.0f}ppm, SNR={archival_snr:.1f}sigma < crit={snr_crit:.1f}sigma, N_trials={n_trials}) -> Transient artifact",
-                None
+                f"Archival non-detection in sectors {used_secs_str} (Prior Depth={depth_prior_ppm:.0f}ppm, SNR={archival_snr:.1f}sigma < crit={snr_crit:.1f}sigma, N_trials={n_trials}) -> Transient artifact",
+                base_diag
             )
 
         if not is_projected_strict and (archival_snr < max_ctrl_snr + 1.5):
             return (
                 False,
-                f"Archival signal failed control phase null test in sectors {chosen_secs} (Transit SNR={archival_snr:.1f}sigma vs control peak {max_ctrl_snr:.1f}sigma) -> Red noise fluctuation",
-                None
+                f"Archival signal failed control phase null test in sectors {used_secs_str} (Transit SNR={archival_snr:.1f}sigma vs control peak {max_ctrl_snr:.1f}sigma) -> Red noise fluctuation",
+                base_diag
             )
-            
-        # Multi-sector secondary eclipse check on combined baseline (catches eccentric EBs with boosted multi-sector SNR)
+
+        # Multi-sector secondary eclipse check on combined baseline
         is_sec_eb, sec_snr, sec_depth_ppm, sec_phi, _ = scan_full_orbit_secondary_eclipse(
-            t_comb, f_comb, refined_p, refined_t0, best_dur, depth_prior_ppm
+            t_comb, f_comb, eff_p, eff_t0, best_dur, depth_prior_ppm
         )
         if is_sec_eb:
             return (
                 False,
-                f"Multi-sector secondary eclipse in sectors {chosen_secs} at phase {sec_phi:.2f} ({sec_depth_ppm:.0f}ppm, {sec_snr:.1f}sigma) -> Eccentric EB",
-                None
+                f"Multi-sector secondary eclipse in sectors {used_secs_str} at phase {sec_phi:.2f} ({sec_depth_ppm:.0f}ppm, {sec_snr:.1f}sigma) -> Eccentric EB",
+                base_diag
             )
-            
-        win_phase = min(0.15 * best_p, 3.0 * best_dur)
+
+        win_phase = min(0.15 * eff_p, 3.0 * best_dur)
         vis_p = np.abs(phase_prior) <= win_phase
         bins = np.linspace(-win_phase, win_phase, 41)
         arch_means, arch_edges, _ = stats.binned_statistic(phase_prior[vis_p], f_prior[vis_p], statistic="mean", bins=bins)
         arch_centers = 0.5 * (arch_edges[:-1] + arch_edges[1:])
-        
-        secs_str = ",".join(str(s) for s in chosen_secs)
-        proxy_sde = sde_curr * np.sqrt(1.0 + len(chosen_secs) * 0.5)
-        return True, f"Confirmed_in_Sectors_{secs_str}", {
-            "n_archival_sectors": len(chosen_secs),
-            "archival_sectors_str": secs_str,
-            "refined_p": refined_p,
-            "refined_t0": refined_t0,
-            "archival_snr": archival_snr,
+
+        proxy_sde = sde_curr * np.sqrt(1.0 + n_used_secs * 0.5)
+        base_diag.update({
             "est_multi_sde_proxy": proxy_sde,
             "multi_sde": proxy_sde,
             "arch_bin_centers": arch_centers,
             "arch_bin_means": arch_means,
-            "n_trials": n_trials,
-            "snr_crit": snr_crit,
-            "is_projected_strict": is_projected_strict,
-            "delta_t_arch_days": delta_t_arch,
-            "sigma_p_sec": float(sigma_p * 86400.0)
-        }
-    except Exception as e:
-        logger.warning("Archival verification error for TIC %s (%s)", tic_id, e)
-        if sde_curr < 6.5:
-            return False, f"Archival lookup failed ({type(e).__name__}) and single-sector SDE < 6.5", None
-        return True, "Single-Sector_Only (Archival Query Error)", {
-            "n_archival_sectors": 0,
-            "archival_sectors_str": "None",
-            "refined_p": best_p,
-            "refined_t0": best_t0,
+        })
+        return True, f"Confirmed_in_Sectors_{used_secs_str}", base_diag
+
+    except Exception as exc:
+        logger.warning("Archival %s error for TIC %s (%s)", comb_stage.lower(), tic_id, exc)
+        failed_stage = comb_stage
+        products_failed.append({
+            "product_id": "COMBINED_PIPELINE",
+            "sector": int(current_sector),
+            "stage": failed_stage,
+            "reason": f"{type(exc).__name__}: {str(exc)}"[:150]
+        })
+        diag_refine_failed = {
+            "n_archival_sectors": n_used_secs,
+            "archival_sectors_str": used_secs_str,
+            "refined_p": np.nan,
+            "refined_t0": np.nan,
             "archival_snr": np.nan,
-            "est_multi_sde_proxy": sde_curr,
-            "multi_sde": sde_curr,
+            "est_multi_sde_proxy": float(sde_curr),
+            "multi_sde": float(sde_curr),
             "arch_bin_centers": None,
             "arch_bin_means": None,
             "n_trials": 1,
             "snr_crit": 2.4,
             "is_projected_strict": True,
             "delta_t_arch_days": 0.0,
-            "sigma_p_sec": np.nan
+            "sigma_p_sec": np.nan,
+            "sigma_t0_sec": np.nan,
+            "archival_sectors_requested": sectors_requested,
+            "archival_sectors_attempted": sorted(list(dict.fromkeys(sectors_attempted))),
+            "archival_sectors_used": unique_secs_used,
+            "archival_products_requested": products_requested,
+            "archival_products_attempted": products_attempted,
+            "archival_products_used": products_used,
+            "archival_products_failed": products_failed,
+            "ephemeris_source": "DISCOVERY_SINGLE_SECTOR",
+            "ephemeris_status": "FALLBACK_DISCOVERY",
+            "ephemeris_fallback_reason": f"ARCHIVAL_{failed_stage}_FAILED: {type(exc).__name__}"
         }
+        if sde_curr < 6.5:
+            return False, f"Archival evaluation failed ({failed_stage}: {type(exc).__name__}) and single-sector SDE < 6.5", diag_refine_failed
+        return True, f"Single-Sector_Only (Archival {failed_stage.capitalize()} Error: {type(exc).__name__})", diag_refine_failed
 
 
-def analyze_single_target(tic_id: str, sector: int, min_period: float = 0.8, max_period: float = 13.0) -> tuple:
+def analyze_single_target(
+    tic_id: str,
+    sector: int,
+    min_period: float = 0.8,
+    max_period: float = 13.0,
+    run_id: str = None,
+    attempt_id: str = None
+) -> AnalysisResult:
     """
     Worker entrypoint. Guarantees the per-target FITS cache is purged on EVERY non-candidate
     exit path (early REJECT_CROWDSAP / REJECT_RUWE / ... returns previously skipped the purge,
     leaving ~65% of downloads on disk and overflowing scratch quotas on HPC nodes).
+    Returns an AnalysisResult tuple (tic_id, status_code, message, cand_data) bound to current
+    run_id and attempt_id, isolating archival vetting diagnostics to the current attempt.
     """
     result = None
+    if run_id is None:
+        run_id = CURRENT_RUN_ID
+    if attempt_id is None:
+        import uuid
+        attempt_id = f"att_{str(tic_id).lstrip('0')}_s{sector}_{uuid.uuid4().hex[:8]}"
     try:
-        result = _analyze_single_target_impl(tic_id, sector, min_period, max_period)
+        result = _analyze_single_target_impl(
+            tic_id, sector, min_period, max_period, run_id=run_id, attempt_id=attempt_id
+        )
         return result
     finally:
         if AUTO_PURGE_CACHE and (result is None or result[1] != "CANDIDATE"):
             purge_target_cache(tic_id)
 
 
-def _analyze_single_target_impl(tic_id: str, sector: int, min_period: float = 0.8, max_period: float = 13.0) -> tuple:
+def _analyze_single_target_impl(
+    tic_id: str,
+    sector: int,
+    min_period: float = 0.8,
+    max_period: float = 13.0,
+    run_id: str = None,
+    attempt_id: str = None
+) -> AnalysisResult:
+    if run_id is None:
+        run_id = CURRENT_RUN_ID
+    if attempt_id is None:
+        import uuid
+        attempt_id = f"att_{str(tic_id).lstrip('0')}_s{sector}_{uuid.uuid4().hex[:8]}"
+
+    attempt_diagnostics = []
+
+    def make_res(t_id, status_val, msg_val, cand_val=None):
+        return AnalysisResult(
+            t_id,
+            status_val,
+            msg_val,
+            cand_val,
+            run_id=run_id,
+            attempt_id=attempt_id,
+            archival_diagnostics=attempt_diagnostics
+        )
+
     try:
         search_res = lk.search_lightcurve(f"TIC {tic_id}", mission="TESS", author="SPOC", sector=sector, exptime=120)
         if len(search_res) == 0:
-            return tic_id, "SKIP_NO_DATA", "SKIP: No SPOC data in target sector", None
+            return make_res(tic_id, "SKIP_NO_DATA", "SKIP: No SPOC data in target sector", None)
         last_sector = sector
         lc_collection = [safe_download(search_res[0], tic_id, download_all=False)]
             
@@ -1098,7 +1897,7 @@ def _analyze_single_target_impl(tic_id: str, sector: int, min_period: float = 0.
         
         # Filter 0: SPOC Aperture Crowding Metric (CROWDSAP)
         if crowdsap < 0.70:
-            return tic_id, "REJECT_CROWDSAP", f"REJECT: Severe aperture crowding (CROWDSAP={crowdsap:.2f} < 0.70) -> Blended field", None
+            return make_res(tic_id, "REJECT_CROWDSAP", f"REJECT: Severe aperture crowding (CROWDSAP={crowdsap:.2f} < 0.70) -> Blended field", None)
             
         med_f = np.median(f)
         mad_std = 1.4826 * np.median(np.abs(f - med_f))
@@ -1119,7 +1918,7 @@ def _analyze_single_target_impl(tic_id: str, sector: int, min_period: float = 0.
                 in_known_transit |= (np.abs(phk) <= (1.0 * durk))
             mask_frac = float(np.mean(in_known_transit))
             if mask_frac > 0.40:
-                return tic_id, "REJECT_TOI_MASK_TOO_LARGE", f"REJECT: Known TOI transits cover > 40% of light curve ({mask_frac*100:.1f}%)", None
+                return make_res(tic_id, "REJECT_TOI_MASK_TOO_LARGE", f"REJECT: Known TOI transits cover > 40% of light curve ({mask_frac*100:.1f}%)", None)
 
         if is_toi_host and np.any(in_known_transit):
             # Goal 2: Linear interpolation across known transits BEFORE Savitzky-Golay detrending prevents filter edge ringing
@@ -1151,7 +1950,7 @@ def _analyze_single_target_impl(tic_id: str, sector: int, min_period: float = 0.
         
         max_p = min(max_period, (t_bls[-1] - t_bls[0]) * 0.48)
         if max_p <= min_period:
-            return tic_id, "REJECT_BASELINE", "REJECT: Time baseline too short", None
+            return make_res(tic_id, "REJECT_BASELINE", "REJECT: Time baseline too short", None)
             
         freqs = np.linspace(1.0 / max_p, 1.0 / min_period, 9000)
         periods = (1.0 / freqs)[::-1]
@@ -1360,7 +2159,7 @@ def _analyze_single_target_impl(tic_id: str, sector: int, min_period: float = 0.
             if star_info_cache is None:
                 star_info_cache = get_stellar_and_gaia_params(tic_id)
             if not star_info_cache["has_params"]:
-                return tic_id, "REJECT_NO_STELLAR_PARAMS", f"REJECT {base_telemetry}: Missing measured R_star/Teff in TIC catalog", None
+                return make_res(tic_id, "REJECT_NO_STELLAR_PARAMS", f"REJECT {base_telemetry}: Missing measured R_star/Teff in TIC catalog", None)
                 
             r_star = star_info_cache["r_star"]
             m_star = star_info_cache["m_star"]
@@ -1372,10 +2171,10 @@ def _analyze_single_target_impl(tic_id: str, sector: int, min_period: float = 0.
             ext_telemetry = f"[Peak#{rank_idx} | SDE={sde:.1f} | P={best_p:.4f}d | Depth={depth_ppm:.0f}ppm | Rp={r_planet_earth:.1f}R_E | R*={r_star:.2f}R_Sun | RUWE={ruwe:.2f}]"
             
             if r_star > 1.75 or teff > 9500:
-                return tic_id, "REJECT_EVOLVED_STAR", f"REJECT {ext_telemetry}: Evolved giant or hot subdwarf host", None
+                return make_res(tic_id, "REJECT_EVOLVED_STAR", f"REJECT {ext_telemetry}: Evolved giant or hot subdwarf host", None)
                 
             if np.isfinite(ruwe) and ruwe > 1.4:
-                return tic_id, "REJECT_RUWE", f"REJECT {ext_telemetry}: Unresolved binary companion (RUWE > 1.4)", None
+                return make_res(tic_id, "REJECT_RUWE", f"REJECT {ext_telemetry}: Unresolved binary companion (RUWE > 1.4)", None)
                 
             if r_planet_earth > 15.0 or r_planet_earth < 0.8:
                 if rank_idx == 1:
@@ -1411,31 +2210,97 @@ def _analyze_single_target_impl(tic_id: str, sector: int, min_period: float = 0.
             arch_ok, arch_status, arch_info = verify_multi_epoch(
                 tic_id, last_sector, t_curr_eval, flat_f, flat_ferr, best_p, best_t0, best_dur, depth_ppm, sde
             )
+
+            # Persist bounded JSON-safe archival diagnostics for every evaluated target/peak
+            from datetime import datetime, timezone
+            target_diag = {
+                "run_id": str(run_id),
+                "attempt_id": str(attempt_id),
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "tic_id": str(tic_id),
+                "sector": int(last_sector),
+                "peak_rank": int(rank_idx),
+                "arch_ok": bool(arch_ok),
+                "arch_status": str(arch_status),
+                "ephemeris_source": arch_info.get("ephemeris_source"),
+                "ephemeris_status": arch_info.get("ephemeris_status"),
+                "ephemeris_fallback_reason": arch_info.get("ephemeris_fallback_reason"),
+                "archival_sectors_requested": arch_info.get("archival_sectors_requested", []),
+                "archival_sectors_attempted": arch_info.get("archival_sectors_attempted", []),
+                "archival_sectors_used": arch_info.get("archival_sectors_used", []),
+                "archival_products_requested": arch_info.get("archival_products_requested", []),
+                "archival_products_attempted": arch_info.get("archival_products_attempted", []),
+                "archival_products_used": arch_info.get("archival_products_used", []),
+                "archival_products_failed": arch_info.get("archival_products_failed", []),
+                "archival_snr": float(arch_info["archival_snr"]) if (arch_info.get("archival_snr") is not None and np.isfinite(arch_info["archival_snr"])) else None,
+                "multi_sde": float(arch_info["multi_sde"]) if (arch_info.get("multi_sde") is not None and np.isfinite(arch_info["multi_sde"])) else None,
+                "est_multi_sde_proxy": float(arch_info["est_multi_sde_proxy"]) if (arch_info.get("est_multi_sde_proxy") is not None and np.isfinite(arch_info["est_multi_sde_proxy"])) else None,
+            }
+            record_archival_diagnostic(target_diag)
+            attempt_diagnostics.append(target_diag)
+
             if not arch_ok:
                 if rank_idx == 1:
                     first_reject_code = "REJECT_ARCHIVAL"
                     first_reject_msg = f"REJECT {ext_telemetry}: {arch_status}"
                 continue
 
-            refined_p = arch_info["refined_p"]
-            arch_snr = arch_info["archival_snr"]
-            arch_secs_str = arch_info["archival_sectors_str"]
+            # Coherent ephemeris selection: ensure (period_days, t0_btjd) come strictly from the same solution
+            discovery_p = float(best_p)
+            discovery_t0 = float(best_t0)
+            refined_p_raw = arch_info.get("refined_p", np.nan)
+            refined_t0_raw = arch_info.get("refined_t0", np.nan)
+            is_strict = arch_info.get("is_projected_strict", True)
+            ephem_src = arch_info.get("ephemeris_source", "DISCOVERY_SINGLE_SECTOR")
+            ephem_stat = arch_info.get("ephemeris_status", "FALLBACK_DISCOVERY")
+            fallback_reas = arch_info.get("ephemeris_fallback_reason", "NONE")
+
+            has_valid_refined = (
+                not is_strict
+                and refined_p_raw is not None
+                and refined_t0_raw is not None
+                and np.isfinite(refined_p_raw)
+                and np.isfinite(refined_t0_raw)
+                and float(refined_p_raw) > 0
+                and ephem_src == "REFINED_MULTI_SECTOR"
+                and ephem_stat == "REFINED_VALID"
+            )
+
+            if has_valid_refined:
+                selected_p = float(refined_p_raw)
+                selected_t0 = float(refined_t0_raw)
+                ephemeris_source = "REFINED_MULTI_SECTOR"
+                ephemeris_status = "REFINED_VALID"
+                ephemeris_fallback_reason = "NONE"
+                refined_p_export = float(refined_p_raw)
+                refined_t0_export = float(refined_t0_raw)
+            else:
+                selected_p = discovery_p
+                selected_t0 = discovery_t0
+                ephemeris_source = "DISCOVERY_SINGLE_SECTOR"
+                ephemeris_status = "FALLBACK_DISCOVERY"
+                ephemeris_fallback_reason = fallback_reas if fallback_reas != "NONE" else ("STRICT_PROJECTION_NEARBY_SECTOR" if is_strict else "REFINED_EPHEMERIS_INVALID")
+                refined_p_export = np.nan
+                refined_t0_export = np.nan
+
+            arch_snr = arch_info.get("archival_snr", np.nan)
+            arch_secs_str = arch_info.get("archival_sectors_str", "None")
 
             # Generate English Vetting Summary Plot
             fig, axes = plt.subplots(2, 2, figsize=(14, 10))
-            
+
             axes[0, 0].plot(periods, sde_arr, color="black", lw=0.8)
-            axes[0, 0].axvline(best_p, color="red", linestyle="--", label=f"Peak #{rank_idx}: P = {refined_p:.5f} d")
+            axes[0, 0].axvline(best_p, color="red", linestyle="--", label=f"Peak #{rank_idx}: P = {selected_p:.5f} d")
             axes[0, 0].axhline(6.0, color="gray", linestyle=":", label="SDE = 6.0")
             axes[0, 0].set_xlabel("Trial Period (days)")
             axes[0, 0].set_ylabel("Kovács Whitened SDE")
             toi_title_suffix = " [TOI Sibling Search]" if is_toi_host else ""
             axes[0, 0].set_title(f"BLS Whitened SDE: TIC {tic_id}{toi_title_suffix} (SDE = {sde:.1f}, N_transits = {unique_transits})")
             axes[0, 0].legend(loc="upper right")
-            
+
             axes[0, 1].scatter(phase[vis], flat_f[vis], s=2, color="gray", alpha=0.35, label=f"Sector {last_sector} (2-min)")
             axes[0, 1].plot(bin_centers, bin_means, color="red", lw=2, label=f"Sector {last_sector} Binned")
-            if arch_info["arch_bin_centers"] is not None:
+            if arch_info.get("arch_bin_centers") is not None:
                 axes[0, 1].plot(
                     arch_info["arch_bin_centers"],
                     arch_info["arch_bin_means"],
@@ -1451,7 +2316,7 @@ def _analyze_single_target_impl(tic_id: str, sector: int, min_period: float = 0.
                 f"Phase-Folded Transit: Rp = {r_planet_earth:.2f} R_Earth | Depth = {depth_ppm:.0f} ppm | {arch_status}"
             )
             axes[0, 1].legend(loc="lower right")
-            
+
             axes[1, 0].scatter(phase[vis], dx_curr_eval[vis] * 21.0, s=2, alpha=0.35, label="dX (arcsec)")
             axes[1, 0].scatter(phase[vis], dy_curr_eval[vis] * 21.0, s=2, alpha=0.35, label="dY (arcsec)")
             axes[1, 0].axvspan(-0.5 * best_dur, 0.5 * best_dur, color="red", alpha=0.15, label="Transit Window")
@@ -1463,7 +2328,7 @@ def _analyze_single_target_impl(tic_id: str, sector: int, min_period: float = 0.
                 f"Centroid Stability: Shift = {shift_arcsec:.3f} arcsec | Odd/Even = {odd_even_sigma:.2f} sigma | RUWE = {ruwe:.2f}"
             )
             axes[1, 0].legend(loc="upper right")
-            
+
             im = axes[1, 1].imshow(diff_image, origin="lower", cmap="viridis")
             plt.colorbar(im, ax=axes[1, 1], label="Flux Deficit (e-/s)")
             for i in range(aperture.shape[0]):
@@ -1474,59 +2339,103 @@ def _analyze_single_target_impl(tic_id: str, sector: int, min_period: float = 0.
             axes[1, 1].set_xlabel("Pixel Column")
             axes[1, 1].set_ylabel("Pixel Row")
             axes[1, 1].set_title(f"Verified On-Target Difference Image (Sector {last_sector}, CROWDSAP={crowdsap:.2f})")
-            
+
             plt.tight_layout()
-            plot_path = os.path.join(OUTPUT_DIR, f"candidate_TIC_{tic_id}.png")
+            run_suffix = f"_{CURRENT_RUN_ID}" if CURRENT_RUN_ID else ""
+            plot_filename = f"candidate_TIC_{tic_id}_s{last_sector}{run_suffix}.png"
+            plot_path = os.path.join(OUTPUT_DIR, plot_filename)
             plt.savefig(plot_path, dpi=150)
             plt.close(fig)
-            
+
             cand_data = {
+                "schema_version": CANDIDATE_SCHEMA_VERSION,
                 "pipeline_version": PIPELINE_VERSION,
-                "tic_id": tic_id,
-                "sector": last_sector,
-                "is_toi_host": is_toi_host,
+                "run_id": str(run_id),
+                "tic_id": str(tic_id),
+                "sector": int(last_sector),
+                "is_toi_host": bool(is_toi_host),
                 "known_toi_context": ",".join(f"{kp['toi']}(P={kp['period']:.3f}d)" for kp in known_transits) if is_toi_host else "None",
                 "candidate_type": "TOI_SIBLING_COMPANION" if is_toi_host else "NOVEL_DISCOVERY",
+                "ephemeris_source": ephemeris_source,
+                "ephemeris_status": ephemeris_status,
+                "ephemeris_fallback_reason": ephemeris_fallback_reason,
+                "time_system": "BTJD",
+                "time_standard": "TDB",
+                "epoch_offset_btjd": 2457000.0,
+                "period_units": "days",
+                "duration_units": "hours",
+                "depth_units": "ppm",
+                "transit_measurement_source": "DISCOVERY_SINGLE_SECTOR",
+                "timing_uncertainty_source": "CARTER_2008_DISCOVERY_HEURISTIC",
+                "period_days": float(selected_p),
+                "t0_btjd": float(selected_t0),
+                "discovery_period_days": float(discovery_p),
+                "discovery_t0_btjd": float(discovery_t0),
+                "refined_period_days": float(refined_p_export) if np.isfinite(refined_p_export) else np.nan,
+                "refined_t0_btjd": float(refined_t0_export) if np.isfinite(refined_t0_export) else np.nan,
+                "duration_hours": float(obs_dur_hr),
+                "min_kepler_dur_hours": float(min_kepler_dur_hr),
+                "max_kepler_dur_hours": float(max_kepler_dur_hr),
+                "n_transits": int(unique_transits),
+                "depth_ppm": float(depth_ppm),
+                "crowdsap": float(crowdsap),
+                "sde": float(sde),
+                "r_planet_earth": float(r_planet_earth),
+                "r_star_sun": float(r_star),
+                "m_star_sun": float(m_star),
+                "teff_k": float(teff),
+                "gaia_ruwe": float(ruwe) if np.isfinite(ruwe) else np.nan,
+                "odd_even_sigma": float(odd_even_sigma),
+                "centroid_shift_arcsec": float(shift_arcsec),
                 "archival_sectors": arch_secs_str,
-                "archival_snr_sigma": round(arch_snr, 2) if np.isfinite(arch_snr) else "Single-Sector",
-                "archival_trials": arch_info.get("n_trials", 1),
-                "archival_snr_crit": round(arch_info.get("snr_crit", 2.4), 2),
-                "cramer_rao_sigma_p_sec": round(arch_info.get("sigma_p_sec", 0.0), 2) if np.isfinite(arch_info.get("sigma_p_sec", np.nan)) else np.nan,
-                "period_days": round(refined_p, 6),
-                "t0_btjd": round(best_t0, 5),
-                "duration_hours": round(obs_dur_hr, 2),
-                "min_kepler_dur_hours": round(min_kepler_dur_hr, 2),
-                "max_kepler_dur_hours": round(max_kepler_dur_hr, 2),
-                "n_transits": unique_transits,
-                "depth_ppm": round(depth_ppm, 1),
-                "crowdsap": round(crowdsap, 3),
-                "sde": round(sde, 2),
-                "r_planet_earth": round(r_planet_earth, 2),
-                "r_star_sun": round(r_star, 2),
-                "m_star_sun": round(m_star, 2),
-                "teff_k": round(teff, 0),
-                "gaia_ruwe": round(ruwe, 3) if np.isfinite(ruwe) else np.nan,
-                "odd_even_sigma": round(odd_even_sigma, 2),
-                "centroid_shift_arcsec": round(shift_arcsec, 3),
+                "n_archival_sectors": int(arch_info.get("n_archival_sectors", 0)),
+                "archival_sectors_requested": _serialize_metadata_list(arch_info.get("archival_sectors_requested", [])),
+                "archival_sectors_attempted": _serialize_metadata_list(arch_info.get("archival_sectors_attempted", [])),
+                "archival_sectors_used": _serialize_metadata_list(arch_info.get("archival_sectors_used", [])),
+                "archival_products_requested": _serialize_metadata_list(arch_info.get("archival_products_requested", [])),
+                "archival_products_attempted": _serialize_metadata_list(arch_info.get("archival_products_attempted", [])),
+                "archival_products_used": _serialize_metadata_list(arch_info.get("archival_products_used", [])),
+                "archival_products_failed": _serialize_metadata_list(arch_info.get("archival_products_failed", [])),
+                "archival_snr_sigma": float(arch_snr) if np.isfinite(arch_snr) else np.nan,
+                "archival_trials": int(arch_info.get("n_trials", 1)),
+                "archival_snr_crit": float(arch_info.get("snr_crit", 2.4)),
+                "est_multi_sde_proxy": float(arch_info.get("est_multi_sde_proxy", sde)),
+                "multi_sde": float(arch_info.get("multi_sde", sde)),
+                "cramer_rao_sigma_p_sec": float(arch_info.get("sigma_p_sec", np.nan)) if np.isfinite(arch_info.get("sigma_p_sec", np.nan)) else np.nan,
+                "cramer_rao_sigma_t0_sec": float(arch_info.get("sigma_t0_sec", np.nan)) if np.isfinite(arch_info.get("sigma_t0_sec", np.nan)) else np.nan,
+                "covariance_p_t0": np.nan,
+                "plot_path": plot_filename,
                 "exofop_url": f"https://exofop.ipac.caltech.edu/tess/target.php?id={tic_id}"
             }
             
             cand_tag = f"TOI SIBLING (Host of {known_transits[0]['toi']})" if is_toi_host else "CANDIDATE"
             trials_str = f"Trials={arch_info.get('n_trials', 1)}, Crit={arch_info.get('snr_crit', 2.4):.1f}s"
             msg = (
-                f"{cand_tag} FOUND (Peak #{rank_idx})! P={refined_p:.5f} d | N={unique_transits} | Depth={depth_ppm:.0f} ppm | "
+                f"{cand_tag} FOUND (Peak #{rank_idx})! P={selected_p:.5f} d | N={unique_transits} | Depth={depth_ppm:.0f} ppm | "
                 f"Rp={r_planet_earth:.2f} R_E | SDE={sde:.1f} | Archival={arch_status} ({trials_str})"
             )
-            return tic_id, "CANDIDATE", msg, cand_data
+            return make_res(tic_id, "CANDIDATE", msg, cand_data)
             
         if AUTO_PURGE_CACHE:
             purge_target_cache(tic_id)
-        return tic_id, first_reject_code, first_reject_msg, None
+        return make_res(tic_id, first_reject_code, first_reject_msg, None)
         
     except Exception as e:
         if AUTO_PURGE_CACHE:
             purge_target_cache(tic_id)
-        return tic_id, "ERROR", f"ERROR: {e}", None
+        return make_res(tic_id, "ERROR", f"ERROR: {e}", None)
+
+
+def save_candidates_to_report(report_path: str, candidate_records: list):
+    """
+    Saves candidate records to report_path using atomic replacement to prevent file corruption.
+    """
+    df_out = pd.DataFrame(candidate_records, columns=CANDIDATE_COLUMNS)
+    dir_name = os.path.dirname(report_path) or "."
+    os.makedirs(dir_name, exist_ok=True)
+    temp_path = f"{report_path}.tmp.{os.getpid()}"
+    df_out.to_csv(temp_path, index=False)
+    os.replace(temp_path, report_path)
 
 
 if __name__ == "__main__":
@@ -1545,47 +2454,73 @@ if __name__ == "__main__":
     write_log("=" * 70, print_to_console=False)
     write_log(start_banner)
     write_event(start_banner)
-    
-    active_sector, targets = select_latest_sector_and_targets(sector_list=PREFERRED_SECTORS, limit=MAX_TARGETS)
+
+    # Validate existing candidate report early before remote sector/target selection
     candidates = []
-    
     if os.path.exists(REPORT_FILE):
-        try:
-            candidates = pd.read_csv(REPORT_FILE).to_dict("records")
-        except Exception:
+        if os.path.getsize(REPORT_FILE) == 0:
             candidates = []
-            
+        else:
+            try:
+                df_existing = pd.read_csv(REPORT_FILE)
+            except Exception as exc:
+                raise RuntimeError(
+                    f"Failed to read existing candidate CSV '{REPORT_FILE}' ({type(exc).__name__}: {exc}). "
+                    f"Refusing to proceed to prevent corrupting historical artifacts."
+                ) from exc
+
+            if list(df_existing.columns) != CANDIDATE_COLUMNS:
+                raise RuntimeError(
+                    f"Incompatible candidate CSV schema in '{REPORT_FILE}'. "
+                    f"Existing header has {len(df_existing.columns)} columns, expected {len(CANDIDATE_COLUMNS)} columns "
+                    f"for schema {CANDIDATE_SCHEMA_VERSION}. Refusing to proceed to prevent corrupting historical artifacts."
+                )
+            candidates = df_existing.to_dict("records")
+
+    active_sector, targets = select_latest_sector_and_targets(sector_list=PREFERRED_SECTORS, limit=MAX_TARGETS)
+
     write_log(f"Launching parallel pipeline on {MAX_WORKERS} CPU workers for Sector {active_sector}...\n")
-    
+
     completed = 0
     total = len(targets)
     stats_counter = {}
-    
+
     executor = ProcessPoolExecutor(max_workers=MAX_WORKERS)
     try:
         future_to_tic = {
             executor.submit(analyze_single_target, tic, active_sector): tic
             for tic in targets
         }
-        
+
         for future in as_completed(future_to_tic):
             completed += 1
             tic_id, code, status_msg, cand_dict = future.result()
             stats_counter[code] = stats_counter.get(code, 0) + 1
-            
+
             if code != "ERROR":
                 append_scanned_history(tic_id)
             else:
                 write_event(f"ERROR [{completed}/{total}] [TIC {tic_id}]: {status_msg}")
-            
+
             if cand_dict is not None:
                 write_log(f"\n>>> [{completed}/{total}] [TIC {tic_id}] {status_msg} <<<\n")
                 write_event(f"CANDIDATE FOUND [{completed}/{total}] [TIC {tic_id}]: {status_msg}")
                 candidates = [c for c in candidates if str(c.get("tic_id")) != str(tic_id)]
                 candidates.append(cand_dict)
-                pd.DataFrame(candidates).to_csv(REPORT_FILE, index=False)
+                save_candidates_to_report(REPORT_FILE, candidates)
             else:
                 write_log(f"[{completed}/{total}] [TIC {tic_id}] {status_msg}")
+                if code == "REJECT_ARCHIVAL":
+                    res_obj = future.result()
+                    arch_diag = getattr(res_obj, "archival_diagnostic", None)
+                    if arch_diag is None:
+                        res_att = getattr(res_obj, "attempt_id", None)
+                        if res_att:
+                            arch_diag = get_latest_archival_diagnostic(
+                                tic_id, active_sector, output_dir=OUTPUT_DIR, run_id=CURRENT_RUN_ID, attempt_id=res_att
+                            )
+                    if arch_diag and arch_diag.get("archival_products_failed"):
+                        write_log(f"    Archival diagnostics: attempted={arch_diag.get('archival_products_attempted')}, failed={arch_diag.get('archival_products_failed')}")
 
             if completed % 500 == 0:
                 cand_cnt = len(candidates)

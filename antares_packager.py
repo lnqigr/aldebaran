@@ -20,8 +20,11 @@ import shutil
 import argparse
 import warnings
 from datetime import datetime, timedelta
+from typing import Optional
 
 import logging
+import json
+import math
 import certifi
 
 logger = logging.getLogger(__name__)
@@ -39,6 +42,12 @@ import pandas as pd
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from vps_contract import (
+    validate_and_extract_vps_score,
+    VPSContractError,
+    ANTARES_DEFAULT_MAX_CORR_RISK,
+    VPS_SCHEMA_VERSION
+)
 from scipy import stats
 from scipy.optimize import curve_fit
 from scipy.signal import savgol_filter
@@ -355,23 +364,16 @@ def compute_astrophysical_metrics(
 
 def calc_sidak_corrected_risk(row: pd.Series) -> float:
     """
-    Computes Sidak-Bonferroni dual-zone corrected Vetting Penalty Score (VPS, 0-100).
-    Suppresses false-alarm penalties when secondary peaks are consistent with noise.
+    Validates versioned VPS component accounting and extracts authoritative score.
+    Legacy unsupported secondary-penalty subtraction has been removed per ALD-012 / SCI-16.
     """
-    r = float(row.get("vps_score", row.get("fp_risk_percent", 50.0)))
-    sec_snr = float(row.get("secondary_snr_sigma", 0.0)) if pd.notna(row.get("secondary_snr_sigma")) else 0.0
-    sec_phase = float(row.get("sec_eclipse_phase", 0.50)) if pd.notna(row.get("sec_eclipse_phase")) else 0.50
-    if sec_snr > 2.2:
-        is_circ = abs(sec_phase - 0.50) <= 0.04
-        if (not is_circ and sec_snr <= 3.4) or (is_circ and sec_snr <= 2.8):
-            r -= 45.0 * (sec_snr / 3.0)
-    return round(max(0.2, r), 1)
+    return validate_and_extract_vps_score(row)
 
 
 def run_stage_3a_filter(
     tier1_csv: str,
     tier2_csv: str,
-    max_corr_risk: float = 25.0,
+    max_corr_risk: float = ANTARES_DEFAULT_MAX_CORR_RISK,
     max_neb_neighbors: int = 2,
     max_flux_contam_pct: float = 20.0
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
@@ -390,74 +392,216 @@ def run_stage_3a_filter(
     df_t1["tic_id"] = df_t1["tic_id"].astype(str).str.strip()
     df_t1 = df_t1.drop_duplicates(subset=["tic_id"], keep="first")
 
-    if os.path.exists(tier2_csv):
-        df_t2 = pd.read_csv(tier2_csv)
-        df_t2["tic_id"] = df_t2["tic_id"].astype(str).str.strip()
-        df_t2 = df_t2.drop_duplicates(subset=["tic_id"], keep="first")
-        df_merged = pd.merge(df_t2, df_t1, on="tic_id", how="left", suffixes=("", "_t1"))
-        print(f"[Stage 3A] Loaded {len(df_t2)} Tier-2 Pleiades dossiers matched against {len(df_t1)} Tier-1 candidates.")
-    else:
-        print(f"[Stage 3A] Warning: Tier-2 summary '{tier2_csv}' not found. Using Tier-1 directly.")
-        df_merged = df_t1.copy()
-        for c, def_v in [
-            ("disposition", "TIER-1 CANDIDATE"),
-            ("fp_risk_percent", 25.0),
-            ("refined_period_days", np.nan),
-            ("fitted_rp_earth", np.nan),
-            ("impact_param_b", 0.30),
-            ("dur_to_kepler_max", 1.00),
-            ("secondary_snr_sigma", 0.0),
-            ("sec_eclipse_phase", 0.50),
-            ("is_known_tess_eb", False),
-            ("gaia_nss_type", np.nan),
-            ("flux_contam_percent", 0.0),
-            ("neb_capable_neighbors", 0),
-            ("sectors_stitched", "")
-        ]:
-            if c not in df_merged.columns:
-                df_merged[c] = def_v
+    if len(df_t1) == 0:
+        print("[Stage 3A] Tier-1 candidate report is empty (0 candidates). Skipping Stage 3A filtering.")
+        empty_survivors = pd.DataFrame(columns=[
+            "tic_id", "corr_risk", "period_d", "rp_e", "dur_ratio", "contam_pct", "neb_count", "sectors_stitched"
+        ])
+        return empty_survivors, pd.DataFrame()
+
+    if not os.path.exists(tier2_csv):
+        raise FileNotFoundError(
+            f"Tier-2 Pleiades summary '{tier2_csv}' not found. "
+            f"Stage 3A requires verified Tier-2 score provenance."
+        )
+
+    df_t2 = pd.read_csv(tier2_csv)
+    df_t2["tic_id"] = df_t2["tic_id"].astype(str).str.strip()
+    df_t2 = df_t2.drop_duplicates(subset=["tic_id"], keep="first")
+    df_merged = pd.merge(df_t2, df_t1, on="tic_id", how="left", suffixes=("", "_t1"))
+    print(f"[Stage 3A] Loaded {len(df_t2)} Tier-2 Pleiades dossiers matched against {len(df_t1)} Tier-1 candidates.")
 
     # Fallback mappings for critical columns
-    df_merged["period_d"] = pd.to_numeric(df_merged.get("refined_period_days"), errors="coerce").fillna(
-        pd.to_numeric(df_merged.get("period_days"), errors="coerce")
-    )
-    df_merged["t0_btjd"] = pd.to_numeric(df_merged.get("refined_t0_btjd"), errors="coerce").fillna(
-        pd.to_numeric(df_merged.get("t0_btjd"), errors="coerce")
-    )
-    df_merged["duration_hours"] = pd.to_numeric(df_merged.get("fitted_duration_hours"), errors="coerce").fillna(
-        pd.to_numeric(df_merged.get("duration_hours"), errors="coerce")
-    )
-    df_merged["depth_ppm"] = pd.to_numeric(df_merged.get("fitted_depth_ppm"), errors="coerce").fillna(
-        pd.to_numeric(df_merged.get("depth_ppm"), errors="coerce")
-    )
-    df_merged["rp_e"] = pd.to_numeric(df_merged.get("fitted_rp_earth"), errors="coerce").fillna(
-        pd.to_numeric(df_merged.get("r_planet_earth"), errors="coerce")
-    )
-    df_merged["dur_ratio"] = pd.to_numeric(df_merged.get("dur_to_kepler_max"), errors="coerce").fillna(1.0)
-    df_merged["sec_snr"] = pd.to_numeric(df_merged.get("secondary_snr_sigma"), errors="coerce").fillna(0.0)
-    df_merged["contam_pct"] = pd.to_numeric(df_merged.get("flux_contam_percent"), errors="coerce").fillna(0.0)
-    df_merged["neb_count"] = pd.to_numeric(df_merged.get("neb_capable_neighbors"), errors="coerce").fillna(0).astype(int)
+    def _get_num_series(col: str, fallback: Optional[str] = None) -> pd.Series:
+        s = pd.to_numeric(df_merged[col], errors="coerce") if col in df_merged.columns else pd.Series(np.nan, index=df_merged.index)
+        if fallback and fallback in df_merged.columns:
+            s_fb = pd.to_numeric(df_merged[fallback], errors="coerce")
+            s = s.fillna(s_fb)
+        return s
 
+    df_merged["period_d"] = _get_num_series("refined_period_days", "period_days")
+    df_merged["t0_btjd"] = _get_num_series("refined_t0_btjd", "t0_btjd")
+    df_merged["duration_hours"] = _get_num_series("fitted_duration_hours", "duration_hours")
+    df_merged["depth_ppm"] = _get_num_series("fitted_depth_ppm", "depth_ppm")
+    df_merged["rp_e"] = _get_num_series("fitted_rp_earth", "r_planet_earth")
+    df_merged["dur_ratio"] = _get_num_series("dur_to_kepler_max")
+    df_merged["sec_snr"] = _get_num_series("secondary_snr_sigma")
+    df_merged["contam_pct"] = _get_num_series("flux_contam_percent")
+    df_merged["neb_count"] = _get_num_series("neb_capable_neighbors")
+    if "sec_eclipse_phase" not in df_merged.columns:
+        df_merged["sec_eclipse_phase"] = np.nan
+    if "sectors_stitched" not in df_merged.columns:
+        df_merged["sectors_stitched"] = ""
+
+    # Validates versioned VPS component accounting and extracts authoritative score (no subtraction)
     df_merged["corr_risk"] = df_merged.apply(calc_sidak_corrected_risk, axis=1)
 
-    # 5-Rule Gate Conditions:
+    if len(df_merged) == 0:
+        empty_survivors = pd.DataFrame(columns=[
+            "tic_id", "corr_risk", "period_d", "rp_e", "dur_ratio", "contam_pct", "neb_count", "sectors_stitched"
+        ])
+        return empty_survivors, pd.DataFrame()
+
+    # B2 / C1 Gate Contract Validation: Validate mandatory physical measurements, stellar environment, catalog flags, and duplicate fields
+    def _validate_gate_contract_and_sec(row) -> dict:
+        tic_id = str(row.get("tic_id", "UNKNOWN")).strip()
+
+        # 1. dur_to_kepler_max: mandatory positive finite float
+        raw_dur = row.get("dur_to_kepler_max")
+        if "dur_to_kepler_max" not in row or raw_dur is None or pd.isna(raw_dur):
+            raise VPSContractError(f"Target TIC {tic_id} missing mandatory gate measurement 'dur_to_kepler_max'.")
+        try:
+            dur_val = float(raw_dur)
+            if not math.isfinite(dur_val) or dur_val <= 0.0:
+                raise ValueError(f"non-positive or non-finite: {dur_val}")
+        except (TypeError, ValueError) as exc:
+            raise VPSContractError(f"Target TIC {tic_id} invalid mandatory gate measurement 'dur_to_kepler_max': {exc}")
+
+        # 2. flux_contam_percent: mandatory non-negative finite float (ratio percentage, can exceed 100%)
+        raw_contam = row.get("flux_contam_percent")
+        if "flux_contam_percent" not in row or raw_contam is None or pd.isna(raw_contam):
+            raise VPSContractError(f"Target TIC {tic_id} missing mandatory gate measurement 'flux_contam_percent'.")
+        try:
+            contam_val = float(raw_contam)
+            if not math.isfinite(contam_val) or contam_val < 0.0:
+                raise ValueError(f"negative or non-finite: {contam_val}")
+        except (TypeError, ValueError) as exc:
+            raise VPSContractError(f"Target TIC {tic_id} invalid mandatory gate measurement 'flux_contam_percent': {exc}")
+
+        # 3. neb_capable_neighbors: mandatory non-negative integer
+        raw_neb = row.get("neb_capable_neighbors")
+        if "neb_capable_neighbors" not in row or raw_neb is None or pd.isna(raw_neb):
+            raise VPSContractError(f"Target TIC {tic_id} missing mandatory gate measurement 'neb_capable_neighbors'.")
+        try:
+            neb_float = float(raw_neb)
+            if not math.isfinite(neb_float) or neb_float < 0 or int(neb_float) != neb_float:
+                raise ValueError(f"non-integer, negative, or non-finite: {raw_neb}")
+        except (TypeError, ValueError) as exc:
+            raise VPSContractError(f"Target TIC {tic_id} invalid mandatory gate measurement 'neb_capable_neighbors': {exc}")
+
+        # 4. is_known_tess_eb: mandatory boolean flag
+        if "is_known_tess_eb" not in row or pd.isna(row.get("is_known_tess_eb")) or str(row.get("is_known_tess_eb")).strip() == "":
+            raise VPSContractError(f"Target TIC {tic_id} missing mandatory gate flag 'is_known_tess_eb'.")
+        raw_eb = row.get("is_known_tess_eb")
+        if isinstance(raw_eb, (bool, np.bool_)):
+            is_known_eb_val = bool(raw_eb)
+        else:
+            s_eb = str(raw_eb).strip().upper()
+            if s_eb in ("TRUE", "1", "1.0", "YES"):
+                is_known_eb_val = True
+            elif s_eb in ("FALSE", "0", "0.0", "NO"):
+                is_known_eb_val = False
+            else:
+                raise VPSContractError(f"Target TIC {tic_id} invalid non-boolean 'is_known_tess_eb': '{raw_eb}'.")
+
+        # 5. Gaia NSS catalog context: gaia_nss_type and is_gaia_nss
+        has_nss_type_col = "gaia_nss_type" in row
+        has_nss_flag_col = "is_gaia_nss" in row
+        if not has_nss_type_col and not has_nss_flag_col:
+            raise VPSContractError(f"Target TIC {tic_id} missing mandatory Gaia NSS catalog context.")
+
+        raw_nss_type = row.get("gaia_nss_type") if has_nss_type_col else None
+        raw_nss_flag = row.get("is_gaia_nss") if has_nss_flag_col else None
+
+        # Parse gaia_nss_type if present
+        type_str = "" if (raw_nss_type is None or pd.isna(raw_nss_type)) else str(raw_nss_type).strip()
+        if type_str.upper() in ("", "NAN", "NONE", "N/A", "NULL", "FALSE", "0"):
+            type_is_match = False
+            type_is_explicit_negative = type_str.upper() in ("FALSE", "0")
+        else:
+            type_is_match = True
+            type_is_explicit_negative = False
+
+        # Parse is_gaia_nss if present
+        if not has_nss_flag_col or raw_nss_flag is None or pd.isna(raw_nss_flag) or str(raw_nss_flag).strip() == "":
+            flag_is_specified = False
+            flag_val = None
+        elif isinstance(raw_nss_flag, (bool, np.bool_)):
+            flag_is_specified = True
+            flag_val = bool(raw_nss_flag)
+        else:
+            s_flag = str(raw_nss_flag).strip().upper()
+            if s_flag in ("TRUE", "1", "1.0", "YES"):
+                flag_is_specified = True
+                flag_val = True
+            elif s_flag in ("FALSE", "0", "0.0", "NO"):
+                flag_is_specified = True
+                flag_val = False
+            else:
+                raise VPSContractError(f"Target TIC {tic_id} invalid non-boolean 'is_gaia_nss': '{raw_nss_flag}'.")
+
+        # Context validation across flag and type
+        if has_nss_flag_col and not flag_is_specified and not has_nss_type_col:
+            raise VPSContractError(f"Target TIC {tic_id} missing mandatory Gaia NSS catalog context.")
+
+        if flag_is_specified and has_nss_type_col:
+            # Check for contradiction between explicit boolean flag and explicit solution type
+            if flag_val is False and type_is_match is True:
+                raise VPSContractError(
+                    f"Target TIC {tic_id} contradictory Gaia NSS context: is_gaia_nss=False but gaia_nss_type='{type_str}'."
+                )
+            if flag_val is True and type_is_explicit_negative is True:
+                raise VPSContractError(
+                    f"Target TIC {tic_id} contradictory Gaia NSS context: is_gaia_nss=True but gaia_nss_type='{type_str}'."
+                )
+
+        if flag_is_specified and flag_val is True:
+            is_gaia_nss_val = True
+        elif type_is_match:
+            is_gaia_nss_val = True
+        else:
+            is_gaia_nss_val = False
+
+        # 6. Secondary eclipse significance from canonical validated ledger & duplicate field validation (B1)
+        raw_ledger = row.get("vps_ledger_json")
+        ledger = raw_ledger if isinstance(raw_ledger, dict) else json.loads(str(raw_ledger))
+        sec_meta = ledger["secondary_metadata"]
+
+        if "secondary_snr_sigma" in row and pd.notna(row["secondary_snr_sigma"]):
+            top_snr = float(row["secondary_snr_sigma"])
+            canonical_snr = float(sec_meta["snr"])
+            rounded_expected_snr = round(canonical_snr, 2)
+            if abs(top_snr - rounded_expected_snr) > 1e-4 and abs(top_snr - canonical_snr) > 1e-4:
+                raise VPSContractError(
+                    f"Target TIC {tic_id} contradictory secondary SNR: "
+                    f"top-level secondary_snr_sigma={top_snr} vs ledger snr={canonical_snr} (expected {rounded_expected_snr})."
+                )
+        if "sec_eclipse_phase" in row and pd.notna(row["sec_eclipse_phase"]):
+            top_phase = float(row["sec_eclipse_phase"])
+            canonical_phase = float(sec_meta["phase"])
+            rounded_expected_phase = round(canonical_phase, 3)
+            if abs(top_phase - rounded_expected_phase) > 1e-4 and abs(top_phase - canonical_phase) > 1e-4:
+                raise VPSContractError(
+                    f"Target TIC {tic_id} contradictory secondary phase: "
+                    f"top-level sec_eclipse_phase={top_phase} vs ledger phase={canonical_phase} (expected {rounded_expected_phase})."
+                )
+        sec_pass_val = not bool(sec_meta["penalty_applied"])
+
+        return {
+            "sec_pass": sec_pass_val,
+            "is_known_eb": is_known_eb_val,
+            "is_gaia_nss": is_gaia_nss_val,
+        }
+
+    gate_contract_res = df_merged.apply(_validate_gate_contract_and_sec, axis=1)
+    sec_pass = gate_contract_res.apply(lambda r: r["sec_pass"])
+    is_known_eb = gate_contract_res.apply(lambda r: r["is_known_eb"])
+    is_gaia_nss = gate_contract_res.apply(lambda r: r["is_gaia_nss"])
+
+    # Update df_merged with normalized catalog columns
+    df_merged["is_known_tess_eb"] = is_known_eb
+    df_merged["is_gaia_nss"] = is_gaia_nss
+
+    # 5-Rule Gate Conditions on validated physical and catalog quantities:
     # 1. No Gaia NSS binary & not known TESS EB
-    is_gaia_nss = df_merged["gaia_nss_type"].notna() & (
-        ~df_merged["gaia_nss_type"].astype(str).str.strip().str.upper().isin(["", "NAN", "NONE", "N/A", "FALSE"])
-    )
-    is_known_eb = df_merged["is_known_tess_eb"].astype(str).str.strip().str.upper() == "TRUE"
-
-    # 2. Secondary eclipse significance
-    sec_circ = (df_merged["sec_eclipse_phase"] - 0.50).abs() <= 0.04
-    sec_pass = (~sec_circ & (df_merged["sec_snr"] <= 3.4)) | (sec_circ & (df_merged["sec_snr"] <= 2.8))
-
+    # 2. Secondary eclipse significance from canonical validated ledger (sec_pass computed above)
     # 3. Kinematic duration self-consistency
     dur_pass = (df_merged["dur_ratio"] >= 0.55) & (df_merged["dur_ratio"] <= 1.35)
 
     # 4. Stellar environment: dilution & nearby EBs
     env_pass = (df_merged["neb_count"] <= max_neb_neighbors) & (df_merged["contam_pct"] <= max_flux_contam_pct)
 
-    # 5. Sidak-corrected FP risk threshold
+    # 5. Versioned VPS risk threshold (Gate <= max_corr_risk, default <= 25.0)
     risk_pass = df_merged["corr_risk"] <= max_corr_risk
 
     gate_mask = (~is_gaia_nss) & (~is_known_eb) & sec_pass & dur_pass & env_pass & risk_pass
@@ -466,11 +610,15 @@ def run_stage_3a_filter(
     df_rejected = df_merged[~gate_mask].copy().reset_index(drop=True)
 
     print(f"[Stage 3A Result] Input: {len(df_merged)} -> Rejected: {len(df_rejected)} -> Passed Gate: {len(df_survivors)} targets")
+    print(f"[Stage 3A] Gate condition 5: VPS <= {max_corr_risk:.1f} (default <= {ANTARES_DEFAULT_MAX_CORR_RISK:.1f})")
     print(f"[Stage 3A] Compute runtime saving: {100.0 * (1.0 - len(df_survivors) / max(1, len(df_merged))):.1f}% reduction in MAST downloads.\n")
 
     disp_cols = ["tic_id", "corr_risk", "period_d", "rp_e", "dur_ratio", "contam_pct", "neb_count", "sectors_stitched"]
     print("STAGE 3A SURVIVING TARGETS:")
-    print(df_survivors[disp_cols].to_string(index=False))
+    if len(df_survivors) > 0:
+        print(df_survivors[disp_cols].to_string(index=False))
+    else:
+        print("(0 surviving targets)")
     print("-" * 76)
 
     return df_survivors, df_rejected
@@ -1260,14 +1408,18 @@ def run_antares_packager(
     results_dir: str = DEFAULT_RESULTS_DIR,
     target_tic: str = None,
     force_all: bool = False,
-    min_snr: float = 3.8
+    min_snr: float = 3.8,
+    tier1_csv: str = None,
+    tier2_csv: str = None
 ):
     print("=" * 76)
     print("ALDEBARAN v8.0 / ANTARES v3.0: UNIFIED TIER-3 ARCHIVAL VETTER & CTOI PACKAGER")
     print("=" * 76)
 
-    tier1_csv = os.path.join(results_dir, "candidates_report.csv")
-    tier2_csv = os.path.join(results_dir, "deep_vetting", "scientific_dossier_summary.csv")
+    if tier1_csv is None:
+        tier1_csv = os.path.join(results_dir, "candidates_report.csv")
+    if tier2_csv is None:
+        tier2_csv = os.path.join(results_dir, "deep_vetting", "scientific_dossier_summary.csv")
 
     # Step 1: Stage 3A Filtering
     df_survivors, df_rejected = run_stage_3a_filter(
@@ -1293,7 +1445,24 @@ def run_antares_packager(
             df_survivors["corr_risk"] = 15.0
 
     if len(df_survivors) == 0:
-        print("[!] No candidates available for Stage 3B archival drilling.")
+        print("[!] No candidates available for Stage 3B archival drilling (0 survivors).")
+        ranking_cols = [
+            "rank", "tic_id", "period_days", "t0_btjd", "duration_hours",
+            "depth_ppm", "rp_earth", "mp_ck17_earth", "rv_k_ck17_ms",
+            "tsm", "esm", "snr_red", "corr_risk_percent", "priority_score"
+        ]
+        exofop_cols = [
+            "TIC ID", "Camera", "CCD", "Epoch BJD", "Period",
+            "Depth", "Duration", "Rp", "User Comments / Disposition"
+        ]
+        ranking_csv = os.path.join(results_dir, "prioritized_targets_ranking.csv")
+        exofop_csv = os.path.join(results_dir, "exofop_ctoi_upload.csv")
+        exofop_comma_csv = os.path.join(results_dir, "exofop_ctoi_upload_comma.csv")
+        top3_csv = os.path.join(results_dir, "exofop_ctoi_upload_top3.csv")
+        pd.DataFrame(columns=ranking_cols).to_csv(ranking_csv, index=False)
+        pd.DataFrame(columns=exofop_cols).to_csv(exofop_csv, index=False, sep="|")
+        pd.DataFrame(columns=exofop_cols).to_csv(exofop_comma_csv, index=False)
+        pd.DataFrame(columns=exofop_cols).to_csv(top3_csv, index=False)
         return
 
     # Step 2: Stage 3B Decoupled Archival Drill
@@ -1358,6 +1527,8 @@ def run_antares_packager(
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Antares Packager: Unified Tier-3 Archival Vetter & CTOI Packager")
     parser.add_argument("--results-dir", type=str, default=DEFAULT_RESULTS_DIR, help="Results directory (default: tess_results)")
+    parser.add_argument("--tier1-csv", type=str, default=None, help="Explicit path to Tier-1 candidates report CSV")
+    parser.add_argument("--tier2-csv", type=str, default=None, help="Explicit path to Tier-2 scientific dossier summary CSV")
     parser.add_argument("--tic", type=str, default=None, help="Target TIC ID to process individually")
     parser.add_argument("--force-all", action="store_true", help="Bypass Stage 3A gate and drill all candidates")
     parser.add_argument("--min-snr", type=float, default=3.8, help="Minimum SPOC red-noise SNR for CTOI inclusion (default: 3.8)")
@@ -1367,5 +1538,7 @@ if __name__ == "__main__":
         results_dir=args.results_dir,
         target_tic=args.tic,
         force_all=args.force_all,
-        min_snr=args.min_snr
+        min_snr=args.min_snr,
+        tier1_csv=args.tier1_csv,
+        tier2_csv=args.tier2_csv
     )

@@ -15,7 +15,7 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
-def run_triceratops_validation(tic_id, period, t0_btjd, duration_hours, depth_ppm, sectors, n_mc=5, n_bins=60):
+def run_triceratops_validation(tic_id, period, t0_btjd, duration_hours, depth_ppm, sectors, n_mc=5, n_bins=60, results_dir: str = None):
     print(f"\n{'='*75}")
     print(f" ALDEBARAN TIER-4 BAYESIAN STATISTICAL VALIDATION (TRICERATOPS)")
     print(f" Target: TIC {tic_id}")
@@ -164,11 +164,14 @@ def run_triceratops_validation(tic_id, period, t0_btjd, duration_hours, depth_pp
     print(f" Scientific Disposition: {disposition}")
     print(f"{'='*65}\n")
 
-    os.makedirs("tess_results/triceratops", exist_ok=True)
+    if results_dir is None:
+        results_dir = "tess_results"
+    out_dir = os.path.join(results_dir, "triceratops")
+    os.makedirs(out_dir, exist_ok=True)
 
     # Plot field and scenario fits
     try:
-        fits_base = f"tess_results/triceratops/triceratops_fits_TIC_{tic_id}"
+        fits_base = os.path.join(out_dir, f"triceratops_fits_TIC_{tic_id}")
         target.plot_fits(time=time_binned, flux_0=flux_binned, flux_err_0=flux_err_scalar, save=True, fname=fits_base)
         plt.savefig(fits_base + ".png", dpi=120)
         plt.close('all')
@@ -177,7 +180,7 @@ def run_triceratops_validation(tic_id, period, t0_btjd, duration_hours, depth_pp
         print(f"[!] Notice plotting fits: {e}")
 
     try:
-        field_base = f"tess_results/triceratops/triceratops_field_TIC_{tic_id}"
+        field_base = os.path.join(out_dir, f"triceratops_field_TIC_{tic_id}")
         sec_to_plot = sectors[0] if sectors else None
         target.plot_field(sector=sec_to_plot, save=True, fname=field_base)
         plt.savefig(field_base + ".png", dpi=120)
@@ -196,7 +199,7 @@ def run_triceratops_validation(tic_id, period, t0_btjd, duration_hours, depth_pp
             base_df['prob'] = base_df['prob'] / base_df['prob'].sum()
     prob_df = base_df
 
-    csv_path = f"tess_results/triceratops/triceratops_probs_TIC_{tic_id}.csv"
+    csv_path = os.path.join(out_dir, f"triceratops_probs_TIC_{tic_id}.csv")
     prob_df.to_csv(csv_path)
     print(f"[TRICERATOPS] Saved scenario probabilities table (averaged over {len(probs_history)} MC draws) to {csv_path}")
 
@@ -230,13 +233,15 @@ def run_triceratops_validation(tic_id, period, t0_btjd, duration_hours, depth_pp
     }
 
 
-def validate_auto(n_mc: int = 5, n_bins: int = 60, top_csv: str = None):
+def validate_auto(n_mc: int = 5, n_bins: int = 60, top_csv: str = None, results_dir: str = None):
     """
     Automatically validates top CTOI candidates from exofop_ctoi_upload_top3.csv
     or prioritized_targets_ranking.csv.
     """
+    if results_dir is None:
+        results_dir = "tess_results"
     if top_csv is None:
-        top_csv = os.path.join("tess_results", "exofop_ctoi_upload_top3.csv")
+        top_csv = os.path.join(results_dir, "exofop_ctoi_upload_top3.csv")
     if not os.path.exists(top_csv):
         print(f"[!] Top candidates table '{top_csv}' not found. Skipping auto-validation.")
         return
@@ -250,7 +255,7 @@ def validate_auto(n_mc: int = 5, n_bins: int = 60, top_csv: str = None):
     col_depth = [c for c in df_top.columns if "DEPTH" in c.upper()][0]
     col_dur = [c for c in df_top.columns if "DUR" in c.upper()][0]
 
-    ranking_csv = os.path.join("tess_results", "prioritized_targets_ranking.csv")
+    ranking_csv = os.path.join(results_dir, "prioritized_targets_ranking.csv")
     df_rank = pd.read_csv(ranking_csv) if os.path.exists(ranking_csv) else None
 
     targets_to_run = []
@@ -299,13 +304,16 @@ def validate_auto(n_mc: int = 5, n_bins: int = 60, top_csv: str = None):
             depth_ppm=cand["depth_ppm"],
             sectors=cand["sectors"],
             n_mc=n_mc,
-            n_bins=n_bins
+            n_bins=n_bins,
+            results_dir=results_dir
         )
 
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Run TRICERATOPS Bayesian Validation on a candidate.")
-    parser.add_argument("--auto", action="store_true", help="Automatically validate all targets from tess_results/exofop_ctoi_upload_top3.csv")
+    parser.add_argument("--auto", action="store_true", help="Automatically validate all targets from top3 CSV")
+    parser.add_argument("--top-csv", type=str, default=None, help="Explicit path to top candidates table")
+    parser.add_argument("--results-dir", type=str, default=None, help="Results directory for ranking lookup and output files")
     parser.add_argument("--tic", type=int, default=350190949, help="TIC ID")
     parser.add_argument("--period", type=float, default=0.926120, help="Period in days")
     parser.add_argument("--t0", type=float, default=1325.61416, help="T0 BTJD")
@@ -317,7 +325,7 @@ if __name__ == '__main__':
     
     args = parser.parse_args()
     if args.auto:
-        validate_auto(n_mc=args.mc, n_bins=args.bins)
+        validate_auto(n_mc=args.mc, n_bins=args.bins, top_csv=args.top_csv, results_dir=args.results_dir)
     else:
         run_triceratops_validation(
             tic_id=args.tic,
@@ -327,5 +335,6 @@ if __name__ == '__main__':
             depth_ppm=args.depth,
             sectors=args.sectors,
             n_mc=args.mc,
-            n_bins=args.bins
+            n_bins=args.bins,
+            results_dir=args.results_dir
         )

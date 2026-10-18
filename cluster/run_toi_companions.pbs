@@ -36,25 +36,118 @@ mkdir -p "$SCRATCHDIR/tess_results/toi_companions"
 if [ -d "$REPO_DIR/tess_results" ]; then
     cp -rf "$REPO_DIR/tess_results"/. "$SCRATCHDIR/tess_results/" 2>/dev/null || true
 fi
-cd "$SCRATCHDIR" || exit 1
+cd "$SCRATCHDIR" || {
+    echo "ERROR: Failed to change directory to SCRATCHDIR '$SCRATCHDIR'!" >&2
+    exit 1
+}
 
-python3 -m venv "$SCRATCHDIR/venv"
-source "$SCRATCHDIR/venv/bin/activate"
-pip install --upgrade pip --no-cache-dir --quiet
-if [ -f requirements.txt ]; then
-    pip install --no-cache-dir --quiet -r requirements.txt certifi
-else
-    pip install --no-cache-dir --quiet numpy scipy astropy pandas lightkurve astroquery matplotlib requests urllib3 certifi
+# Setup Python virtual environment in scratch with explicit status checks
+if ! python3 -m venv "$SCRATCHDIR/venv"; then
+    echo "ERROR: Failed to create virtual environment in '$SCRATCHDIR/venv'!" >&2
+    exit 3
 fi
 
+ACTIVATE_SCRIPT=""
+if [ -f "$SCRATCHDIR/venv/bin/activate" ]; then
+    ACTIVATE_SCRIPT="$SCRATCHDIR/venv/bin/activate"
+elif [ -f "$SCRATCHDIR/venv/Scripts/activate" ]; then
+    ACTIVATE_SCRIPT="$SCRATCHDIR/venv/Scripts/activate"
+else
+    echo "ERROR: Virtual environment activation script missing in '$SCRATCHDIR/venv'!" >&2
+    exit 3
+fi
+
+if ! source "$ACTIVATE_SCRIPT"; then
+    echo "ERROR: Failed to activate virtual environment using '$ACTIVATE_SCRIPT'!" >&2
+    exit 3
+fi
+
+# Verify active Python interpreter is the intended venv interpreter before executing workload
+if [ -z "$(command -v python 2>/dev/null)" ]; then
+    echo "ERROR: No active python executable found in PATH after venv activation!" >&2
+    exit 3
+fi
+
+if ! python -c "
+import sys, os
+expected = os.path.normcase(os.path.realpath(sys.argv[1]))
+actual = os.path.normcase(os.path.realpath(sys.prefix))
+if expected != actual:
+    sys.stderr.write(f'ERROR: Active Python sys.prefix ({actual}) does not match expected venv ({expected})\n')
+    sys.exit(1)
+" "$SCRATCHDIR/venv"; then
+    echo "ERROR: Active Python interpreter is not from intended venv '$SCRATCHDIR/venv'!" >&2
+    exit 3
+fi
+
+if ! python -m pip install --upgrade pip --no-cache-dir --quiet; then
+    echo "ERROR: Failed to upgrade pip in virtual environment '$SCRATCHDIR/venv'!" >&2
+    exit 3
+fi
+
+if [ -f requirements.txt ]; then
+    if ! python -m pip install --no-cache-dir --quiet -r requirements.txt certifi; then
+        echo "ERROR: Failed to install dependencies from requirements.txt!" >&2
+        exit 3
+    fi
+else
+    if ! python -m pip install --no-cache-dir --quiet numpy scipy astropy pandas lightkurve astroquery matplotlib requests urllib3 certifi; then
+        echo "ERROR: Failed to install default dependency packages!" >&2
+        exit 3
+    fi
+fi
+
+sync_and_finalize() {
+    local py_exit="$1"
+    local scratch="$2"
+    local repo="$3"
+    local clean_failed=0
+    local clean_rc=0
+
+    if mkdir -p "$repo/tess_results/toi_companions" && cp -rf "$scratch/tess_results/toi_companions"/. "$repo/tess_results/toi_companions/"; then
+        echo "Results and diagnostics successfully copied to $repo/tess_results/toi_companions"
+        if [ "$py_exit" -eq 0 ]; then
+            if command -v clean_scratch >/dev/null 2>&1; then
+                clean_scratch
+                clean_rc=$?
+                if [ "$clean_rc" -ne 0 ]; then
+                    clean_failed=1
+                    echo "ERROR: clean_scratch failed with exit code $clean_rc!" >&2
+                fi
+            fi
+        else
+            echo "WARNING: Python execution failed with exit code $py_exit. Retaining scratch for diagnostics." >&2
+        fi
+    else
+        echo "ERROR: Failed to copy results from scratch to $repo/tess_results/toi_companions!" >&2
+        echo "Preserving scratch directory for diagnosis." >&2
+        return 1
+    fi
+
+    if [ "$py_exit" -ne 0 ]; then
+        echo "Exiting with Python error code: $py_exit" >&2
+        return "$py_exit"
+    fi
+
+    if [ "$clean_failed" -ne 0 ]; then
+        return "$clean_rc"
+    fi
+
+    return 0
+}
+
 # Run TOI companion search on sectors 106 down to 99 across 8 parallel workers
-python search_toi_companions.py --sectors 106 105 104 103 102 101 100 99 --workers 8 --output-dir "$SCRATCHDIR/tess_results/toi_companions"
+EXIT_CODE=0
+python search_toi_companions.py --sectors 106 105 104 103 102 101 100 99 --workers 8 --output-dir "$SCRATCHDIR/tess_results/toi_companions" || EXIT_CODE=$?
 
-# Sync results back to permanent repo storage
-mkdir -p "$REPO_DIR/tess_results/toi_companions"
-cp -rf "$SCRATCHDIR/tess_results/toi_companions"/. "$REPO_DIR/tess_results/toi_companions/" 2>/dev/null || true
+# Sync results and diagnostics back to permanent repo storage
+sync_and_finalize "$EXIT_CODE" "$SCRATCHDIR" "$REPO_DIR"
+FINAL_RC=$?
 
-clean_scratch
+if [ "$FINAL_RC" -ne 0 ]; then
+    exit "$FINAL_RC"
+fi
+
 echo "======================================================================"
 echo "TOI Companion Search completed at: $(date)"
 echo "======================================================================"

@@ -1,6 +1,6 @@
 #!/bin/bash
 # ==============================================================================
-# ALDEBARAN v9.0 - TIER-2 MERGE, DEEP VETTING & TIER-4 TRICERATOPS REDUCER
+# ALDEBARAN v9.1 - TIER-2 MERGE, SAFE REDUCTION & ORCHESTRATION PBS WRAPPER
 # ==============================================================================
 #PBS -N merge_shards
 #PBS -l select=1:ncpus=8:mem=24gb:scratch_local=25gb
@@ -9,47 +9,344 @@
 #PBS -j oe
 
 echo "======================================================================"
-echo "Starting Aldebaran Shard Merge & Pleiades Vetting on $(hostname)"
-echo "Job ID: $PBS_JOBID"
+echo "Starting Aldebaran Shard Merge & Reduction Orchestration on $(hostname)"
+echo "Job ID: ${PBS_JOBID:-local_run}"
 echo "Start time: $(date)"
 echo "======================================================================"
 
-REPO_DIR="$PBS_O_WORKDIR"
+REPO_DIR="${PBS_O_WORKDIR:-$(pwd)}"
 if [ ! -f "$REPO_DIR/merge_shards.py" ] && [ -f "$REPO_DIR/../merge_shards.py" ]; then
     REPO_DIR="$(cd "$REPO_DIR/.." && pwd)"
 fi
 cd "$REPO_DIR" || exit 1
 
+# Environment / configuration variables (must be explicit)
+if [ -z "${MANIFEST_PATH:-}" ]; then
+    echo "ERROR: Required MANIFEST_PATH is not set" >&2
+    exit 2
+fi
+if [ ! -f "$MANIFEST_PATH" ]; then
+    echo "ERROR: Manifest file not found at '$MANIFEST_PATH'" >&2
+    exit 2
+fi
+if [ -z "${RUN_ID:-}" ]; then
+    echo "ERROR: Required RUN_ID is not set" >&2
+    exit 2
+fi
+if [ -z "${OUTPUT_DIR:-}" ]; then
+    echo "ERROR: Required OUTPUT_DIR is not set" >&2
+    exit 2
+fi
+
+RUN_PLEIADES="${RUN_PLEIADES:-0}"
+RUN_ANTARES="${RUN_ANTARES:-0}"
+RUN_TRICERATOPS="${RUN_TRICERATOPS:-0}"
+ALLOW_PARTIAL="${ALLOW_PARTIAL:-0}"
+
+PYTHON_EXIT_CODE=0
+PYTHON_PID=""
+SIGNAL_RECEIVED=0
+
+# Canonical path resolution helper (handles non-existent leaf paths safely)
+canonical_path() {
+    local target="$1"
+    if [ -d "$target" ]; then
+        (cd "$target" 2>/dev/null && pwd -P)
+    elif [ -e "$target" ]; then
+        local p
+        p="$(cd "$(dirname "$target")" 2>/dev/null && pwd -P)"
+        echo "$p/$(basename "$target")"
+    else
+        local cur="$target"
+        local trailing=""
+        while [ ! -d "$cur" ] && [ "$cur" != "/" ] && [ "$cur" != "." ] && [ -n "$cur" ]; do
+            trailing="$(basename "$cur")/${trailing}"
+            cur="$(dirname "$cur")"
+        done
+        local parent
+        parent="$(cd "$cur" 2>/dev/null && pwd -P)"
+        echo "${parent%/}/${trailing%/}"
+    fi
+}
+
+# Verify OUTPUT_DIR does not reside inside or equal SCRATCHDIR (destructive cleanup prevention)
+if [ -n "${SCRATCHDIR:-}" ]; then
+    canon_scratch="$(canonical_path "$SCRATCHDIR")"
+    canon_output="$(canonical_path "$OUTPUT_DIR")"
+    if [ "$canon_output" = "$canon_scratch" ] || [ "${canon_output#$canon_scratch/}" != "$canon_output" ]; then
+        echo "ERROR: OUTPUT_DIR cannot reside inside or equal SCRATCHDIR (destructive cleanup would destroy output)" >&2
+        exit 1
+    fi
+fi
+
+# Process tree inspection and termination (portable across Linux PBS and Git Bash)
+get_descendants() {
+    local root="$1"
+    [ -z "$root" ] && return 0
+    local all=""
+    local queue="$root"
+    while [ -n "$queue" ]; do
+        local next=""
+        for p in $queue; do
+            local ch
+            ch=$(ps -ef 2>/dev/null | awk -v parent="$p" '$3 == parent {print $2}')
+            for c in $ch; do
+                if [ -n "$c" ] && [ "$c" != "$p" ]; then
+                    case " $all " in
+                        *" $c "*) ;;
+                        *)
+                            all="$all $c"
+                            next="$next $c"
+                            ;;
+                    esac
+                fi
+            done
+        done
+        queue="$next"
+    done
+    echo "$all"
+}
+
+kill_process_tree() {
+    local target_pid="$1"
+    local sig="${2:-TERM}"
+    [ -z "$target_pid" ] && return 0
+
+    local descendants
+    descendants=$(get_descendants "$target_pid")
+    for p in $descendants "$target_pid"; do
+        kill -"$sig" "$p" 2>/dev/null || true
+    done
+
+    if command -v pkill >/dev/null 2>&1; then
+        pkill -"$sig" -P "$target_pid" 2>/dev/null || true
+    fi
+}
+
+handle_signal() {
+    local sig_name="$1"
+    local sig_code="$2"
+    SIGNAL_RECEIVED="$sig_code"
+    echo "======================================================================" >&2
+    echo "[!] Caught signal $sig_name in PBS wrapper ($$)" >&2
+    echo "======================================================================" >&2
+    if [ -n "$PYTHON_PID" ]; then
+        echo "[!] Forwarding signal $sig_name to child process tree rooted at $PYTHON_PID..." >&2
+        # 1. Snapshot all descendants before signalling
+        local descendants
+        descendants=$(get_descendants "$PYTHON_PID")
+        local tracked_pids="$PYTHON_PID $descendants"
+
+        # 2. Forward signal to all tracked processes
+        for p in $tracked_pids; do
+            kill -"$sig_name" "$p" 2>/dev/null || true
+        done
+
+        # 3. Bounded wait for all tracked processes
+        local timeout=5
+        local waited=0
+        while [ "$waited" -lt "$((timeout * 4))" ]; do
+            local any_alive=0
+            for p in $tracked_pids; do
+                if kill -0 "$p" 2>/dev/null; then
+                    any_alive=1
+                    break
+                fi
+            done
+            [ "$any_alive" -eq 0 ] && break
+            sleep 0.25
+            waited=$((waited + 1))
+        done
+
+        # 4. Escalate to KILL for any surviving tracked descendants
+        for p in $tracked_pids; do
+            if kill -0 "$p" 2>/dev/null; then
+                echo "[!] Process $p survived grace period, escalating to KILL..." >&2
+                kill -KILL "$p" 2>/dev/null || true
+            fi
+        done
+        wait "$PYTHON_PID" 2>/dev/null || true
+        PYTHON_PID=""
+    fi
+    echo "[!] Scratch retained for diagnostic review at ${SCRATCHDIR:-N/A}" >&2
+    exit "$sig_code"
+}
+
+trap 'handle_signal SIGTERM 143' TERM
+trap 'handle_signal SIGINT 130' INT
+
+# Scratch configuration
+if [ -n "${SCRATCHDIR:-}" ]; then
+    if [ ! -d "$SCRATCHDIR" ]; then
+        mkdir -p "$SCRATCHDIR" 2>/dev/null || { echo "ERROR: Failed to create SCRATCHDIR '$SCRATCHDIR'" >&2; exit 3; }
+    fi
+    export XDG_CACHE_HOME="$SCRATCHDIR/.cache"
+    export PIP_CACHE_DIR="$SCRATCHDIR/.cache/pip"
+    export LIGHTKURVE_CACHE_DIR="$SCRATCHDIR/.cache/lightkurve"
+    export ASTROPY_CACHE_DIR="$SCRATCHDIR/.cache/astropy"
+    export MPLCONFIGDIR="$SCRATCHDIR/.cache/matplotlib"
+    mkdir -p "$XDG_CACHE_HOME" "$PIP_CACHE_DIR" "$LIGHTKURVE_CACHE_DIR" "$ASTROPY_CACHE_DIR" "$MPLCONFIGDIR" || {
+        echo "ERROR: Failed to create scratch cache directories" >&2
+        exit 3
+    }
+fi
+
+# Load python module if available
 module add python/3.11 2>/dev/null || module add python 2>/dev/null || true
 
-export XDG_CACHE_HOME="$SCRATCHDIR/.cache"
-export PIP_CACHE_DIR="$SCRATCHDIR/.cache/pip"
-export LIGHTKURVE_CACHE_DIR="$SCRATCHDIR/.cache/lightkurve"
-export ASTROPY_CACHE_DIR="$SCRATCHDIR/.cache/astropy"
-export MPLCONFIGDIR="$SCRATCHDIR/.cache/matplotlib"
-mkdir -p "$XDG_CACHE_HOME" "$PIP_CACHE_DIR" "$LIGHTKURVE_CACHE_DIR" "$ASTROPY_CACHE_DIR" "$MPLCONFIGDIR"
-
-python3 -m venv "$SCRATCHDIR/venv"
-source "$SCRATCHDIR/venv/bin/activate"
-pip install --upgrade pip --no-cache-dir --quiet
-if [ -f requirements.txt ]; then
-    pip install --no-cache-dir --quiet -r requirements.txt certifi triceratops
-else
-    pip install --no-cache-dir --quiet numpy scipy astropy pandas lightkurve astroquery matplotlib requests urllib3 certifi triceratops
+# Setup virtual environment if scratch is defined
+if [ -n "$SCRATCHDIR" ] && [ -d "$SCRATCHDIR" ]; then
+    if [ ! -d "$SCRATCHDIR/venv" ]; then
+        python3 -m venv "$SCRATCHDIR/venv" || { echo "ERROR: Failed to create venv" >&2; exit 3; }
+    fi
+    source "$SCRATCHDIR/venv/bin/activate" || { echo "ERROR: Failed to activate venv" >&2; exit 3; }
+    pip install --upgrade pip --no-cache-dir --quiet || true
+    if [ -f requirements.txt ]; then
+        pip install --no-cache-dir --quiet -r requirements.txt certifi triceratops || { echo "ERROR: Failed to install requirements" >&2; exit 3; }
+    else
+        pip install --no-cache-dir --quiet numpy scipy astropy pandas lightkurve astroquery matplotlib requests urllib3 certifi triceratops || { echo "ERROR: Failed to install fallback dependencies" >&2; exit 3; }
+    fi
 fi
 
-python merge_shards.py
-
-# Priority P5: Tier-4 TRICERATOPS Bayesian Statistical Validation on Golden Candidates
-if [ -f validate_triceratops.py ]; then
-    echo "======================================================================"
-    echo "Launching Tier-4 TRICERATOPS Bayesian Validation on $(hostname)"
-    echo "Start time: $(date)"
-    echo "======================================================================"
-    python validate_triceratops.py --auto
+# Build arguments array
+MERGE_ARGS=(--manifest "$MANIFEST_PATH" --output-dir "$OUTPUT_DIR" --run-id "$RUN_ID")
+if [ "$RUN_PLEIADES" = "1" ] || [ "$RUN_PLEIADES" = "true" ]; then
+    MERGE_ARGS+=(--run-pleiades)
+fi
+if [ "$RUN_ANTARES" = "1" ] || [ "$RUN_ANTARES" = "true" ]; then
+    MERGE_ARGS+=(--run-antares)
+fi
+if [ "$RUN_TRICERATOPS" = "1" ] || [ "$RUN_TRICERATOPS" = "true" ]; then
+    MERGE_ARGS+=(--run-triceratops)
+fi
+if [ "$ALLOW_PARTIAL" = "1" ] || [ "$ALLOW_PARTIAL" = "true" ]; then
+    MERGE_ARGS+=(--allow-partial)
 fi
 
-clean_scratch
+echo "[+] Executing merge_shards.py with args: ${MERGE_ARGS[*]}"
+python merge_shards.py "${MERGE_ARGS[@]}" &
+PYTHON_PID=$!
+wait "$PYTHON_PID"
+PYTHON_EXIT_CODE=$?
+
+if [ $PYTHON_EXIT_CODE -ne 0 ]; then
+    echo "ERROR: merge_shards.py failed with exit code $PYTHON_EXIT_CODE" >&2
+    echo "[!] Scratch retained for debugging at ${SCRATCHDIR:-N/A}" >&2
+    exit $PYTHON_EXIT_CODE
+fi
+
+if [ "$SIGNAL_RECEIVED" -ne 0 ]; then
+    echo "[!] Termination signal received ($SIGNAL_RECEIVED); scratch retained at ${SCRATCHDIR:-N/A}" >&2
+    exit "$SIGNAL_RECEIVED"
+fi
+
+# Verify required durable outputs and validate run status before scratch cleanup (R7, B5 & C4)
+if [ ! -f "$OUTPUT_DIR/manifest.json" ] || [ ! -f "$OUTPUT_DIR/run_status.json" ]; then
+    echo "ERROR: Required output manifests missing from '$OUTPUT_DIR'. Refusing scratch cleanup." >&2
+    exit 4
+fi
+
+GATE_CHECK_SCRIPT='
+import sys, json, os, hashlib
+
+out_dir = sys.argv[1]
+expected_run_id = sys.argv[2]
+
+# 1. Parse run_status.json
+status_p = os.path.join(out_dir, "run_status.json")
+try:
+    with open(status_p, "r", encoding="utf-8") as f:
+        status_data = json.load(f)
+except Exception as e:
+    sys.stderr.write(f"ERROR: run_status.json is malformed or unreadable: {e}\n")
+    sys.exit(4)
+
+if not isinstance(status_data, dict):
+    sys.stderr.write("ERROR: run_status.json must be a JSON object\n")
+    sys.exit(4)
+
+actual_run_id = status_data.get("run_id")
+if actual_run_id != expected_run_id:
+    sys.stderr.write(f"ERROR: run_status.json run_id mismatch: expected \"{expected_run_id}\", got \"{actual_run_id}\"\n")
+    sys.exit(4)
+
+status_val = status_data.get("status")
+if status_val not in ("SUCCESS", "SUCCESS_PARTIAL_SURVEY"):
+    sys.stderr.write(f"ERROR: run_status.json status is \"{status_val}\" (must be exact SUCCESS or SUCCESS_PARTIAL_SURVEY)\n")
+    sys.exit(4)
+
+# 2. Parse manifest.json
+manifest_p = os.path.join(out_dir, "manifest.json")
+try:
+    with open(manifest_p, "r", encoding="utf-8") as f:
+        manifest_data = json.load(f)
+except Exception as e:
+    sys.stderr.write(f"ERROR: manifest.json is malformed or unreadable: {e}\n")
+    sys.exit(4)
+
+if not isinstance(manifest_data, dict):
+    sys.stderr.write("ERROR: manifest.json must be a JSON object\n")
+    sys.exit(4)
+
+man_run_id = manifest_data.get("run_id")
+if man_run_id != expected_run_id:
+    sys.stderr.write(f"ERROR: manifest.json run_id mismatch: expected \"{expected_run_id}\", got \"{man_run_id}\"\n")
+    sys.exit(4)
+
+# 3. Verify required output artifacts declared in manifest.json exist and match SHA256 hashes
+artifacts = manifest_data.get("artifacts")
+if not isinstance(artifacts, dict) or len(artifacts) == 0:
+    sys.stderr.write("ERROR: manifest.json has no declared artifacts or artifacts is not an object\n")
+    sys.exit(4)
+
+for rel_p, art_info in artifacts.items():
+    if not isinstance(rel_p, str) or not rel_p.strip():
+        sys.stderr.write("ERROR: artifact path key is invalid or empty\n")
+        sys.exit(4)
+    if os.path.isabs(rel_p) or ".." in rel_p.replace("\\", "/").split("/"):
+        sys.stderr.write(f"ERROR: artifact path \"{rel_p}\" contains traversal or is absolute\n")
+        sys.exit(4)
+    if not isinstance(art_info, dict):
+        sys.stderr.write(f"ERROR: manifest.json artifact entry \"{rel_p}\" is not an object (got {type(art_info).__name__})\n")
+        sys.exit(4)
+    exp_hash = art_info.get("sha256")
+    if not exp_hash or not isinstance(exp_hash, str) or not exp_hash.strip():
+        sys.stderr.write(f"ERROR: manifest.json artifact \"{rel_p}\" missing or invalid sha256\n")
+        sys.exit(4)
+    full_p = os.path.join(out_dir, rel_p)
+    if not os.path.exists(full_p) or not os.path.isfile(full_p):
+        sys.stderr.write(f"ERROR: declared output artifact \"{rel_p}\" missing from disk or is not a file\n")
+        sys.exit(4)
+    try:
+        with open(full_p, "rb") as f:
+            actual_hash = hashlib.sha256(f.read()).hexdigest().upper()
+        if actual_hash != exp_hash.strip().upper():
+            sys.stderr.write(f"ERROR: artifact \"{rel_p}\" hash mismatch: expected {exp_hash}, got {actual_hash}\n")
+            sys.exit(4)
+    except Exception as e:
+        sys.stderr.write(f"ERROR: failed to read artifact \"{rel_p}\": {e}\n")
+        sys.exit(4)
+'
+
+python -c "$GATE_CHECK_SCRIPT" "$OUTPUT_DIR" "$RUN_ID"
+GATE_EXIT_CODE=$?
+
+if [ $GATE_EXIT_CODE -ne 0 ]; then
+    echo "ERROR: Output status/manifest gate verification failed (exit code $GATE_EXIT_CODE). Refusing scratch cleanup." >&2
+    exit 4
+fi
+
+# Safe cleanup of scratch only on success
+if [ -n "$SCRATCHDIR" ] && type clean_scratch >/dev/null 2>&1; then
+    echo "[+] Running clean_scratch on success..."
+    clean_scratch || {
+        echo "ERROR: clean_scratch failed" >&2
+        exit 5
+    }
+fi
+
 echo "======================================================================"
-echo "Merge and Pleiades vetting completed at: $(date)"
+echo "Merge and orchestration completed successfully at: $(date)"
+echo "Output preserved in: $OUTPUT_DIR"
 echo "======================================================================"
+exit 0

@@ -1,37 +1,28 @@
 #!/bin/bash
-# ==============================================================================
-# ALDEBARAN v9.0 - END-TO-END AUTOMATED CLUSTER LAUNCHER
-# ==============================================================================
-# Submits the 8-node screening array (Tier-1) and automatically schedules the
-# shard merge and Pleiades deep vetting (Tier-2) to execute once all shards finish.
-# Usage: ./cluster/submit_all.sh or cd cluster && ./submit_all.sh
-# ==============================================================================
-
+# Explicit scan-only submission. Merge requires a separately verified manifest.
 set -euo pipefail
-
+usage() { echo "Usage: $0 --scan-only [--array 1-8]"; }
+fail() { echo "ERROR: $*" >&2; exit 2; }
+[[ $# -gt 0 ]] || { usage >&2; exit 2; }
+[[ "$1" == "--help" && $# -eq 1 ]] && { usage; exit 0; }
+[[ "$1" == "--scan-only" ]] || fail "Only --scan-only is supported; automatic merge is unavailable."
+shift
+array="1-8"
+if [[ $# -gt 0 ]]; then
+    [[ $# -eq 2 && "$1" == "--array" ]] || fail "Unsupported or ambiguous options."
+    array="$2"
+fi
+# run_aldebaran.pbs maps array indices onto eight configured sectors.
+[[ "$array" =~ ^([1-8])(-([1-8]))?$ ]] || fail "Array must be an index or ascending range within 1-8."
+if [[ -n "${BASH_REMATCH[3]:-}" ]]; then
+    [[ "${BASH_REMATCH[1]}" -le "${BASH_REMATCH[3]}" ]] || fail "Descending array range."
+fi
+command -v qsub >/dev/null 2>&1 || fail "qsub is unavailable."
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-cd "$REPO_DIR"
-
-echo "======================================================================"
-echo "Submitting Aldebaran v9.0 End-to-End Pipeline to MetaCentrum"
-echo "Repository Root: $REPO_DIR"
-echo "======================================================================"
-
-# 1. Submit Tier-1 array across 8 sectors
-ARRAY_JOB_ID=$(qsub -J 1-8 cluster/run_aldebaran.pbs)
-echo "[+] Step 1/2: Submitted Tier-1 array job -> ${ARRAY_JOB_ID}"
-
-# 2. Submit Tier-2 reducer with afterany dependency on the entire array
-MERGE_JOB_ID=$(qsub -W depend=afterany:"${ARRAY_JOB_ID}" cluster/run_merge.pbs)
-echo "[+] Step 2/2: Submitted Tier-2 merge reducer job -> ${MERGE_JOB_ID}"
-
-echo "======================================================================"
-echo "Workflow successfully scheduled!"
-echo "Tier-1 Array:        ${ARRAY_JOB_ID}"
-echo "Tier-2 Auto-Reducer: ${MERGE_JOB_ID} (Status: Hold/Waiting for array)"
-echo ""
-BASE_ID="${ARRAY_JOB_ID%%\[\]*}"
-echo "Monitor overall progress: qstat -u \$USER"
-echo "Monitor individual array tasks: qstat -t ${BASE_ID}[]"
-echo "======================================================================"
+cd "$SCRIPT_DIR/.."
+if ! job_id=$(qsub -J "$array" cluster/run_aldebaran.pbs); then
+    fail "Scan submission failed."
+fi
+[[ "$job_id" =~ ^[0-9]+(\[\])?\.[A-Za-z0-9][A-Za-z0-9.-]*$ ]] || fail "qsub returned an invalid job ID; inspect scheduler state before retrying."
+echo "Scan array submitted: $job_id"
+echo "Merge requires an independently checked explicit manifest and a separate submission."
