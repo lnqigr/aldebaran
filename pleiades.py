@@ -1,4 +1,5 @@
 import os
+from depth_contract import fit_depth_fields, number
 import io
 import ssl
 import json
@@ -19,6 +20,15 @@ from vps_contract import (
     VPS_SCHEMA_VERSION,
     VPS_PRODUCER_NAME,
     PLEIADES_CLEAN_VPS_THRESHOLD
+)
+from ephemeris_contract import (
+    BTJD_OFFSET,
+    fold_phase_0to1,
+    fold_phase_centered,
+    cyclic_orbital_distance,
+    compute_orbit_number,
+    days_to_hours,
+    hours_to_days
 )
 from scipy.optimize import curve_fit
 from scipy.ndimage import median_filter
@@ -109,7 +119,7 @@ def calc_max_keplerian_duration_hours(p_days: float, r_star_sun: float, m_star_s
     a_m = (G * m_kg * (p_sec ** 2) / (4.0 * np.pi ** 2)) ** (1.0 / 3.0)
     ratio = (r_m * (1.0 + rp_rs)) / a_m
     if ratio >= 1.0:
-        return p_days * 24.0 * 0.25
+        return days_to_hours(p_days) * 0.25
     t14_sec = (p_sec / np.pi) * np.arcsin(ratio)
     return float(t14_sec / 3600.0)
 
@@ -148,7 +158,7 @@ def scan_full_orbit_secondary_eclipse(
     Applies Sidak-Bonferroni trials-factor correction for alpha = 0.001 false-alarm rate.
     Returns: (is_eb_flag, max_sec_snr, max_sec_depth_ppm, best_sec_phase, z_crit_threshold)
     """
-    phase_0to1 = ((t - t0) % period) / period
+    phase_0to1 = fold_phase_0to1(t, t0, period)
     dur_phase = dur / period
     min_phi = max(0.06, 1.6 * dur_phase)
     
@@ -412,11 +422,13 @@ def deep_vet_target(cand_row: dict, vet_dir: str = None) -> dict | None:
     tic_id = str(int(cand_row["tic_id"]))
     p_init = safe_float(cand_row.get("period_days"), 5.0)
     t0_init = safe_float(cand_row.get("t0_btjd"), 3500.0)
-    dur_init = safe_float(cand_row.get("duration_hours"), 2.5) / 24.0
+    dur_init = hours_to_days(safe_float(cand_row.get("duration_hours"), 2.5))
     r_star = safe_float(cand_row.get("r_star_sun"), 1.0)
     m_star = safe_float(cand_row.get("m_star_sun"), r_star ** 1.1)
     teff = safe_float(cand_row.get("teff_k"), 5500.0)
-    depth_init_ppm = safe_float(cand_row.get("depth_ppm"), 1000.0)
+    depth_init_ppm = number(cand_row.get("depth_ppm"))
+    if not depth_init_ppm > 0:
+        raise ValueError("Missing positive Tier-1 photometric depth; no 1000ppm default")
     
     print(f"\n======================================================================")
     print(f"PLEIADES DEEP SCIENTIFIC VETTING {PIPELINE_VERSION}: TIC {tic_id} (Initial P = {p_init:.5f} d)")
@@ -441,7 +453,7 @@ def deep_vet_target(cand_row: dict, vet_dir: str = None) -> dict | None:
         t_sec, f_sec = t_sec[valid], f_sec[valid]
         f_sec = f_sec / np.nanmedian(f_sec)
         
-        phase_sec = ((t_sec - t0_init + 0.5 * p_init) % p_init) - 0.5 * p_init
+        phase_sec = fold_phase_centered(t_sec, t0_init, p_init, in_days=True)
         tr_mask = np.abs(phase_sec) < (0.65 * dur_init)
         f_flat = tukey_biweight_detrend(t_sec, f_sec, window_days=0.75, mask=tr_mask)
         
@@ -467,7 +479,7 @@ def deep_vet_target(cand_row: dict, vet_dir: str = None) -> dict | None:
     t0_ref = float(bls_res.transit_time[best_idx])
     dur_ref = float(bls_res.duration[best_idx])
     
-    phase = ((t - t0_ref + 0.5 * p_ref) % p_ref) - 0.5 * p_ref
+    phase = fold_phase_centered(t, t0_ref, p_ref, in_days=True)
     
     print(f"[2/4] Fitting 300-Ring Annular Limb-Darkened Transit Model (Teff={teff:.0f} K, R*={r_star:.2f} R_Sun)...")
     u1_est = float(np.clip(0.45 - 0.00008 * (teff - 5500.0), 0.15, 0.70))
@@ -483,12 +495,13 @@ def deep_vet_target(cand_row: dict, vet_dir: str = None) -> dict | None:
     nom_max_dur_hr, min_kepler_dur_hr, max_kepler_dur_hr = compute_keplerian_duration_bounds_hours(
         p_ref, r_star, e_r_star, m_star, e_m_star, rp_rs_guess
     )
-    upper_dur_bound = max(dur_ref * 0.7, min(dur_ref * 1.6, max_kepler_dur_hr / 24.0))
-    lower_dur_bound = max(0.005, min(dur_ref * 0.5, min_kepler_dur_hr / 24.0))
+    upper_dur_bound = max(dur_ref * 0.7, min(dur_ref * 1.6, hours_to_days(max_kepler_dur_hr)))
+    lower_dur_bound = max(0.005, min(dur_ref * 0.5, hours_to_days(min_kepler_dur_hr)))
     
     def model_to_fit(ph, rp_rs, b, dur_t):
         return exact_annulus_transit_model(ph, rp_rs, b, dur_t, u1_est, u2_est)
         
+    fit_converged, fit_error = False, ""
     try:
         p0_dur = np.clip(dur_ref, lower_dur_bound * 1.05, upper_dur_bound * 0.98)
         popt, _ = curve_fit(
@@ -500,11 +513,22 @@ def deep_vet_target(cand_row: dict, vet_dir: str = None) -> dict | None:
             maxfev=6000
         )
         rp_rs_fit, b_fit, dur_fit = float(popt[0]), float(popt[1]), float(popt[2])
-    except Exception:
+        if not np.all(np.isfinite(popt)) or rp_rs_fit <= 0 or dur_fit <= 0:
+            raise ValueError("Nonfinite or nonphysical fitted parameters")
+        fit_converged = True
+    except Exception as exc:
+        fit_error = type(exc).__name__ + ": " + str(exc)
         rp_rs_fit, b_fit, dur_fit = rp_rs_guess, 0.5, dur_ref
+    # Legacy fallback is retained for diagnostics/unchanged vetting, never labelled a fit.
+    depth_fields = fit_depth_fields(
+        rp_rs_fit, model_to_fit(np.array([0.0]), rp_rs_fit, b_fit, dur_fit)[0],
+        depth_init_ppm, fit_converged, fit_error)
+    depth_fields["stellar_parameter_provenance"] = (
+        "input_host_parameters" if all(number(cand_row.get(k)) > 0
+        for k in ("r_star_sun", "m_star_sun", "teff_k")) else "initial_model_assumptions_present")
         
     true_rp_earth = r_star * rp_rs_fit * 109.076
-    dur_ratio_kepler = (dur_fit * 24.0) / max(nom_max_dur_hr, 0.1)
+    dur_ratio_kepler = (days_to_hours(dur_fit)) / max(nom_max_dur_hr, 0.1)
     
     print(f"[3/4] Scanning Full-Orbit Secondary Eclipse across all out-of-transit phases...")
     is_sec_eb, sec_snr, sec_depth_ppm, sec_phi, z_crit = scan_full_orbit_secondary_eclipse(
@@ -567,7 +591,7 @@ def deep_vet_target(cand_row: dict, vet_dir: str = None) -> dict | None:
     else:
         disposition = "SUSPECT / GRAZING OR CONTAMINATED"
     
-    print(f"      -> Fitted Radius: Rp = {true_rp_earth:.2f} R_Earth (Rp/R* = {rp_rs_fit:.4f})")
+    print(f"      -> Radius (fit={fit_converged}, fallback explicitly flagged): Rp = {true_rp_earth:.2f} R_Earth (Rp/R* = {rp_rs_fit:.4f})")
     print(f"      -> Impact Parameter: b = {b_fit:.3f} | Duration / Nom_Kepler = {dur_ratio_kepler:.2f}")
     print(f"      -> Secondary Eclipse: Depth = {sec_depth_ppm:.0f} ppm at Phase {sec_center_phi:.2f} (SNR = {sec_snr:.2f} sigma)")
     print(f"      -> Gaia DR3 Neighbors (120\"): {gaia_contam['n_neighbors']} stars | Contamination = {gaia_contam['contamination_ratio']*100:.2f}%")
@@ -580,7 +604,7 @@ def deep_vet_target(cand_row: dict, vet_dir: str = None) -> dict | None:
     fig, axes = plt.subplots(2, 2, figsize=(15, 10))
     
     ph_grid = np.linspace(-2.2 * dur_fit, 2.2 * dur_fit, 500)
-    axes[0, 0].scatter(ph_fit * 24.0, f_fit, s=3, color="silver", alpha=0.35, label="Tukey Biweight Cadences")
+    axes[0, 0].scatter(days_to_hours(ph_fit), f_fit, s=3, color="silver", alpha=0.35, label="Tukey Biweight Cadences")
     bins = np.linspace(-2.2 * dur_fit, 2.2 * dur_fit, 35)
     b_means, b_edges, _ = stats.binned_statistic(ph_fit, f_fit, statistic="mean", bins=bins)
     b_std, _, _ = stats.binned_statistic(ph_fit, f_fit, statistic="std", bins=bins)
@@ -589,7 +613,7 @@ def deep_vet_target(cand_row: dict, vet_dir: str = None) -> dict | None:
     valid_b = b_cnt >= 3
     b_err = b_std[valid_b] / np.sqrt(b_cnt[valid_b])
     axes[0, 0].errorbar(
-        b_centers[valid_b] * 24.0,
+        days_to_hours(b_centers[valid_b]),
         b_means[valid_b],
         yerr=b_err,
         fmt="o",
@@ -601,12 +625,12 @@ def deep_vet_target(cand_row: dict, vet_dir: str = None) -> dict | None:
         label="Binned Photometry (±1σ)"
     )
     axes[0, 0].plot(
-        ph_grid * 24.0,
+        days_to_hours(ph_grid),
         model_to_fit(ph_grid, rp_rs_fit, b_fit, dur_fit),
         color="crimson",
         lw=2.5,
         zorder=5,
-        label=f"300-Ring Fit (b={b_fit:.2f}, Rp={true_rp_earth:.2f} R_E)"
+        label=f"300-Ring Model (fit={fit_converged}, b={b_fit:.2f}, Rp={true_rp_earth:.2f} R_E)"
     )
     # Focused Y-axis zoom on the transit feature to prevent noisy outliers from squishing the curve
     transit_depth = rp_rs_fit ** 2
@@ -623,10 +647,10 @@ def deep_vet_target(cand_row: dict, vet_dir: str = None) -> dict | None:
     axes[0, 0].set_title(f"TIC {tic_id}: Annular Limb-Darkened Transit Model (Sectors {sectors_used})")
     axes[0, 0].legend(loc="lower right")
     
-    phase_0to1 = ((t - t0_ref) % p_ref) / p_ref
-    sec_phase_diff = ((phase_0to1 - sec_center_phi + 0.5) % 1.0) - 0.5
+    phase_0to1 = fold_phase_0to1(t, t0_ref, p_ref)
+    sec_phase_diff = cyclic_orbital_distance(phase_0to1, sec_center_phi)
     sec_win = np.abs(sec_phase_diff) <= min(0.12, 3.0 * dur_fit / p_ref)
-    ph_sec_hrs = sec_phase_diff[sec_win] * p_ref * 24.0
+    ph_sec_hrs = days_to_hours(sec_phase_diff[sec_win] * p_ref)
     axes[0, 1].scatter(ph_sec_hrs, f[sec_win], s=3, color="silver", alpha=0.4)
     if len(ph_sec_hrs) > 20:
         s_bins = np.linspace(np.min(ph_sec_hrs), np.max(ph_sec_hrs), 25)
@@ -639,14 +663,14 @@ def deep_vet_target(cand_row: dict, vet_dir: str = None) -> dict | None:
     axes[0, 1].set_title(f"Secondary Eclipse Scan (Max Dip at Phase {sec_center_phi:.2f}: {sec_depth_ppm:.0f} ppm)")
     axes[0, 1].legend(loc="lower right")
     
-    orbit_nums = np.round((t - t0_ref) / p_ref).astype(int)
+    orbit_nums = compute_orbit_number(t, t0_ref, p_ref)
     in_tr_orbits = np.unique(orbit_nums[np.abs(phase) < (0.4 * dur_fit)])
     show_orbits = in_tr_orbits[:8]
     offset_step = max(0.003, 2.2 * (rp_rs_fit ** 2))
     for k, orb in enumerate(show_orbits):
         m_orb = (orbit_nums == orb) & (np.abs(phase) < (1.8 * dur_fit))
         if np.sum(m_orb) > 4:
-            axes[1, 0].plot(phase[m_orb] * 24.0, f[m_orb] - k * offset_step, "o-", ms=2.5, lw=1, alpha=0.8, label=f"Epoch #{orb}")
+            axes[1, 0].plot(days_to_hours(phase[m_orb]), f[m_orb] - k * offset_step, "o-", ms=2.5, lw=1, alpha=0.8, label=f"Epoch #{orb}")
     axes[1, 0].axvline(0.0, color="red", linestyle=":", alpha=0.6)
     axes[1, 0].set_xlabel("Time from Mid-Transit (hours)")
     axes[1, 0].set_ylabel("Flux + Vertical Offset")
@@ -664,8 +688,9 @@ def deep_vet_target(cand_row: dict, vet_dir: str = None) -> dict | None:
         f"ORBITAL & PHYSICAL PARAMETERS (300-Ring Fit):\n"
         f"  Refined Period:  {p_ref:.6f} days\n"
         f"  Mid-Transit T0:  {t0_ref:.5f} BTJD\n"
-        f"  Transit Dur:     {dur_fit*24.0:.2f} h (Kepler Bounds: {min_kepler_dur_hr:.2f}h - {max_kepler_dur_hr:.2f}h)\n"
+        f"  Transit Dur:     {days_to_hours(dur_fit):.2f} h (Kepler Bounds: {min_kepler_dur_hr:.2f}h - {max_kepler_dur_hr:.2f}h)\n"
         f"  Radius Ratio:    Rp/R* = {rp_rs_fit:.4f}\n"
+        f"  Fit converged:   {fit_converged} ({depth_fields['fit_status']})\n"
         f"  Planet Radius:   Rp = {true_rp_earth:.2f} R_Earth\n"
         f"  Impact Param:    b = {b_fit:.3f} (0=central, >0.82=grazing)\n"
         f"  Limb Darkening:  u1 = {u1_est:.2f}, u2 = {u2_est:.2f} (Teff={teff:.0f} K)\n\n"
@@ -692,6 +717,7 @@ def deep_vet_target(cand_row: dict, vet_dir: str = None) -> dict | None:
     return {
         "tic_id": tic_id,
         "operational_status": "SUCCESS",
+        **depth_fields,
         "disposition": disposition,
         "vps_version": VPS_SCHEMA_VERSION,
         "vps_producer": VPS_PRODUCER_NAME,
@@ -710,7 +736,7 @@ def deep_vet_target(cand_row: dict, vet_dir: str = None) -> dict | None:
         "refined_period_days": round(p_ref, 6),
         "refined_t0_btjd": round(t0_ref, 5),
         "fitted_depth_ppm": round((rp_rs_fit ** 2) * 1e6, 1),
-        "fitted_duration_hours": round(dur_fit * 24.0, 2),
+        "fitted_duration_hours": round(days_to_hours(dur_fit), 2),
         "fitted_rp_earth": round(true_rp_earth, 2),
         "impact_param_b": round(b_fit, 3),
         "dur_to_kepler_max": round(dur_ratio_kepler, 2),

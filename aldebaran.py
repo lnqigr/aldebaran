@@ -14,6 +14,22 @@ from typing import Any, Optional
 import certifi
 import requests
 
+try:
+    from decision_ledger import ObserverContext, SubmissionLedger
+except ImportError:
+    ObserverContext = None
+    SubmissionLedger = None
+
+from ephemeris_contract import (
+    days_to_hours,
+    BTJD_OFFSET,
+    fold_phase_0to1,
+    fold_phase_centered,
+    cyclic_orbital_distance,
+    compute_orbit_number,
+    cramer_rao_timing_uncertainty
+)
+
 logger = logging.getLogger(__name__)
 
 # Priority P1: Enforce verified TLS context anchored to certifi CA bundle
@@ -1003,7 +1019,7 @@ def calc_max_keplerian_duration_hours(p_days: float, r_star_sun: float, m_star_s
     a_m = (G * m_kg * (p_sec ** 2) / (4.0 * np.pi ** 2)) ** (1.0 / 3.0)
     ratio = (r_m * (1.0 + rp_rs)) / a_m
     if ratio >= 1.0:
-        return p_days * 24.0 * 0.25
+        return days_to_hours(p_days) * 0.25
     t14_sec = (p_sec / np.pi) * np.arcsin(ratio)
     return float(t14_sec / 3600.0)
 
@@ -1125,7 +1141,7 @@ def scan_full_orbit_secondary_eclipse(
     Note: z_crit is the eccentric trials-factor threshold and is retained in the return tuple
     even when the circular branch is selected. When circular is selected, best_sec_phase is 0.50.
     """
-    phase_0to1 = ((t - t0) % period) / period
+    phase_0to1 = fold_phase_0to1(t, t0, period)
     dur_phase = dur / period
     min_phi = max(0.06, 1.6 * dur_phase)
     
@@ -1367,7 +1383,7 @@ def verify_and_filter_tpf(tic_id: str, sector: int, p_val: float, t0_val: float,
         if not np.any(aperture):
             return False, "Empty SPOC pipeline aperture mask", None, None
             
-        phase = ((t_tpf - t0_val + 0.5 * p_val) % p_val) - 0.5 * p_val
+        phase = fold_phase_centered(t_tpf, t0_val, p_val, in_days=True)
         in_transit = np.abs(phase) < (0.45 * dur_val)
         out_transit = (np.abs(phase) > (0.75 * dur_val)) & (np.abs(phase) < (2.5 * dur_val))
         
@@ -1631,9 +1647,7 @@ def verify_multi_epoch(
         baseline_curr = float(np.max(t_curr) - np.min(t_curr))
 
         # Cramer-Rao Fisher timing uncertainty from discovery sector (Carter et al. 2008)
-        sigma_t0 = (0.5 * best_dur) / max(sde_curr, 5.0)
-        n_cyc_disc = max(1.0, baseline_curr / best_p)
-        sigma_p = np.sqrt(12.0) * sigma_t0 / n_cyc_disc
+        sigma_t0, sigma_p = cramer_rao_timing_uncertainty(best_dur, sde_curr, baseline_curr, best_p)
 
         if delta_t_arch <= 60.0:
             comb_stage = "PROJECTION"
@@ -1691,7 +1705,7 @@ def verify_multi_epoch(
         eff_p = refined_p if (refined_p is not None and np.isfinite(refined_p)) else best_p
         eff_t0 = refined_t0 if (refined_t0 is not None and np.isfinite(refined_t0)) else best_t0
 
-        phase_prior = ((t_prior - eff_t0 + 0.5 * eff_p) % eff_p) - 0.5 * eff_p
+        phase_prior = fold_phase_centered(t_prior, eff_t0, eff_p, in_days=True)
         tr_mask_prior = np.abs(phase_prior) < (0.6 * best_dur)
         trend_prior_ref = piecewise_savgol_detrend(t_prior, f_prior_raw, mask=tr_mask_prior, max_win=601)
         f_prior = f_prior_raw / trend_prior_ref
@@ -1741,7 +1755,9 @@ def verify_multi_epoch(
         ctrl_phases = [0.15, 0.20, 0.25, 0.30, 0.70, 0.75, 0.80, 0.85]
         ctrl_snrs = []
         for cp in ctrl_phases:
-            in_cp = np.abs(phase_prior - cp * eff_p) < (0.45 * best_dur)
+            # Compare on the periodic orbit: phase_prior is signed, while cp is in [0, 1).
+            cp_distance = np.abs(cyclic_orbital_distance(phase_prior, cp * eff_p, period=eff_p))
+            in_cp = cp_distance < (0.45 * best_dur)
             if np.sum(in_cp) >= 5:
                 cp_depth = float((base_p - np.nanmean(f_prior[in_cp])) * 1e6)
                 ctrl_snrs.append(cp_depth / max(err_prior_ppm, 1.0))
@@ -1834,7 +1850,9 @@ def analyze_single_target(
     min_period: float = 0.8,
     max_period: float = 13.0,
     run_id: str = None,
-    attempt_id: str = None
+    attempt_id: str = None,
+    *,
+    observer_context: Any = None
 ) -> AnalysisResult:
     """
     Worker entrypoint. Guarantees the per-target FITS cache is purged on EVERY non-candidate
@@ -1844,19 +1862,70 @@ def analyze_single_target(
     run_id and attempt_id, isolating archival vetting diagnostics to the current attempt.
     """
     result = None
+    ledger = None
+    if observer_context is not None and ObserverContext is not None and SubmissionLedger is not None:
+        try:
+            ctx = ObserverContext.from_any(observer_context)
+            if ctx is not None:
+                ledger = SubmissionLedger(ctx, tic_id, sector)
+                ledger.record_submission_begin()
+        except Exception:
+            pass
+
     if run_id is None:
         run_id = CURRENT_RUN_ID
     if attempt_id is None:
         import uuid
         attempt_id = f"att_{str(tic_id).lstrip('0')}_s{sector}_{uuid.uuid4().hex[:8]}"
+
+    if ledger is not None:
+        try:
+            ledger.bind_attempt_id(attempt_id)
+        except Exception:
+            pass
+
     try:
         result = _analyze_single_target_impl(
-            tic_id, sector, min_period, max_period, run_id=run_id, attempt_id=attempt_id
+            tic_id, sector, min_period, max_period, run_id=run_id, attempt_id=attempt_id,
+            observer_context=observer_context, ledger=ledger
         )
         return result
     finally:
         if AUTO_PURGE_CACHE and (result is None or result[1] != "CANDIDATE"):
             purge_target_cache(tic_id)
+
+
+def _extract_product_identity(prod) -> dict:
+    info = {}
+    for attr in ("target_name", "obsid", "mission", "author", "exptime", "sequence_number", "year"):
+        val = None
+        if hasattr(prod, attr):
+            val = getattr(prod, attr)
+        elif hasattr(prod, "meta") and isinstance(prod.meta, dict) and attr in prod.meta:
+            val = prod.meta.get(attr)
+        elif isinstance(prod, dict) and attr in prod:
+            val = prod.get(attr)
+
+        if val is not None:
+            if hasattr(val, "__getitem__") and not isinstance(val, (str, bytes, dict)):
+                try:
+                    val = val[0]
+                except Exception:
+                    pass
+            if hasattr(val, "item"):
+                try:
+                    val = val.item()
+                except Exception:
+                    pass
+            info[attr] = val
+
+    if not info and isinstance(prod, (str, bytes)):
+        info["product_repr"] = str(prod)
+    elif not info and isinstance(prod, dict):
+        info = dict(prod)
+    elif not info:
+        info["product_type"] = type(prod).__name__
+    return info
 
 
 def _analyze_single_target_impl(
@@ -1865,17 +1934,49 @@ def _analyze_single_target_impl(
     min_period: float = 0.8,
     max_period: float = 13.0,
     run_id: str = None,
-    attempt_id: str = None
+    attempt_id: str = None,
+    *,
+    observer_context: Any = None,
+    ledger: Any = None
 ) -> AnalysisResult:
+    if ledger is None and observer_context is not None and ObserverContext is not None and SubmissionLedger is not None:
+        try:
+            ctx = ObserverContext.from_any(observer_context)
+            if ctx is not None:
+                ledger = SubmissionLedger(ctx, tic_id, sector)
+                ledger.record_submission_begin()
+                if attempt_id is not None:
+                    ledger.bind_attempt_id(attempt_id)
+        except Exception:
+            pass
+
     if run_id is None:
         run_id = CURRENT_RUN_ID
     if attempt_id is None:
         import uuid
         attempt_id = f"att_{str(tic_id).lstrip('0')}_s{sector}_{uuid.uuid4().hex[:8]}"
+        if ledger is not None and getattr(ledger, "attempt_id", None) is None:
+            try:
+                ledger.bind_attempt_id(attempt_id)
+            except Exception:
+                pass
 
     attempt_diagnostics = []
 
     def make_res(t_id, status_val, msg_val, cand_val=None):
+        if ledger is not None:
+            try:
+                ledger.record_target_result(
+                    status_code=status_val,
+                    message=msg_val,
+                    has_candidate=(cand_val is not None),
+                    cand_data=cand_val
+                )
+                ledger.record_submission_final(
+                    status="COMPLETE" if status_val != "ERROR" else "ERROR"
+                )
+            except Exception:
+                pass
         return AnalysisResult(
             t_id,
             status_val,
@@ -1887,18 +1988,62 @@ def _analyze_single_target_impl(
         )
 
     try:
-        search_res = lk.search_lightcurve(f"TIC {tic_id}", mission="TESS", author="SPOC", sector=sector, exptime=120)
+        try:
+            if ledger is not None:
+                try:
+                    ledger.record_spoc_search_start(target=f"TIC {tic_id}", mission="TESS", author="SPOC", sector=sector, exptime=120)
+                except Exception:
+                    pass
+            search_res = lk.search_lightcurve(f"TIC {tic_id}", mission="TESS", author="SPOC", sector=sector, exptime=120)
+        except Exception as search_exc:
+            if ledger is not None:
+                try:
+                    ledger.record_spoc_search_error(exc=search_exc)
+                except Exception:
+                    pass
+            raise search_exc
+
         if len(search_res) == 0:
+            if ledger is not None:
+                try:
+                    ledger.record_spoc_search(num_products=0)
+                except Exception:
+                    pass
             return make_res(tic_id, "SKIP_NO_DATA", "SKIP: No SPOC data in target sector", None)
+
+        if ledger is not None:
+            try:
+                prod_info = _extract_product_identity(search_res[0])
+                ledger.record_spoc_search(num_products=len(search_res), selected_product_info=prod_info)
+            except Exception:
+                pass
+
         last_sector = sector
         lc_collection = [safe_download(search_res[0], tic_id, download_all=False)]
             
         t, f, ferr, dx, dy, crowdsap = extract_and_stitch_arrays(lc_collection, edge_trim_days=0.10)
         
+        # Check if CROWDSAP was defaulted or measured from metadata
+        is_default_crowdsap = True
+        if lc_collection and hasattr(lc_collection[0], "meta") and isinstance(lc_collection[0].meta, dict):
+            c_val = lc_collection[0].meta.get("CROWDSAP")
+            if c_val is not None and np.isfinite(float(c_val)) and float(c_val) > 0:
+                is_default_crowdsap = False
+
         # Filter 0: SPOC Aperture Crowding Metric (CROWDSAP)
         if crowdsap < 0.70:
+            if ledger is not None:
+                try:
+                    ledger.record_crowding_gate(crowdsap=float(crowdsap), passed=False, is_default=is_default_crowdsap)
+                except Exception:
+                    pass
             return make_res(tic_id, "REJECT_CROWDSAP", f"REJECT: Severe aperture crowding (CROWDSAP={crowdsap:.2f} < 0.70) -> Blended field", None)
-            
+        if ledger is not None:
+            try:
+                ledger.record_crowding_gate(crowdsap=float(crowdsap), passed=True, is_default=is_default_crowdsap)
+            except Exception:
+                pass
+
         med_f = np.median(f)
         mad_std = 1.4826 * np.median(np.abs(f - med_f))
         keep = f < (med_f + 3.0 * mad_std)
@@ -1950,19 +2095,76 @@ def _analyze_single_target_impl(
         
         max_p = min(max_period, (t_bls[-1] - t_bls[0]) * 0.48)
         if max_p <= min_period:
+            if ledger is not None:
+                try:
+                    ledger.record_baseline_gate(
+                        span=float(t_bls[-1] - t_bls[0]),
+                        min_period=float(min_period),
+                        max_period=float(max_period),
+                        max_p=float(max_p),
+                        passed=False
+                    )
+                except Exception:
+                    pass
             return make_res(tic_id, "REJECT_BASELINE", "REJECT: Time baseline too short", None)
+        if ledger is not None:
+            try:
+                ledger.record_baseline_gate(
+                    span=float(t_bls[-1] - t_bls[0]),
+                    min_period=float(min_period),
+                    max_period=float(max_period),
+                    max_p=float(max_p),
+                    passed=True
+                )
+            except Exception:
+                pass
             
         freqs = np.linspace(1.0 / max_p, 1.0 / min_period, 9000)
         periods = (1.0 / freqs)[::-1]
         # Start durations at 0.045d (1.08h) to prevent BLS grid boundary collapse
         durations = np.linspace(0.045, 0.18, 12)
         
-        bls_model = BoxLeastSquares(t_bls, flat_f_bls, dy=flat_ferr_bls)
-        bls_res = bls_model.power(periods, durations)
-        
-        # Kovács et al. (2002) whitened linear Signal Residue SDE
-        sde_arr, _ = compute_whitened_kovacs_sde(bls_res.power, window_pts=501)
-        top_peak_indices = get_top_distinct_bls_peaks(periods, sde_arr, max_peaks=MAX_PEAKS_PER_STAR)
+        if ledger is not None:
+            try:
+                ledger.record_bls_start(
+                    n_freq=len(freqs),
+                    min_freq=float(freqs[0]),
+                    max_freq=float(freqs[-1]),
+                    min_dur=float(durations[0]),
+                    max_dur=float(durations[-1]),
+                    n_dur=len(durations)
+                )
+            except Exception:
+                pass
+
+        try:
+            bls_model = BoxLeastSquares(t_bls, flat_f_bls, dy=flat_ferr_bls)
+            bls_res = bls_model.power(periods, durations)
+            # Kovács et al. (2002) whitened linear Signal Residue SDE
+            sde_arr, _ = compute_whitened_kovacs_sde(bls_res.power, window_pts=501)
+            top_peak_indices = get_top_distinct_bls_peaks(periods, sde_arr, max_peaks=MAX_PEAKS_PER_STAR)
+        except Exception as bls_exc:
+            if ledger is not None:
+                try:
+                    ledger.record_bls_error(exc=bls_exc)
+                except Exception:
+                    pass
+            raise bls_exc
+
+        if ledger is not None:
+            try:
+                ledger.record_bls_search(
+                    n_freq=len(freqs),
+                    min_freq=float(freqs[0]),
+                    max_freq=float(freqs[-1]),
+                    min_dur=float(durations[0]),
+                    max_dur=float(durations[-1]),
+                    n_dur=len(durations),
+                    window_pts=501,
+                    top_peak_indices=[int(idx) for idx in top_peak_indices]
+                )
+            except Exception:
+                pass
         
         star_info_cache = None
         first_reject_code = "EMPTY_LOW_SDE"
@@ -1976,10 +2178,31 @@ def _analyze_single_target_impl(
             
             # Filter 1: Signal Detection Efficiency (SDE >= 6.0) & Duty Cycle
             if sde < 6.0:
+                if ledger is not None:
+                    try:
+                        ledger.record_low_sde_gate(
+                            peak_idx=int(peak_idx),
+                            rank_idx=rank_idx,
+                            sde=sde,
+                            passed=False
+                        )
+                    except Exception:
+                        pass
                 if rank_idx == 1:
                     first_reject_code = "EMPTY_LOW_SDE"
                     first_reject_msg = f"Empty (SDE={sde:.1f})"
                 break
+            else:
+                if ledger is not None:
+                    try:
+                        ledger.record_low_sde_gate(
+                            peak_idx=int(peak_idx),
+                            rank_idx=rank_idx,
+                            sde=sde,
+                            passed=True
+                        )
+                    except Exception:
+                        pass
                 
             if (best_dur / best_p) > 0.095:
                 if rank_idx == 1:
@@ -2007,7 +2230,7 @@ def _analyze_single_target_impl(
                         first_reject_msg = f"REJECT [SDE={sde:.1f}, P={best_p:.4f}d]: {harmonic_reason}"
                     continue
                 
-            phase_full = ((t - best_t0 + 0.5 * best_p) % best_p) - 0.5 * best_p
+            phase_full = fold_phase_centered(t, best_t0, best_p, in_days=True)
             phase = phase_full[keep_res]
             transit_mask = (np.abs(phase_full) < (0.6 * best_dur)) | in_known_transit
             
@@ -2084,7 +2307,7 @@ def _analyze_single_target_impl(
                         continue
             
             # Filter 3: Multiplicity (>= 3 transits), Odd-Even symmetry & Phase 0.5 Secondary Eclipse Test
-            orbit_num = np.round((t_curr_eval - best_t0) / best_p).astype(int)
+            orbit_num = compute_orbit_number(t_curr_eval, best_t0, best_p)
             unique_transits = len(np.unique(orbit_num[in_tr]))
             if unique_transits < 3:
                 if rank_idx == 1:
@@ -2186,7 +2409,7 @@ def _analyze_single_target_impl(
             nom_max_dur_hr, min_kepler_dur_hr, max_kepler_dur_hr = compute_keplerian_duration_bounds_hours(
                 best_p, r_star, star_info_cache["e_r_star"], m_star, star_info_cache["e_m_star"], rp_rs
             )
-            obs_dur_hr = best_dur * 24.0
+            obs_dur_hr = days_to_hours(best_dur)
             if obs_dur_hr > max_kepler_dur_hr:
                 if rank_idx == 1:
                     first_reject_code = "REJECT_KEPLER_DURATION_LONG"
@@ -2366,7 +2589,7 @@ def _analyze_single_target_impl(
                 "ephemeris_fallback_reason": ephemeris_fallback_reason,
                 "time_system": "BTJD",
                 "time_standard": "TDB",
-                "epoch_offset_btjd": 2457000.0,
+                "epoch_offset_btjd": float(BTJD_OFFSET),
                 "period_units": "days",
                 "duration_units": "hours",
                 "depth_units": "ppm",
@@ -2460,29 +2683,48 @@ if __name__ == "__main__":
     write_log(start_banner)
     write_event(start_banner)
 
+    # Initialize observer run ledger if configured before report/catalog/queue preflight
+    obs_dir = os.environ.get("ALDEBARAN_OBSERVER_DIR")
+    run_ledger = None
+    if obs_dir and obs_dir.strip():
+        try:
+            from decision_ledger import RunLedger
+            run_ledger = RunLedger(observer_dir=obs_dir.strip(), legacy_run_id=CURRENT_RUN_ID)
+        except Exception as exc:
+            write_log(f"Warning: Failed to initialize observer RunLedger ({exc}); continuing with observer disabled.")
+
     # Validate existing candidate report early before remote sector/target selection
     candidates = []
-    if os.path.exists(REPORT_FILE):
-        if os.path.getsize(REPORT_FILE) == 0:
-            candidates = []
-        else:
+    try:
+        if os.path.exists(REPORT_FILE):
+            if os.path.getsize(REPORT_FILE) == 0:
+                candidates = []
+            else:
+                try:
+                    df_existing = pd.read_csv(REPORT_FILE)
+                except Exception as exc:
+                    raise RuntimeError(
+                        f"Failed to read existing candidate CSV '{REPORT_FILE}' ({type(exc).__name__}: {exc}). "
+                        f"Refusing to proceed to prevent corrupting historical artifacts."
+                    ) from exc
+
+                if list(df_existing.columns) != CANDIDATE_COLUMNS:
+                    raise RuntimeError(
+                        f"Incompatible candidate CSV schema in '{REPORT_FILE}'. "
+                        f"Existing header has {len(df_existing.columns)} columns, expected {len(CANDIDATE_COLUMNS)} columns "
+                        f"for schema {CANDIDATE_SCHEMA_VERSION}. Refusing to proceed to prevent corrupting historical artifacts."
+                    )
+                candidates = df_existing.to_dict("records")
+
+        active_sector, targets = select_latest_sector_and_targets(sector_list=PREFERRED_SECTORS, limit=MAX_TARGETS)
+    except Exception as prequeue_exc:
+        if run_ledger is not None:
             try:
-                df_existing = pd.read_csv(REPORT_FILE)
-            except Exception as exc:
-                raise RuntimeError(
-                    f"Failed to read existing candidate CSV '{REPORT_FILE}' ({type(exc).__name__}: {exc}). "
-                    f"Refusing to proceed to prevent corrupting historical artifacts."
-                ) from exc
-
-            if list(df_existing.columns) != CANDIDATE_COLUMNS:
-                raise RuntimeError(
-                    f"Incompatible candidate CSV schema in '{REPORT_FILE}'. "
-                    f"Existing header has {len(df_existing.columns)} columns, expected {len(CANDIDATE_COLUMNS)} columns "
-                    f"for schema {CANDIDATE_SCHEMA_VERSION}. Refusing to proceed to prevent corrupting historical artifacts."
-                )
-            candidates = df_existing.to_dict("records")
-
-    active_sector, targets = select_latest_sector_and_targets(sector_list=PREFERRED_SECTORS, limit=MAX_TARGETS)
+                run_ledger.record_prequeue_failure(str(prequeue_exc))
+                run_ledger.finalize_run(completed_count=0, error_count=1, candidate_count=0, status="ERROR")
+            except Exception:
+                pass
+        raise
 
     write_log(f"Launching parallel pipeline on {MAX_WORKERS} CPU workers for Sector {active_sector}...\n")
 
@@ -2492,14 +2734,49 @@ if __name__ == "__main__":
 
     executor = ProcessPoolExecutor(max_workers=MAX_WORKERS)
     try:
-        future_to_tic = {
-            executor.submit(analyze_single_target, tic, active_sector): tic
-            for tic in targets
-        }
+        if run_ledger is not None:
+            future_to_meta = {}
+            for tic in targets:
+                ctx = None
+                sub_id = None
+                try:
+                    ctx = run_ledger.create_submission_context(tic, active_sector)
+                    sub_id = ctx.submission_id
+                except Exception:
+                    ctx = None
+                    sub_id = None
+                fut = executor.submit(analyze_single_target, tic, active_sector, observer_context=ctx)
+                future_to_meta[fut] = (tic, sub_id)
+        else:
+            future_to_tic = {
+                executor.submit(analyze_single_target, tic, active_sector): tic
+                for tic in targets
+            }
 
-        for future in as_completed(future_to_tic):
+        iter_futures = future_to_meta if run_ledger is not None else future_to_tic
+        for future in as_completed(iter_futures):
             completed += 1
-            tic_id, code, status_msg, cand_dict = future.result()
+            if run_ledger is not None:
+                tic_id, sub_id = future_to_meta[future]
+                try:
+                    res_tuple = future.result()
+                except Exception as worker_exc:
+                    if sub_id is not None:
+                        try:
+                            run_ledger.record_submission_outcome(sub_id, exc=worker_exc)
+                        except Exception:
+                            pass
+                    raise worker_exc
+
+                if sub_id is not None:
+                    try:
+                        run_ledger.record_submission_outcome(sub_id, future_result=res_tuple)
+                    except Exception:
+                        pass
+                tic_id, code, status_msg, cand_dict = res_tuple
+            else:
+                tic_id = future_to_tic[future]
+                tic_id, code, status_msg, cand_dict = future.result()
             stats_counter[code] = stats_counter.get(code, 0) + 1
 
             if code != "ERROR":
@@ -2539,6 +2816,14 @@ if __name__ == "__main__":
         executor.shutdown(wait=False, cancel_futures=True)
     else:
         executor.shutdown(wait=True)
+
+    if run_ledger is not None:
+        try:
+            cand_cnt = len(candidates)
+            err_cnt = stats_counter.get("ERROR", 0)
+            run_ledger.finalize_run(completed_count=completed, error_count=err_cnt, candidate_count=cand_cnt)
+        except Exception:
+            pass
         
     summary_str = " | ".join(f"{k}: {v}" for k, v in sorted(stats_counter.items()))
     final_summary = f"Run Summary (Sector {active_sector}, {completed}/{total} processed): {summary_str}"

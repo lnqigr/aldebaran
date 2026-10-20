@@ -36,11 +36,19 @@ from typing import Any, Optional, Sequence, Union
 
 import numpy as np
 import pandas as pd
+from ephemeris_contract import (
+    days_to_hours,
+    hours_to_days,
+    BTJD_OFFSET,
+    bjd_to_btjd,
+    btjd_to_bjd,
+    calculate_cyclic_timing_residual as contract_calculate_cyclic_timing_residual
+)
 
 logger = logging.getLogger("aldebaran.known_signals")
 
 SCHEMA_VERSION = "known_signals_v1"
-BJD_BTJD_OFFSET = 2457000.0
+BJD_BTJD_OFFSET = BTJD_OFFSET
 CANONICAL_SOURCES = ("nasa_toi", "nasa_confirmed", "exofop_ctoi", "vizier_tess_eb")
 
 
@@ -85,15 +93,13 @@ def normalize_tic_id(val: Any) -> str:
 
 def convert_bjd_to_btjd(bjd: float) -> float:
     """Converts BJD to BTJD if > 2,400,000, otherwise preserves value."""
-    if bjd > 2400000.0:
-        return float(bjd - BJD_BTJD_OFFSET)
-    return float(bjd)
+    return float(bjd_to_btjd(bjd, strict=False))
 
 
 def convert_btjd_to_bjd(btjd: float) -> float:
     """Converts BTJD to BJD if < 100,000, otherwise preserves value."""
     if btjd < 100000.0:
-        return float(btjd + BJD_BTJD_OFFSET)
+        return float(btjd_to_bjd(btjd, strict=True))
     return float(btjd)
 
 
@@ -721,7 +727,7 @@ class KnownSignalsRegistry:
             toi_list = []
             for s in host.signals:
                 if s.source_catalog == "nasa_toi" and not s.quarantined and s.period_days is not None and s.epoch_btjd is not None:
-                    dur_days = (s.duration_hours / 24.0) if s.duration_hours is not None else 0.08
+                    dur_days = (hours_to_days(s.duration_hours)) if s.duration_hours is not None else 0.08
                     toi_list.append({
                         "toi": str(s.source_record_id),
                         "period": float(s.period_days),
@@ -838,7 +844,7 @@ class KnownSignalsRegistry:
                     if sig.duration_days is not None and (not math.isfinite(sig.duration_days) or sig.duration_days <= 0):
                         raise ValueError(f"Malformed cache: signal {sig.signal_id} is maskable=True but has invalid duration_days: {sig.duration_days}")
                     if sig.duration_hours is not None and sig.duration_days is not None:
-                        if abs(sig.duration_hours - sig.duration_days * 24.0) > 1e-3:
+                        if abs(sig.duration_hours - days_to_hours(sig.duration_days)) > 1e-3:
                             raise ValueError(f"Malformed cache: signal {sig.signal_id} duration_hours ({sig.duration_hours}) inconsistent with duration_days ({sig.duration_days})")
 
                 if sig.has_transit_ephemeris:
@@ -1127,7 +1133,7 @@ def ingest_nasa_toi_df(
                 dur_val = float(row[dur_col])
                 if math.isfinite(dur_val) and dur_val > 0:
                     dur_h = dur_val
-                    dur_d = dur_h / 24.0
+                    dur_d = hours_to_days(dur_h)
             except Exception:
                 pass
         if dur_err_col and pd.notna(row.get(dur_err_col)):
@@ -1429,7 +1435,7 @@ def ingest_nasa_confirmed_df(
                 dur_val = float(row[dur_col])
                 if math.isfinite(dur_val) and dur_val > 0:
                     dur_h = dur_val
-                    dur_d = dur_h / 24.0
+                    dur_d = hours_to_days(dur_h)
             except Exception:
                 pass
         if dur_err_col and pd.notna(row.get(dur_err_col)):
@@ -1711,7 +1717,7 @@ def ingest_exofop_ctoi_df(
                 dur_val = float(row[dur_col])
                 if math.isfinite(dur_val) and dur_val > 0:
                     dur_h = dur_val
-                    dur_d = dur_h / 24.0
+                    dur_d = hours_to_days(dur_h)
             except Exception:
                 pass
 
@@ -2021,44 +2027,11 @@ def calculate_cyclic_timing_residual(
     """
     Calculates physical timing difference between candidate and catalog solutions,
     strictly invariant to integer-cycle epoch shifts in either candidate or catalog.
-
-    Methodology:
-      1. Uses pivot_time as a common fixed time anchor (if None, defaults to cand_t0).
-      2. Projects candidate ephemeris to nearest cycle around pivot_time:
-           N_cand = round((pivot_time - cand_t0) / cand_p)
-           T_cand_proj = cand_t0 + N_cand * cand_p
-      3. Projects catalog ephemeris to nearest cycle around T_cand_proj:
-           N_cat = round((T_cand_proj - cat_t0) / cat_p)
-           T_cat_proj = cat_t0 + N_cat * cat_p
-      4. Timing residual dt = T_cand_proj - T_cat_proj.
-      5. Centered cyclic residual:
-           dt_cyclic = dt - round(dt / cat_p) * cat_p
-      6. Phase offset in [-0.5, 0.5]:
-           phase = dt_cyclic / cat_p
-
-    Returns:
-      (dt_days, dt_minutes, phase_offset)
+    Delegates to canonical implementation in ephemeris_contract.
     """
-    if cand_p <= 0 or cat_p <= 0:
-        raise ValueError(f"Periods must be strictly positive: cand_p={cand_p}, cat_p={cat_p}")
-
-    anchor = cand_t0 if pivot_time is None else float(pivot_time)
-
-    # Transport candidate to anchor
-    n_cand = round((anchor - cand_t0) / cand_p)
-    t_cand_proj = cand_t0 + n_cand * cand_p
-
-    # Transport catalog to nearest cycle at candidate predicted time
-    n_cat = round((t_cand_proj - cat_t0) / cat_p)
-    t_cat_proj = cat_t0 + n_cat * cat_p
-
-    dt_days = t_cand_proj - t_cat_proj
-    # Ensure cyclic centering within [-P_cat / 2, +P_cat / 2]
-    dt_cyclic_days = dt_days - round(dt_days / cat_p) * cat_p
-    dt_minutes = dt_cyclic_days * 1440.0
-    phase_offset = dt_cyclic_days / cat_p
-
-    return dt_cyclic_days, dt_minutes, phase_offset
+    return contract_calculate_cyclic_timing_residual(
+        cand_p, cand_t0, cat_p, cat_t0, pivot_time=pivot_time
+    )
 
 
 @dataclass

@@ -65,6 +65,42 @@ class VPSContractError(ValueError):
     pass
 
 
+CTOI_SECONDARY_THRESHOLD_SNR = 3.5
+
+def secondary_evidence(sec_center_phi: float, sec_snr: float) -> Dict[str, Any]:
+    """Full-precision VPS predicate, phase in cycles and SNR in sigma.
+
+    Retains production binary64 zone arithmetic, strict comparisons and penalties.
+    A heuristic evidence predicate, not an astrophysical probability.
+    """
+    if sec_snr is None or isinstance(sec_snr, bool) or not math.isfinite(sec_snr) or sec_snr < 0:
+        raise VPSContractError("Secondary SNR must be finite and nonnegative")
+    if sec_center_phi is None or isinstance(sec_center_phi, bool) or not math.isfinite(sec_center_phi) or not 0 <= sec_center_phi <= 1:
+        raise VPSContractError("Secondary phase must be finite in [0,1]")
+    sec_phase = float(sec_center_phi)
+    is_circular_sec = abs(sec_phase - SEC_CIRCULAR_CENTER) <= SEC_CIRCULAR_HALF_WIDTH
+    sec_snr_threshold = SEC_CIRCULAR_THRESHOLD_SNR if is_circular_sec else SEC_ECCENTRIC_THRESHOLD_SNR
+
+    sec_snr_val = float(sec_snr)
+    sec_penalty_applied = sec_snr_val > sec_snr_threshold
+    if sec_penalty_applied:
+        sec_penalty = float(SEC_PENALTY_SCALE * (sec_snr_val / SEC_PENALTY_SNR_DIVISOR))
+    else:
+        sec_penalty = 0.0
+    # R1: Store full-precision floats in secondary_metadata so validator does not diverge from producer
+    secondary_metadata = {
+        "phase": float(sec_phase),
+        "snr": float(sec_snr_val),
+        "is_circular": bool(is_circular_sec),
+        "zone": "circular" if is_circular_sec else "eccentric",
+        "threshold": float(sec_snr_threshold),
+        "penalty_applied": bool(sec_penalty_applied),
+        "penalty_amount": float(sec_penalty)
+    }
+
+    return secondary_metadata
+
+
 def compute_vps_ledger(
     b_fit: float,
     sec_center_phi: float,
@@ -133,16 +169,8 @@ def compute_vps_ledger(
     # 3. Secondary eclipse significance penalty (Šidák-Bonferroni dual-zone threshold)
     # Circular zone (|phase - 0.50| <= 0.04): SNR > 2.8 sigma
     # Eccentric zone (|phase - 0.50| > 0.04): SNR > 3.4 sigma
-    sec_phase = float(sec_center_phi)
-    is_circular_sec = abs(sec_phase - SEC_CIRCULAR_CENTER) <= SEC_CIRCULAR_HALF_WIDTH
-    sec_snr_threshold = SEC_CIRCULAR_THRESHOLD_SNR if is_circular_sec else SEC_ECCENTRIC_THRESHOLD_SNR
-
-    sec_snr_val = float(sec_snr)
-    sec_penalty_applied = sec_snr_val > sec_snr_threshold
-    if sec_penalty_applied:
-        sec_penalty = float(SEC_PENALTY_SCALE * (sec_snr_val / SEC_PENALTY_SNR_DIVISOR))
-    else:
-        sec_penalty = 0.0
+    secondary_metadata = secondary_evidence(sec_center_phi, sec_snr)
+    sec_penalty = secondary_metadata["penalty_amount"]
     components["secondary_significance"] = sec_penalty
 
     # 4. Secondary EB flag
@@ -200,16 +228,6 @@ def compute_vps_ledger(
     # Serialized rounded score (1 decimal place)
     final_score = round(clipped_score, VPS_ROUNDING_DECIMALS)
 
-    # R1: Store full-precision floats in secondary_metadata so validator does not diverge from producer
-    secondary_metadata = {
-        "phase": float(sec_phase),
-        "snr": float(sec_snr_val),
-        "is_circular": bool(is_circular_sec),
-        "zone": "circular" if is_circular_sec else "eccentric",
-        "threshold": float(sec_snr_threshold),
-        "penalty_applied": bool(sec_penalty_applied),
-        "penalty_amount": float(sec_penalty)
-    }
 
     return {
         "version": VPS_SCHEMA_VERSION,
@@ -432,7 +450,8 @@ def validate_and_extract_vps_score(row: Union[pd.Series, Mapping[str, Any]]) -> 
     if not (0.0 <= sec_phase <= 1.0):
         raise VPSContractError(f"Target TIC {tic_id} secondary phase must be in [0.0, 1.0], got {sec_phase}")
 
-    is_circ = bool(abs(sec_phase - SEC_CIRCULAR_CENTER) <= SEC_CIRCULAR_HALF_WIDTH)
+    expected_secondary = secondary_evidence(sec_phase, float(sec_meta["snr"]))
+    is_circ = expected_secondary["is_circular"]
     if sec_meta["is_circular"] != is_circ:
         raise VPSContractError(
             f"Target TIC {tic_id} secondary metadata 'is_circular' contradiction: expected {is_circ}, got {sec_meta['is_circular']}."
@@ -445,7 +464,7 @@ def validate_and_extract_vps_score(row: Union[pd.Series, Mapping[str, Any]]) -> 
             f"Target TIC {tic_id} secondary zone inconsistency: expected '{expected_zone}', got '{actual_zone}'."
         )
 
-    expected_threshold = SEC_CIRCULAR_THRESHOLD_SNR if is_circ else SEC_ECCENTRIC_THRESHOLD_SNR
+    expected_threshold = expected_secondary["threshold"]
     actual_threshold = float(sec_meta["threshold"])
     if abs(actual_threshold - expected_threshold) > 1e-6:
         raise VPSContractError(
@@ -453,7 +472,7 @@ def validate_and_extract_vps_score(row: Union[pd.Series, Mapping[str, Any]]) -> 
         )
 
     sec_snr = float(sec_meta["snr"])
-    expected_applied = sec_snr > expected_threshold
+    expected_applied = expected_secondary["penalty_applied"]
     actual_applied = bool(sec_meta["penalty_applied"])
     if expected_applied != actual_applied:
         raise VPSContractError(
@@ -461,7 +480,7 @@ def validate_and_extract_vps_score(row: Union[pd.Series, Mapping[str, Any]]) -> 
             f"expected {expected_applied} for SNR={sec_snr} vs threshold={expected_threshold}, got {actual_applied}."
         )
 
-    expected_penalty_amt = float(SEC_PENALTY_SCALE * (sec_snr / SEC_PENALTY_SNR_DIVISOR)) if expected_applied else 0.0
+    expected_penalty_amt = expected_secondary["penalty_amount"]
     actual_penalty_amt = float(sec_meta["penalty_amount"])
     if abs(expected_penalty_amt - actual_penalty_amt) > VPS_RECONSTRUCTION_TOLERANCE:
         raise VPSContractError(
@@ -478,3 +497,43 @@ def validate_and_extract_vps_score(row: Union[pd.Series, Mapping[str, Any]]) -> 
 
     # 11. Authoritative score return: NO secondary subtraction
     return vps_score
+
+
+def resolve_secondary_evidence(row: Mapping[str, Any]) -> Dict[str, Any]:
+    """Canonical validated ledger wins over display columns; legacy stays explicit.
+
+    Invalid supplied ledgers fail closed. Missing legacy SNR is unknown, not
+    absence. CTOI >3.5 and VPS phase-dependent thresholds are distinct policies.
+    """
+    raw = row.get("vps_ledger_json")
+    supplied = isinstance(raw, dict) or (raw is not None and not pd.isna(raw) and str(raw).strip() != "")
+    if not supplied and row.get("vps_version") is not None and not pd.isna(row.get("vps_version")):
+        raise VPSContractError("Versioned VPS record missing canonical ledger")
+    if supplied:
+        validate_and_extract_vps_score(row)
+        ledger = raw if isinstance(raw, dict) else json.loads(str(raw))
+        meta = secondary_evidence(ledger["secondary_metadata"]["phase"], ledger["secondary_metadata"]["snr"])
+        # Existing Antares representation allowance; never used for decisions.
+        for column, key, decimals in (("sec_eclipse_phase", "phase", 3), ("secondary_snr_sigma", "snr", 2)):
+            value = row.get(column)
+            if value is not None and not pd.isna(value):
+                try:
+                    number = float(value)
+                except (ValueError, TypeError) as exc:
+                    raise VPSContractError(f"Invalid secondary display {column}") from exc
+                if not math.isfinite(number) or all(abs(number - expected) > VPS_RECONSTRUCTION_TOLERANCE
+                                                     for expected in (meta[key], round(meta[key], decimals))):
+                    raise VPSContractError(f"Contradictory secondary display {column}")
+        source, snr = "canonical_vps_ledger", meta["snr"]
+    else:
+        source = "legacy_display_only"
+        try:
+            snr = float(row.get("secondary_snr_sigma"))
+        except (TypeError, ValueError):
+            snr = math.nan
+        if not math.isfinite(snr) or snr < 0:
+            return {"source": source, "snr": None, "phase": None, "vps_penalty_applied": None, "ctoi_reject": None}
+        meta = {"phase": None, "penalty_applied": None}
+    return {"source": source, "snr": snr, "phase": meta["phase"],
+            "vps_penalty_applied": meta["penalty_applied"],
+            "ctoi_reject": snr > CTOI_SECONDARY_THRESHOLD_SNR}

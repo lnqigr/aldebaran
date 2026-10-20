@@ -2132,15 +2132,15 @@ class TestAntaresPackagerCLI(unittest.TestCase):
 
         # 4 header-only exports must exist with 0 data rows
         expected_files = [
-            "prioritized_targets_ranking.csv",
-            "exofop_ctoi_upload.csv",
-            "exofop_ctoi_upload_comma.csv",
-            "exofop_ctoi_upload_top3.csv"
+            "antares_prioritized_targets_ranking.csv",
+            "antares_exofop_ctoi_upload.csv",
+            "antares_exofop_ctoi_upload_comma.csv",
+            "antares_exofop_ctoi_upload_top3.csv"
         ]
         for f in expected_files:
             fp = os.path.join(out_dir, f)
             self.assertTrue(os.path.exists(fp), f"Expected export file {f} missing")
-            df = pd.read_csv(fp, sep="|" if f == "exofop_ctoi_upload.csv" else ",")
+            df = pd.read_csv(fp, sep="|" if f == "antares_exofop_ctoi_upload.csv" else ",")
             self.assertEqual(len(df), 0, f"Expected 0 data rows in {f}")
 
     def test_antares_cli_empty_tier1_exits_0_with_header_only_exports(self):
@@ -2160,7 +2160,7 @@ class TestAntaresPackagerCLI(unittest.TestCase):
             timeout=30,
         )
         self.assertEqual(proc.returncode, 0)
-        ranking_csv = os.path.join(out_dir, "prioritized_targets_ranking.csv")
+        ranking_csv = os.path.join(out_dir, "antares_prioritized_targets_ranking.csv")
         self.assertTrue(os.path.exists(ranking_csv))
         df = pd.read_csv(ranking_csv)
         self.assertEqual(len(df), 0)
@@ -2314,15 +2314,15 @@ class TestAntaresPackagerCLI(unittest.TestCase):
         )
         self.assertEqual(proc.returncode, 0)
         expected_files = [
-            "prioritized_targets_ranking.csv",
-            "exofop_ctoi_upload.csv",
-            "exofop_ctoi_upload_comma.csv",
-            "exofop_ctoi_upload_top3.csv"
+            "antares_prioritized_targets_ranking.csv",
+            "antares_exofop_ctoi_upload.csv",
+            "antares_exofop_ctoi_upload_comma.csv",
+            "antares_exofop_ctoi_upload_top3.csv"
         ]
         for f in expected_files:
             fp = os.path.join(out_dir, f)
             self.assertTrue(os.path.exists(fp), f"Expected export file {f} missing")
-            df = pd.read_csv(fp, sep="|" if f == "exofop_ctoi_upload.csv" else ",")
+            df = pd.read_csv(fp, sep="|" if f == "antares_exofop_ctoi_upload.csv" else ",")
             self.assertEqual(len(df), 0, f"Expected 0 data rows in {f}")
 
     def test_antares_cli_all_valid_high_contamination_rejected_exits_0_with_header_only_exports(self):
@@ -2361,16 +2361,143 @@ class TestAntaresPackagerCLI(unittest.TestCase):
         )
         self.assertEqual(proc.returncode, 0)
         expected_files = [
-            "prioritized_targets_ranking.csv",
-            "exofop_ctoi_upload.csv",
-            "exofop_ctoi_upload_comma.csv",
-            "exofop_ctoi_upload_top3.csv"
+            "antares_prioritized_targets_ranking.csv",
+            "antares_exofop_ctoi_upload.csv",
+            "antares_exofop_ctoi_upload_comma.csv",
+            "antares_exofop_ctoi_upload_top3.csv"
         ]
         for f in expected_files:
             fp = os.path.join(out_dir, f)
             self.assertTrue(os.path.exists(fp), f"Expected export file {f} missing")
-            df = pd.read_csv(fp, sep="|" if f == "exofop_ctoi_upload.csv" else ",")
+            df = pd.read_csv(fp, sep="|" if f == "antares_exofop_ctoi_upload.csv" else ",")
             self.assertEqual(len(df), 0, f"Expected 0 data rows in {f}")
+
+
+
+
+class TestSharedSecondaryEvidence(unittest.TestCase):
+    """Frozen Test2, real CTOI consumer and production benchmark adapter."""
+
+    CASES = ((.5, 3.1, True, False), (.3, 3.45, True, False),
+             (.4596, 3., False, False), (.5, 2.804, True, False),
+             (.5, 2.8, False, False), (.3, 3.4, False, False),
+             (.5, 3.5, True, False), (.5, 3.504, True, True))
+
+    def row(self, phase, snr):
+        kw = TestVPSIsolatedPenalties()._nominal_kwargs()
+        kw.update(sec_center_phi=phase, sec_snr=snr)
+        ledger = compute_vps_ledger(**kw)
+        return dict(tic_id="123", operational_status="VETTED", error_message="",
+                    vps_version=VPS_SCHEMA_VERSION, vps_producer=VPS_PRODUCER_NAME,
+                    vps_score=ledger["final_score"], fp_risk_percent=ledger["final_score"],
+                    vps_unclipped_total=ledger["unclipped_total"], vps_ledger_json=json.dumps(ledger),
+                    sec_eclipse_phase=round(phase, 3), secondary_snr_sigma=round(snr, 2),
+                    gaia_nss_type=None, is_known_tess_eb=False)
+
+    def test_frozen_eight_serialized_boundaries(self):
+        from vps_contract import resolve_secondary_evidence
+        for phase, snr, penalty, reject in self.CASES:
+            with self.subTest(phase=phase, snr=snr):
+                row = self.row(phase, snr)
+                for candidate in (row, pd.read_csv(io.StringIO(pd.DataFrame([row]).to_csv(index=False))).iloc[0]):
+                    result = resolve_secondary_evidence(candidate)
+                    self.assertEqual(result["source"], "canonical_vps_ledger")
+                    self.assertEqual(result["snr"], snr)
+                    self.assertEqual(result["vps_penalty_applied"], penalty)
+                    self.assertEqual(result["ctoi_reject"], reject)
+                self.assertEqual(validate_and_extract_vps_score(row), row["vps_score"])
+
+    def test_full_precision_duplicate_csv_representation(self):
+        from vps_contract import resolve_secondary_evidence
+        row = self.row(.45960000000000006, 3.5040000000000004)
+        row["sec_eclipse_phase"] = .45960000000000006
+        row["secondary_snr_sigma"] = 3.5040000000000004
+        parsed = pd.read_csv(io.StringIO(pd.DataFrame([row]).to_csv(index=False))).iloc[0]
+        self.assertEqual(resolve_secondary_evidence(parsed)["snr"], 3.5040000000000004)
+
+    def test_display_corruption_and_ledger_corruption_fail_closed(self):
+        from vps_contract import resolve_secondary_evidence
+        for field, value in (("secondary_snr_sigma", 3.49), ("sec_eclipse_phase", .3),
+                             ("vps_ledger_json", "{}"), ("vps_ledger_json", ""), ("vps_score", 0.1)):
+            row = self.row(.5, 3.504)
+            row[field] = value
+            with self.subTest(field=field), self.assertRaises(VPSContractError):
+                resolve_secondary_evidence(row)
+
+    def test_legacy_missingness_and_rounding_are_explicit(self):
+        from vps_contract import resolve_secondary_evidence
+        for missing in (None, float("nan"), "bad"):
+            result = resolve_secondary_evidence({"secondary_snr_sigma": missing})
+            self.assertIsNone(result["ctoi_reject"])
+            self.assertIsNone(result["vps_penalty_applied"])
+        result = resolve_secondary_evidence({"secondary_snr_sigma": 3.50})
+        self.assertFalse(result["ctoi_reject"])
+        self.assertIsNone(result["vps_penalty_applied"])
+        self.assertEqual(result["source"], "legacy_display_only")
+        # Original rounding drift is exposed, not fixed by threshold relaxation.
+        self.assertTrue(resolve_secondary_evidence(self.row(.5, 3.504))["ctoi_reject"])
+
+    def test_actual_ctoi_packaging_frozen_cases(self):
+        import ctoi_packager as ctoi
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as tmp:
+            tier1 = os.path.join(tmp, "tier1.csv")
+            tier2 = os.path.join(tmp, "tier2.csv")
+            rank = os.path.join(tmp, "ranking.csv")
+            out = os.path.join(tmp, "exofop.csv")
+            rows = []
+            for index, (phase, snr, _, _) in enumerate(self.CASES):
+                row = self.row(phase, snr)
+                row["tic_id"] = str(100 + index)
+                rows.append(row)
+            pd.DataFrame([dict(tic_id=r["tic_id"], period_days=4., t0_btjd=2000.,
+                               duration_hours=2., depth_ppm=1000., r_planet_earth=2., sector=98,
+                               sde=8., r_star_sun=1., m_star_sun=1., teff_k=5700.) for r in rows]).to_csv(tier1, index=False)
+            pd.DataFrame(rows).to_csv(tier2, index=False)
+            with patch.multiple(ctoi, TIER1_CSV=tier1, TIER2_CSV=tier2, RESULTS_DIR=tmp,
+                                RANKING_OUT_CSV=rank, EXOFOP_OUT_CSV=out), \
+                 patch.object(ctoi, "batch_query_tic_photometry", return_value={}) as phot, \
+                 patch.object(ctoi, "extract_camera_ccd_from_cache", return_value=(1, 1)), \
+                 patch("sys.stdout", new=io.StringIO()):
+                ctoi.run_ctoi_packager()
+            expected = {str(100+i) for i, case in enumerate(self.CASES) if not case[3]}
+            self.assertEqual(set(pd.read_csv(rank).tic_id.astype(str)), expected)
+            self.assertEqual(set(phot.call_args.args[0]), expected)
+            self.assertEqual(set(pd.read_csv(out, sep="|")["TIC ID"].astype(str)), expected)
+            # Contradictory canonical evidence aborts before photometry dispatch.
+            rows[0]["secondary_snr_sigma"] = 9.
+            pd.DataFrame(rows).to_csv(tier2, index=False)
+            with patch.multiple(ctoi, TIER1_CSV=tier1, TIER2_CSV=tier2), \
+                 patch.object(ctoi, "batch_query_tic_photometry") as phot, \
+                 patch("sys.stdout", new=io.StringIO()), self.assertRaises(VPSContractError):
+                ctoi.run_ctoi_packager()
+            phot.assert_not_called()
+
+    def test_benchmark_calls_production_and_exposes_old_drift(self):
+        from tests import benchmark_vps_roc as benchmark
+        from unittest.mock import patch
+        base = dict(sec_snr=0., sec_phase=.5, dur_ratio=1., b_impact=0., ruwe=1.,
+                    neb_count=0, contam_pct=0.)
+        # Previously copied b/duration/RUWE/contamination/count/catalog formulas.
+        cases = (({"b_impact": .8}, 1.2), ({"dur_ratio": 1.3}, .2),
+                 ({"ruwe": 1.3}, 15.2), ({"contam_pct": 20.}, .2),
+                 ({"neb_count": 6}, 48.2), ({"is_gaia_nss": True}, 80.2),
+                 ({"is_tess_eb": True}, 90.2), ({"is_sec_eb": True}, 65.2))
+        for changes, expected in cases:
+            with self.subTest(changes=changes):
+                values = dict(base, **changes)
+                with patch.object(benchmark, "compute_vps_ledger", wraps=compute_vps_ledger) as production:
+                    self.assertEqual(benchmark.compute_vps_score(**values), expected)
+                    production.assert_called_once()
+                    self.assertEqual(production.call_args.kwargs["contamination_ratio"], values["contam_pct"] / 100.)
+        # Deliberately corrupting production output must be visible through adapter.
+        with patch.object(benchmark, "compute_vps_ledger", return_value={"final_score": 17.3}):
+            self.assertEqual(benchmark.compute_vps_score(**base), 17.3)
+
+    def test_phase_edges_preserve_binary64_production_expression(self):
+        from vps_contract import secondary_evidence
+        for phase in (.46, .54, np.nextafter(.46, 0.), np.nextafter(.54, 1.)):
+            self.assertEqual(secondary_evidence(phase, 3.)["is_circular"], abs(phase-.5) <= .04)
 
 
 if __name__ == "__main__":

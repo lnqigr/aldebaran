@@ -13,6 +13,7 @@ Architecture:
 """
 
 import os
+from depth_contract import photometric_depth, geometric_radius, validate_observables, check_output_schema, DEPTH_SCHEMA
 import sys
 import ssl
 import glob
@@ -26,6 +27,7 @@ import logging
 import json
 import math
 import certifi
+from ephemeris_contract import BTJD_OFFSET, btjd_to_bjd, fold_phase_centered, compute_orbit_number, days_to_hours, hours_to_days
 
 logger = logging.getLogger(__name__)
 
@@ -66,7 +68,7 @@ R_EARTH = 6.371e6
 H_PLANCK = 6.62607015e-34
 C_LIGHT = 2.99792458e8
 K_BOLTZ = 1.380649e-23
-BTJD_OFFSET = 2457000.0
+# BTJD_OFFSET imported from ephemeris_contract
 
 # Pipeline Author priority and diagnostic colors
 AUTHOR_PRIORITY = {"SPOC": 1, "TESS-SPOC": 2, "TGLC": 3, "QLP": 4}
@@ -422,7 +424,14 @@ def run_stage_3a_filter(
     df_merged["period_d"] = _get_num_series("refined_period_days", "period_days")
     df_merged["t0_btjd"] = _get_num_series("refined_t0_btjd", "t0_btjd")
     df_merged["duration_hours"] = _get_num_series("fitted_duration_hours", "duration_hours")
-    df_merged["depth_ppm"] = _get_num_series("fitted_depth_ppm", "depth_ppm")
+    # Depth is descriptive here, not one of the five gate predicates below.
+    # Keep missing evidence missing; only packaging requires a positive observable.
+    def _box_value(row):
+        try:
+            return photometric_depth(row)[0]
+        except ValueError:
+            return np.nan
+    df_merged["depth_ppm"] = df_merged.apply(_box_value, axis=1)
     df_merged["rp_e"] = _get_num_series("fitted_rp_earth", "r_planet_earth")
     df_merged["dur_ratio"] = _get_num_series("dur_to_kepler_max")
     df_merged["sec_snr"] = _get_num_series("secondary_snr_sigma")
@@ -851,7 +860,7 @@ def refine_multi_year_ephemeris(
 
     snr_grid = np.zeros(n_grid, dtype=np.float64)
     for i, p_try in enumerate(trial_periods):
-        ph = ((t_all - t0_init + 0.5 * p_try) % p_try) - 0.5 * p_try
+        ph = fold_phase_centered(t_all, t0_init, p_try, in_days=True)
         in_m = np.abs(ph) < half_tr
         if np.sum(in_m) < 8:
             continue
@@ -866,7 +875,7 @@ def refine_multi_year_ephemeris(
     t0_grid = np.linspace(t0_init - 0.35 * dur_days, t0_init + 0.35 * dur_days, 300)
     t0_snr = np.zeros_like(t0_grid)
     for j, t0_try in enumerate(t0_grid):
-        ph = ((t_all - t0_try + 0.5 * p_refined) % p_refined) - 0.5 * p_refined
+        ph = fold_phase_centered(t_all, t0_try, p_refined, in_days=True)
         in_m = np.abs(ph) < half_tr
         if np.sum(in_m) >= 8:
             w_in = weights[in_m]
@@ -887,7 +896,7 @@ def compute_transit_metrics(
     cadence_days: float = 0.0014
 ) -> dict:
     eff_dur = np.hypot(dur_days, cadence_days)
-    ph = ((t - t0_val + 0.5 * p_val) % p_val) - 0.5 * p_val
+    ph = fold_phase_centered(t, t0_val, p_val, in_days=True)
     in_tr = np.abs(ph) < (0.45 * eff_dur)
     out_tr = (np.abs(ph) > (0.70 * (dur_days + cadence_days))) & (np.abs(ph) < min(0.25 * p_val, 3.5 * dur_days))
 
@@ -895,7 +904,7 @@ def compute_transit_metrics(
     if n_pts_in < 3 or np.sum(out_tr) < 10:
         return {"n_transits": 0, "n_cadences_in": n_pts_in, "depth_ppm": np.nan, "err_white_ppm": np.nan, "snr_white": 0.0, "snr_red": 0.0, "beta_red": 1.0}
 
-    orbit_nums = np.round((t - t0_val) / p_val).astype(int)
+    orbit_nums = compute_orbit_number(t, t0_val, p_val)
     n_unique_transits = int(len(np.unique(orbit_nums[in_tr])))
 
     w_in = 1.0 / np.maximum(ferr[in_tr] ** 2, 1e-10)
@@ -952,7 +961,7 @@ def execute_archival_drill(
     p_init = float(candidate["period_d"])
     t0_init = float(candidate.get("t0_btjd", 3980.0))
     dur_hr = float(candidate.get("duration_hours", 2.0))
-    dur_days = dur_hr / 24.0
+    dur_days = hours_to_days(dur_hr)
 
     print(f"\n---> Archival Drill: TIC {tid} (P = {p_init:.6f} d | T0 = {t0_init:.5f} BTJD | Dur = {dur_hr:.2f} h)")
 
@@ -1115,12 +1124,12 @@ def execute_archival_drill(
     out_png = os.path.join(archival_dir, f"antares_TIC_{tid}.png")
     try:
         fig, axes = plt.subplots(2, 2, figsize=(14, 10))
-        win_hrs = min(0.18 * p_ref, 2.5 * dur_days) * 24.0
+        win_hrs = days_to_hours(min(0.18 * p_ref, 2.5 * dur_days))
         bins_hrs = np.linspace(-win_hrs, win_hrs, 35)
         b_centers = 0.5 * (bins_hrs[:-1] + bins_hrs[1:])
 
         # Panel 1: Master Phase-Folded Transit
-        ph_hrs = (((t_master - t0_ref + 0.5 * p_ref) % p_ref) - 0.5 * p_ref) * 24.0
+        ph_hrs = days_to_hours(((t_master - t0_ref + 0.5 * p_ref) % p_ref) - 0.5 * p_ref)
         vis = np.abs(ph_hrs) <= win_hrs
         axes[0, 0].scatter(ph_hrs[vis], f_master[vis], s=2, color="silver", alpha=0.35, label=f"Cadences ({n_sectors_stack} Secs)")
         bm, _, _ = stats.binned_statistic(ph_hrs[vis], f_master[vis], statistic="mean", bins=bins_hrs)
@@ -1142,7 +1151,7 @@ def execute_archival_drill(
             a_recs = [r for r in records if r["author"] == auth]
             t_a = np.concatenate([r["t"] for r in a_recs])
             f_a = np.concatenate([r["f_clean"] for r in a_recs])
-            ph_a_hrs = (((t_a - t0_ref + 0.5 * p_ref) % p_ref) - 0.5 * p_ref) * 24.0
+            ph_a_hrs = days_to_hours(((t_a - t0_ref + 0.5 * p_ref) % p_ref) - 0.5 * p_ref)
             vis_a = np.abs(ph_a_hrs) <= win_hrs
             if np.sum(vis_a) < 15:
                 continue
@@ -1255,19 +1264,25 @@ def run_stage_3c_packaging(
 
         p_days = r["p_ref"]
         t0_btjd = r["t0_ref"]
-        epoch_bjd = t0_btjd + BTJD_OFFSET
-        dur_hr = to_clean_float(cand.get("duration_hours"), 2.0)
+        epoch_bjd = btjd_to_bjd(t0_btjd, strict=True)
+        dur_hr = to_clean_float(cand.get("duration_hours"), np.nan)
         depth_ppm = r["depth_ppm"]
 
         # Stellar parameters
-        r_star = to_clean_float(t_meta.get("r_star"), to_clean_float(cand.get("r_star_sun"), 1.0))
-        m_star = to_clean_float(t_meta.get("m_star"), to_clean_float(cand.get("m_star_sun"), r_star ** 1.1))
-        teff = to_clean_float(t_meta.get("teff"), to_clean_float(cand.get("teff_k"), 5500.0))
+        r_star = to_clean_float(t_meta.get("r_star"), to_clean_float(cand.get("r_star_sun"), np.nan))
+        m_star = to_clean_float(t_meta.get("m_star"), to_clean_float(cand.get("m_star_sun"), np.nan))
+        teff = to_clean_float(t_meta.get("teff"), to_clean_float(cand.get("teff_k"), np.nan))
 
-        # Fitted planet radius: derived from SPOC depth
-        rp_rs = np.sqrt(max(1e-6, depth_ppm * 1e-6))
-        rp_earth = rp_rs * r_star * 109.076
-        b_imp = to_clean_float(cand.get("impact_param_b"), 0.30)
+        # Radius and box depth have different meanings; never derive k from the box.
+        try:
+            rp_earth, radius_source = geometric_radius(cand)
+            validate_observables(p_days, t0_btjd, dur_hr, depth_ppm, rp_earth)
+            if not all(np.isfinite(v) and v > 0 for v in (r_star, m_star, teff)):
+                raise ValueError("Missing measured host parameters")
+        except ValueError as exc:
+            logger.error("TIC %s not characterizable: %s", tid, exc)
+            continue
+        b_imp = to_clean_float(cand.get("impact_param_b"), np.nan)
 
         phot = estimate_missing_photometry(
             t_meta.get("Tmag", np.nan),
@@ -1304,6 +1319,13 @@ def run_stage_3c_packaging(
 
         ranking_rows.append({
             "tic_id": tid,
+            "depth_schema_version": DEPTH_SCHEMA,
+            "depth_kind": "measured_box_photometric",
+            "depth_source": "antares_archive_inverse_variance_box",
+            "radius_source": radius_source,
+            "impact_parameter_source": "input_fit_or_legacy" if np.isfinite(b_imp) else "missing",
+            "characterization_assumptions": "legacy_model_b_default_0.3" if not np.isfinite(b_imp) else "legacy_characterization_model",
+            "output_producer": "antares_packager",
             "priority_score": priority_score,
             "disposition": "TIER-3 VETTED CANDIDATE",
             "corr_risk_percent": round(corr_risk, 1),
@@ -1352,6 +1374,8 @@ def run_stage_3c_packaging(
             f"Aldebaran v8.0 / Pleiades v2.2 / Antares v3.0 Candidate (Sectors {secs_str}, N={r['n_transits']} transits, SNR_red={r['snr_red']:.1f}s). "
             f"Conditional Planetary Characterization: Teq={int(astro['teq_k'])}K, Mp_est={astro['mp_ck17_earth']:.1f} M_E, "
             f"RV K={astro['rv_k_ck17_ms']:.1f} m/s, TSM={astro['tsm']:.1f}, ESM={astro['esm']:.1f}. "
+            f"Depth=archival measured box; radius={radius_source}. "
+            f"Impact source={'input_fit_or_legacy' if np.isfinite(b_imp) else 'missing; characterization assumes b=0.3'}. "
             f"Gaia Contam={contam_pct:.1f}% ({neb_cnt} NEB neighbors). Disposition: PC (VPS heuristic points={corr_risk:.1f}/100; uncalibrated, not a probability)."
         )
 
@@ -1367,6 +1391,8 @@ def run_stage_3c_packaging(
             "User Comments / Disposition": comment_str
         })
 
+    if not ranking_rows:
+        raise ValueError("No characterizable archival candidates; existing outputs untouched")
     df_rank = pd.DataFrame(ranking_rows)
     df_rank = df_rank.sort_values(
         by=["priority_score", "tsm", "rv_k_ck17_ms"],
@@ -1380,10 +1406,13 @@ def run_stage_3c_packaging(
     df_exofop = df_exofop.sort_values(by="sort_key").drop(columns=["sort_key"]).reset_index(drop=True)
 
     # Save to disk
-    ranking_csv = os.path.join(results_dir, "prioritized_targets_ranking.csv")
-    exofop_csv = os.path.join(results_dir, "exofop_ctoi_upload.csv")
-    exofop_comma_csv = os.path.join(results_dir, "exofop_ctoi_upload_comma.csv")
+    ranking_csv = os.path.join(results_dir, "antares_prioritized_targets_ranking.csv")
+    exofop_csv = os.path.join(results_dir, "antares_exofop_ctoi_upload.csv")
+    exofop_comma_csv = os.path.join(results_dir, "antares_exofop_ctoi_upload_comma.csv")
 
+    check_output_schema(ranking_csv, df_rank.columns)
+    check_output_schema(exofop_csv, df_exofop.columns, "|")
+    check_output_schema(exofop_comma_csv, df_exofop.columns)
     df_rank.to_csv(ranking_csv, index=False)
     df_exofop.to_csv(exofop_csv, index=False, sep="|")
     df_exofop.to_csv(exofop_comma_csv, index=False)
@@ -1455,10 +1484,15 @@ def run_antares_packager(
             "TIC ID", "Camera", "CCD", "Epoch BJD", "Period",
             "Depth", "Duration", "Rp", "User Comments / Disposition"
         ]
-        ranking_csv = os.path.join(results_dir, "prioritized_targets_ranking.csv")
-        exofop_csv = os.path.join(results_dir, "exofop_ctoi_upload.csv")
-        exofop_comma_csv = os.path.join(results_dir, "exofop_ctoi_upload_comma.csv")
-        top3_csv = os.path.join(results_dir, "exofop_ctoi_upload_top3.csv")
+        ranking_csv = os.path.join(results_dir, "antares_prioritized_targets_ranking.csv")
+        exofop_csv = os.path.join(results_dir, "antares_exofop_ctoi_upload.csv")
+        exofop_comma_csv = os.path.join(results_dir, "antares_exofop_ctoi_upload_comma.csv")
+        top3_csv = os.path.join(results_dir, "antares_exofop_ctoi_upload_top3.csv")
+        # Precheck every path before writing any zero-survivor table.
+        check_output_schema(ranking_csv, ranking_cols)
+        check_output_schema(exofop_csv, exofop_cols, "|")
+        check_output_schema(exofop_comma_csv, exofop_cols)
+        check_output_schema(top3_csv, exofop_cols)
         pd.DataFrame(columns=ranking_cols).to_csv(ranking_csv, index=False)
         pd.DataFrame(columns=exofop_cols).to_csv(exofop_csv, index=False, sep="|")
         pd.DataFrame(columns=exofop_cols).to_csv(exofop_comma_csv, index=False)

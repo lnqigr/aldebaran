@@ -1155,8 +1155,8 @@ def orchestrate_downstream_stages(
             })
             raise StageExecutionError("antares", proc.returncode, proc.stderr)
 
-        expected_exofop_csv = os.path.join(output_dir, "exofop_ctoi_upload.csv")
-        expected_ranking_csv = os.path.join(output_dir, "prioritized_targets_ranking.csv")
+        expected_exofop_csv = os.path.join(output_dir, "antares_exofop_ctoi_upload.csv")
+        expected_ranking_csv = os.path.join(output_dir, "antares_prioritized_targets_ranking.csv")
         if not os.path.exists(expected_exofop_csv):
             err_msg = f"Expected artifact '{expected_exofop_csv}' not generated."
             stages_executed.append({
@@ -1181,9 +1181,11 @@ def orchestrate_downstream_stages(
 
     # 3. TRICERATOPS Tier-4 Bayesian Statistical Validation (Strict Opt-In)
     if run_triceratops:
-        top3_csv = os.path.join(output_dir, "exofop_ctoi_upload_top3.csv")
+        # A requested Antares stage must never consume stale CTOI outputs.
+        producer_prefix = "antares_" if run_antares else ""
+        top3_csv = os.path.join(output_dir, producer_prefix + "exofop_ctoi_upload_top3.csv")
         if not os.path.exists(top3_csv):
-            ranking_csv = os.path.join(output_dir, "prioritized_targets_ranking.csv")
+            ranking_csv = os.path.join(output_dir, producer_prefix + "prioritized_targets_ranking.csv")
             if os.path.exists(ranking_csv):
                 top3_csv = ranking_csv
             else:
@@ -1254,7 +1256,7 @@ def orchestrate_downstream_stages(
         # Ephemeris column validation before expensive invocation (C2)
         p_cols = [c for c in df_top.columns if "PERIOD" in c.upper()]
         epoch_cols = [c for c in df_top.columns if "EPOCH" in c.upper() or "T0" in c.upper()]
-        depth_cols = [c for c in df_top.columns if "DEPTH" in c.upper()]
+        depth_cols = [c for c in ("Depth", "measured_box_depth_ppm", "depth_ppm") if c in df_top.columns]
         dur_cols = [c for c in df_top.columns if "DUR" in c.upper()]
         if not (p_cols and epoch_cols and depth_cols and dur_cols):
             missing_cols = []

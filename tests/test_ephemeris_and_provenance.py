@@ -410,6 +410,104 @@ class TestEphemerisSerializationAndCoherence(unittest.TestCase):
 class TestTruthfulArchivalProvenance(unittest.TestCase):
     """Test archival provenance accounting in verify_multi_epoch across various failure modes."""
 
+    def _run_control_phase_fixture(self, control_phase: float, shift_periods: int = 0):
+        """Run the production archival gate on deterministic transit/control dips."""
+        period = 4.0
+        t0 = 2000.0 + shift_periods * period
+        best_dur = 0.15
+        t_arch = np.arange(1600.0, 1628.0, 0.01) + shift_periods * period
+        phase = ((t_arch - t0 + 0.5 * period) % period) - 0.5 * period
+        transit = np.abs(phase) < 0.045
+        control_distance = np.abs(
+            ((phase - control_phase * period + 0.5 * period) % period) - 0.5 * period
+        )
+        control = control_distance < 0.045
+        f_arch = np.ones_like(t_arch)
+        f_arch[transit] -= 0.001
+        f_arch[control] -= 0.002
+
+        t_curr = np.arange(2000.0, 2028.0, 0.01) + shift_periods * period
+        phase_curr = ((t_curr - t0 + 0.5 * period) % period) - 0.5 * period
+        f_curr = np.ones_like(t_curr)
+        f_curr[np.abs(phase_curr) < 0.045] -= 0.001
+        ferr_curr = np.full_like(t_curr, 0.0001)
+
+        mock_row = MagicMock()
+        mock_row.mission = ["TESS Sector 80"]
+        mock_row.obsid = "TESS_s0080_control_phase"
+
+        class FixedEphemerisBLS:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def power(self, periods, durations):
+                return MagicMock(
+                    power=np.array([1.0]),
+                    period=np.array([period]),
+                    transit_time=np.array([t0]),
+                )
+
+        with patch("lightkurve.search_lightcurve", return_value=[mock_row]), \
+             patch.object(ald, "safe_download", return_value=MagicMock()), \
+             patch.object(ald, "extract_and_stitch_arrays", return_value=(
+                 t_arch, f_arch, np.full_like(t_arch, 0.0001), np.zeros_like(t_arch),
+                 np.zeros_like(t_arch), 0.95
+             )), \
+             patch.object(ald, "clip_upper_outliers", side_effect=lambda t, f, e: (t, f, e)), \
+             patch.object(ald, "piecewise_savgol_detrend", side_effect=lambda t, f, **kw: np.ones_like(f)), \
+             patch.object(ald, "BoxLeastSquares", FixedEphemerisBLS), \
+             patch.object(ald, "scan_full_orbit_secondary_eclipse", return_value=(False, 0.0, 0.0, 0.5, 3.0)):
+            result = ald.verify_multi_epoch(
+                "34567890", 106, t_curr, f_curr, ferr_curr,
+                best_p=period, best_t0=t0, best_dur=best_dur,
+                depth_ppm_curr=1000.0, sde_curr=20.0,
+            )
+
+        # Independent recomputation from the exact frozen input arrays and selected ephemeris.
+        in_transit = np.abs(phase) < (0.45 * best_dur)
+        out_transit = np.abs(phase) > (0.65 * best_dur)
+        baseline = float(np.nanmedian(f_arch[out_transit]))
+        err_ppm = float(np.nanstd(f_arch[out_transit]) / np.sqrt(np.sum(in_transit)) * 1e6)
+        transit_snr = float((baseline - np.nanmean(f_arch[in_transit])) * 1e6 / max(err_ppm, 1.0))
+        control_mean = float(np.nanmean(f_arch[control]))
+        control_snr = float((baseline - control_mean) * 1e6 / max(err_ppm, 1.0))
+        return result, {
+            "n_control": int(np.sum(control)),
+            "n_transit": int(np.sum(in_transit)),
+            "transit_snr": transit_snr,
+            "control_snr": control_snr,
+            "t0": t0,
+        }
+
+    def test_all_eight_control_centers_reject_control_dominant_signal(self):
+        """Each declared control center must be reachable through verify_multi_epoch."""
+        for center in (0.15, 0.20, 0.25, 0.30, 0.70, 0.75, 0.80, 0.85):
+            with self.subTest(control_center=center):
+                (ok, status, diag), expected = self._run_control_phase_fixture(center)
+                self.assertGreater(expected["n_control"], 0)
+                self.assertGreater(expected["n_transit"], 0)
+                self.assertGreater(expected["control_snr"], expected["transit_snr"] + 1.5)
+                self.assertAlmostEqual(diag["archival_snr"], expected["transit_snr"], places=10)
+                self.assertFalse(diag["is_projected_strict"])
+                self.assertFalse(ok)
+                self.assertIn("control phase null test", status)
+
+    def test_wrapped_control_gate_is_invariant_under_integer_period_shifts(self):
+        """A control at phase 0.70 remains the same decision after common kP shifts."""
+        outcomes = []
+        for shift in (-250, 1, 500):
+            (ok, status, diag), expected = self._run_control_phase_fixture(0.70, shift)
+            self.assertGreater(expected["n_control"], 0)
+            self.assertFalse(diag["is_projected_strict"])
+            self.assertFalse(ok)
+            self.assertIn("control phase null test", status)
+            outcomes.append((ok, diag["archival_snr"], expected["control_snr"]))
+
+        self.assertEqual([item[0] for item in outcomes], [False, False, False])
+        for outcome in outcomes[1:]:
+            self.assertAlmostEqual(outcome[1], outcomes[0][1], places=10)
+            self.assertAlmostEqual(outcome[2], outcomes[0][2], places=10)
+
     def test_partial_success_and_failure_stages(self):
         """
         Verify that when 3 products are requested across prior sectors:

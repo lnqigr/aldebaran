@@ -1,4 +1,6 @@
 import os
+import json
+from depth_contract import fit_depth_fields
 import sys
 import ssl
 import glob
@@ -30,6 +32,7 @@ from scipy.optimize import curve_fit
 from scipy.signal import savgol_filter
 import lightkurve as lk
 from astroquery.mast import Catalogs
+from ephemeris_contract import BTJD_OFFSET, btjd_to_year as contract_btjd_to_year, fold_phase_centered, compute_orbit_number, days_to_hours, hours_to_days
 
 RESULTS_DIR = "tess_results"
 os.makedirs(RESULTS_DIR, exist_ok=True)
@@ -56,14 +59,14 @@ def to_numpy(col) -> np.ndarray:
 
 def btjd_to_year(btjd_val: float) -> int:
     """Converts TESS Barycentric Julian Date (BTJD = BJD - 2457000.0) to calendar year."""
-    base_dt = datetime(2014, 12, 8, 12, 0, 0)
-    target_dt = base_dt + timedelta(days=float(btjd_val))
-    return int(target_dt.year)
+    return contract_btjd_to_year(btjd_val)
 
 
 def get_stellar_limb_darkening(tic_id: str) -> dict:
     """Queries TIC v8.2 for R_star, M_star, Teff, Tmag and estimates quadratic limb darkening."""
     info = {"r_star": 0.61, "m_star": 0.60, "teff": 3958.0, "tmag": 13.8, "u1": 0.57, "u2": 0.20}
+    info["stellar_parameter_sources"] = dict.fromkeys(("r_star", "m_star", "teff", "tmag"), "fixed_initial_assumption")
+    info["catalog_error"] = ""
     try:
         tic_data = Catalogs.query_criteria(catalog="Tic", ID=int(tic_id))
         if len(tic_data) > 0:
@@ -74,15 +77,19 @@ def get_stellar_limb_darkening(tic_id: str) -> dict:
             tmag_val = float(to_numpy(row["Tmag"])) if "Tmag" in row.colnames else np.nan
             if np.isfinite(r_val) and r_val > 0:
                 info["r_star"] = r_val
+                info["stellar_parameter_sources"]["r_star"] = "TIC_catalog"
                 info["m_star"] = m_val if (np.isfinite(m_val) and m_val > 0) else (r_val ** 1.1)
+                info["stellar_parameter_sources"]["m_star"] = "TIC_catalog" if (np.isfinite(m_val) and m_val > 0) else "radius_power_law_assumption"
             if np.isfinite(t_val) and t_val > 0:
                 info["teff"] = t_val
+                info["stellar_parameter_sources"]["teff"] = "TIC_catalog"
                 info["u1"] = float(np.clip(0.45 - 0.00008 * (t_val - 5500.0), 0.15, 0.70))
                 info["u2"] = float(np.clip(0.25 + 0.00003 * (t_val - 5500.0), 0.05, 0.45))
             if np.isfinite(tmag_val):
                 info["tmag"] = tmag_val
-    except Exception:
-        pass
+                info["stellar_parameter_sources"]["tmag"] = "TIC_catalog"
+    except Exception as exc:
+        info["catalog_error"] = type(exc).__name__ + ": " + str(exc)
     return info
 
 
@@ -333,7 +340,7 @@ def refine_multi_year_ephemeris(
 
     snr_grid = np.zeros(n_grid, dtype=np.float64)
     for i, p_try in enumerate(trial_periods):
-        ph = ((t_all - t0_init + 0.5 * p_try) % p_try) - 0.5 * p_try
+        ph = fold_phase_centered(t_all, t0_init, p_try, in_days=True)
         in_m = np.abs(ph) < half_tr
         n_in = np.sum(in_m)
         if n_in < 8:
@@ -350,7 +357,7 @@ def refine_multi_year_ephemeris(
     t0_grid = np.linspace(t0_init - 0.35 * dur_days, t0_init + 0.35 * dur_days, 300)
     t0_snr = np.zeros_like(t0_grid)
     for j, t0_try in enumerate(t0_grid):
-        ph = ((t_all - t0_try + 0.5 * p_refined) % p_refined) - 0.5 * p_refined
+        ph = fold_phase_centered(t_all, t0_try, p_refined, in_days=True)
         in_m = np.abs(ph) < half_tr
         if np.sum(in_m) >= 8:
             w_in = weights[in_m]
@@ -372,7 +379,7 @@ def compute_transit_metrics(
 ) -> dict:
     """Computes depth, white-noise SNR, red-noise corrected SNR, and unique transit count."""
     eff_dur = np.hypot(dur_days, cadence_days)
-    ph = ((t - t0_val + 0.5 * p_val) % p_val) - 0.5 * p_val
+    ph = fold_phase_centered(t, t0_val, p_val, in_days=True)
     in_tr = np.abs(ph) < (0.45 * eff_dur)
     out_tr = (np.abs(ph) > (0.70 * (dur_days + cadence_days))) & (np.abs(ph) < min(0.25 * p_val, 3.5 * dur_days))
 
@@ -380,7 +387,7 @@ def compute_transit_metrics(
     if n_pts_in < 3 or np.sum(out_tr) < 10:
         return {"n_transits": 0, "n_cadences_in": n_pts_in, "depth_ppm": np.nan, "err_white_ppm": np.nan, "snr_white": 0.0, "snr_red": 0.0, "beta_red": 1.0}
 
-    orbit_nums = np.round((t - t0_val) / p_val).astype(int)
+    orbit_nums = compute_orbit_number(t, t0_val, p_val)
     n_unique_transits = int(len(np.unique(orbit_nums[in_tr])))
 
     w_in = 1.0 / np.maximum(ferr[in_tr] ** 2, 1e-10)
@@ -424,7 +431,7 @@ def compute_transit_metrics(
 
 
 def run_antares_detective(tic_id: str, p_init: float, t0_init: float, dur_hr: float):
-    dur_days = dur_hr / 24.0
+    dur_days = hours_to_days(dur_hr)
     print("=" * 76)
     print(f"ANTARES HISTORICAL SPECTRO-PHOTOMETRIC DETECTIVE: TIC {tic_id}")
     print(f"Input Ephemeris: P = {p_init:.6f} d | T0 = {t0_init:.5f} BTJD | Dur = {dur_hr:.2f} h")
@@ -570,6 +577,7 @@ def run_antares_detective(tic_id: str, p_init: float, t0_init: float, dur_hr: fl
     def master_model(ph, rp_rs, b_val, d_val):
         return annulus_300_transit_model(ph, rp_rs, b_val, d_val, star_info["u1"], star_info["u2"], exp_time_days=cad_master)
 
+    fit_converged, fit_error = False, ""
     try:
         popt, _ = curve_fit(
             master_model,
@@ -581,9 +589,23 @@ def run_antares_detective(tic_id: str, p_init: float, t0_init: float, dur_hr: fl
             maxfev=5000
         )
         rp_rs_fit, b_fit, dur_fit = float(popt[0]), float(popt[1]), float(popt[2])
-    except Exception:
+        if not np.all(np.isfinite(popt)) or rp_rs_fit <= 0 or dur_fit <= 0:
+            raise ValueError("Nonfinite or nonphysical fit parameters")
+        fit_converged = True
+    except Exception as exc:
+        fit_error = type(exc).__name__ + ": " + str(exc)
         rp_rs_fit, b_fit, dur_fit = rp_rs_guess, 0.35, dur_days
+    depth_fields = fit_depth_fields(
+        rp_rs_fit, master_model(np.array([0.0]), rp_rs_fit, b_fit, dur_fit)[0],
+        master_metrics["depth_ppm"], fit_converged, fit_error,
+        measured_source="antares_master_inverse_variance_box")
 
+    host_sources = star_info.get("stellar_parameter_sources", {"r_star": "UNKNOWN"})
+    depth_fields["stellar_parameter_provenance"] = json.dumps(host_sources, sort_keys=True)
+    depth_fields["stellar_catalog_error"] = star_info.get("catalog_error", "")
+    host_radius_measured = host_sources.get("r_star") == "TIC_catalog"
+    if fit_converged and not host_radius_measured:
+        depth_fields["fitted_radius_kind"] = "geometric_fit_with_assumed_or_unknown_host"
     rp_earth_fit = star_info["r_star"] * rp_rs_fit * 109.076
     sigma_rp_earth = rp_earth_fit * np.hypot(0.03 / star_info["r_star"], 1.0 / (2.0 * max(master_metrics["snr_red"], 1.0)))
 
@@ -640,12 +662,12 @@ def run_antares_detective(tic_id: str, p_init: float, t0_init: float, dur_hr: fl
     # Step 6: Generate 6-Panel Publication Poster & Save CSV
     print(f"[6/6] Rendering 6-panel diagnostic poster & saving CSV report...")
     fig, axes = plt.subplots(3, 2, figsize=(16, 15))
-    win_hrs = min(0.18 * p_ref, 2.5 * dur_fit) * 24.0
+    win_hrs = days_to_hours(min(0.18 * p_ref, 2.5 * dur_fit))
     bins_hrs = np.linspace(-win_hrs, win_hrs, 35)
     b_centers = 0.5 * (bins_hrs[:-1] + bins_hrs[1:])
 
     # Panel 1 (0, 0): Master Multi-Year Coherent Phase-Folded Transit
-    ph_m_hrs = ph_master * 24.0
+    ph_m_hrs = days_to_hours(ph_master)
     vis_m = np.abs(ph_m_hrs) <= win_hrs
     axes[0, 0].scatter(ph_m_hrs[vis_m], f_master[vis_m], s=2, color="silver", alpha=0.30, label=f"Cadences ({len(master_records)} Sectors)")
     bm, _, _ = stats.binned_statistic(ph_m_hrs[vis_m], f_master[vis_m], statistic="mean", bins=bins_hrs)
@@ -655,12 +677,12 @@ def run_antares_detective(tic_id: str, p_init: float, t0_init: float, dur_hr: fl
     berr = bs[vb] / np.sqrt(bc[vb])
     axes[0, 0].errorbar(b_centers[vb], bm[vb], yerr=berr, fmt="o", color="black", ms=5, capsize=2.5, lw=1.2, zorder=4, label="Master Binned (+/-1 sigma)")
 
-    ph_grid_d = np.linspace(-win_hrs / 24.0, win_hrs / 24.0, 500)
+    ph_grid_d = np.linspace(hours_to_days(-win_hrs), hours_to_days(win_hrs), 500)
     axes[0, 0].plot(
-        ph_grid_d * 24.0,
+        days_to_hours(ph_grid_d),
         master_model(ph_grid_d, rp_rs_fit, b_fit, dur_fit),
         color="crimson", lw=2.6, zorder=5,
-        label=f"300-Ring Fit: Rp={rp_earth_fit:.2f}+/-{sigma_rp_earth:.2f} R_E"
+        label=f"300-Ring Model (fit={fit_converged}): Rp={rp_earth_fit:.2f}+/-{sigma_rp_earth:.2f} R_E"
     )
     depth_frac = rp_rs_fit ** 2
     axes[0, 0].set_ylim(
@@ -681,7 +703,7 @@ def run_antares_detective(tic_id: str, p_init: float, t0_init: float, dur_hr: fl
     offset_step = max(0.0022, 2.2 * depth_frac)
     for idx_y, yr in enumerate(years_unique):
         yst = year_stats[yr]
-        ph_y_hrs = (((yst["t"] - t0_ref + 0.5 * p_ref) % p_ref) - 0.5 * p_ref) * 24.0
+        ph_y_hrs = days_to_hours(((yst["t"] - t0_ref + 0.5 * p_ref) % p_ref) - 0.5 * p_ref)
         vis_y = np.abs(ph_y_hrs) <= win_hrs
         if np.sum(vis_y) < 15:
             continue
@@ -693,7 +715,7 @@ def run_antares_detective(tic_id: str, p_init: float, t0_init: float, dur_hr: fl
             b_centers[vy], ym[vy] - v_off, "o-", color=yr_colors[idx_y], ms=4, lw=1.6,
             label=f"{yr} (S{','.join(str(s) for s in yst['sectors'])}): N={yst['n_transits']}, d={yst['depth_ppm']:.0f}ppm ({yst['snr_white']:.1f} sigma)"
         )
-        axes[0, 1].plot(ph_grid_d * 24.0, master_model(ph_grid_d, rp_rs_fit, b_fit, dur_fit) - v_off, color="black", linestyle="--", lw=1.0, alpha=0.5)
+        axes[0, 1].plot(days_to_hours(ph_grid_d), master_model(ph_grid_d, rp_rs_fit, b_fit, dur_fit) - v_off, color="black", linestyle="--", lw=1.0, alpha=0.5)
     axes[0, 1].axvline(0.0, color="crimson", linestyle=":", alpha=0.6)
     axes[0, 1].set_xlim(-win_hrs, win_hrs)
     axes[0, 1].set_xlabel("Time from Mid-Transit (hours)")
@@ -704,7 +726,7 @@ def run_antares_detective(tic_id: str, p_init: float, t0_init: float, dur_hr: fl
     # Panel 3 (1, 0): Cross-Pipeline De-Blending Comparison (SPOC vs TGLC vs QLP)
     for idx_a, auth in enumerate(authors_unique):
         ast = author_stats[auth]
-        ph_a_hrs = (((ast["t"] - t0_ref + 0.5 * p_ref) % p_ref) - 0.5 * p_ref) * 24.0
+        ph_a_hrs = days_to_hours(((ast["t"] - t0_ref + 0.5 * p_ref) % p_ref) - 0.5 * p_ref)
         vis_a = np.abs(ph_a_hrs) <= win_hrs
         if np.sum(vis_a) < 15:
             continue
@@ -717,7 +739,7 @@ def run_antares_detective(tic_id: str, p_init: float, t0_init: float, dur_hr: fl
             b_centers[va], am[va] - v_off, "s-", color=c_auth, ms=4, lw=1.7,
             label=f"{auth} (S{','.join(str(s) for s in ast['sectors'])}): d={ast['depth_ppm']:.0f}+/-{ast['err_white_ppm']:.0f}ppm ({ast['snr_white']:.1f} sigma)"
         )
-        axes[1, 0].plot(ph_grid_d * 24.0, master_model(ph_grid_d, rp_rs_fit, b_fit, dur_fit) - v_off, color="gray", linestyle="--", lw=1.0, alpha=0.6)
+        axes[1, 0].plot(days_to_hours(ph_grid_d), master_model(ph_grid_d, rp_rs_fit, b_fit, dur_fit) - v_off, color="gray", linestyle="--", lw=1.0, alpha=0.6)
     axes[1, 0].axvline(0.0, color="crimson", linestyle=":", alpha=0.6)
     axes[1, 0].set_xlim(-win_hrs, win_hrs)
     axes[1, 0].set_xlabel("Time from Mid-Transit (hours)")
@@ -784,7 +806,7 @@ def run_antares_detective(tic_id: str, p_init: float, t0_init: float, dur_hr: fl
         f"  Refined T0:        {t0_ref:.5f} BTJD\n"
         f"  Master Depth:      {master_metrics['depth_ppm']:.1f} +/- {master_metrics['err_white_ppm']:.1f} ppm\n"
         f"  Integrated SNR:    {master_metrics['snr_white']:.2f} sigma (white) | {master_metrics['snr_red']:.2f} sigma (red-corrected, beta={master_metrics['beta_red']:.2f})\n"
-        f"  Fitted Radius:     Rp = {rp_earth_fit:.2f} +/- {sigma_rp_earth:.2f} R_Earth (b = {b_fit:.2f})\n\n"
+        f"  Radius (fit={fit_converged}, host_measured={host_radius_measured}):     Rp = {rp_earth_fit:.2f} +/- {sigma_rp_earth:.2f} R_Earth (b = {b_fit:.2f})\n\n"
         f"CROSS-PIPELINE DE-BLENDING & SECULAR CHECK:\n"
         f"  SPOC (2-min):      {spoc_str}\n"
         f"  QLP  (FFI):        {qlp_str}\n"
@@ -802,6 +824,14 @@ def run_antares_detective(tic_id: str, p_init: float, t0_init: float, dur_hr: fl
     out_csv = os.path.join(RESULTS_DIR, f"antares_summary_{tic_id}.csv")
     plt.savefig(out_png, dpi=160)
     plt.close(fig)
+    for summary in summary_rows:
+        if summary.get("group_type") == "MASTER_DEDUPLICATED_ALL_YEARS":
+            summary.update(depth_fields)
+            summary["fitted_rp_earth"] = rp_earth_fit if (fit_converged and host_radius_measured) else np.nan
+            summary["assumed_host_radius_estimate_earth"] = rp_earth_fit if (fit_converged and not host_radius_measured) else np.nan
+            summary["legacy_initial_radius_earth"] = rp_earth_fit if not fit_converged else np.nan
+            summary["legacy_radius_uncertainty_earth"] = sigma_rp_earth
+            summary["radius_uncertainty_method"] = "legacy_fixed_host_error_and_snr_proxy_NOT_CALIBRATED"
     pd.DataFrame(summary_rows).to_csv(out_csv, index=False)
 
     print("\n" + "=" * 76)
@@ -809,7 +839,7 @@ def run_antares_detective(tic_id: str, p_init: float, t0_init: float, dur_hr: fl
     print(f"  -> Unique Sectors Stitched: {len(master_records)} | Total Unique Transits: {master_metrics['n_transits']}")
     print(f"  -> Master Depth: {master_metrics['depth_ppm']:.1f} +/- {master_metrics['err_white_ppm']:.1f} ppm")
     print(f"  -> Master SNR (White): {master_metrics['snr_white']:.2f} sigma | Master SNR (Red-Noise Corrected): {master_metrics['snr_red']:.2f} sigma")
-    print(f"  -> Fitted Radius (with photometric error): Rp = {rp_earth_fit:.2f} +/- {sigma_rp_earth:.2f} R_Earth")
+    print(f"  -> Radius (fit={fit_converged}, host_measured={host_radius_measured}, uncertainty heuristic uncalibrated): Rp = {rp_earth_fit:.2f} +/- {sigma_rp_earth:.2f} R_Earth")
     print(f"  -> Saved Diagnostic Poster: {out_png}")
     print(f"  -> Saved Telemetry Table:   {out_csv}")
     print("=" * 76)

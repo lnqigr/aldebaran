@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-ALDEBARAN EXOPLANET SEARCH PIPELINE — MODULE: TIER-4 TRICERATOPS BAYESIAN FPP/NFPP
+ALDEBARAN EXOPLANET SEARCH PIPELINE â€” MODULE: TIER-4 TRICERATOPS BAYESIAN FPP/NFPP
 Computes Bayesian False Positive Probability (FPP) and Nearby False Positive Probability
 (NFPP) estimates conditional on the supplied data, astrophysical scenarios, and model priors.
 Optimized with Phase-Folded Adaptive Binning to prevent OOM on multi-sector datasets.
@@ -9,13 +9,117 @@ Optimized with Phase-Folded Adaptive Binning to prevent OOM on multi-sector data
 import sys
 import os
 import argparse
+import json
+from importlib.metadata import PackageNotFoundError, version
 import numpy as np
 import pandas as pd
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
+from ephemeris_contract import BTJD_OFFSET, bjd_to_btjd, fold_phase_centered, hours_to_days
 
-def run_triceratops_validation(tic_id, period, t0_btjd, duration_hours, depth_ppm, sectors, n_mc=5, n_bins=60, results_dir: str = None):
+SUPPORTED_TRICERATOPS_VERSION = "1.0.21"
+TRICERATOPS_EXPTIME_DAYS = 0.00139
+# Lightkurve 2.6 SearchResult exptime is in seconds. Keep the library
+# default exposure (rounded 0.00139 d) unchanged; accept nominal 120-s products only.
+SPOC_EXPOSURE_SECONDS = 120.0
+
+
+def _pipeline_aperture_pixels(tpf):
+    mask = np.asarray(tpf.pipeline_mask, dtype=bool)
+    if mask.ndim != 2 or not np.any(mask):
+        raise ValueError("SPOC TPF pipeline aperture is empty or not two-dimensional.")
+    rows, columns = np.nonzero(mask)
+    return np.column_stack((int(tpf.column) + columns, int(tpf.row) + rows))
+
+
+def _sap_flux_only(flux, flux_column):
+    flux = np.asarray(flux, dtype=float)
+    if flux_column == "sap_flux":
+        return flux
+    raise ValueError(
+        "TRICERATOPS 1.0.21 requires SAP flux for this adapter. "
+        "PDCSAP conversion is not enabled without an approved scientific contract."
+    )
+
+
+def _download_spoc_sector(lk, tic_id, sector, flux_column):
+    if flux_column != "sap_flux":
+        raise ValueError(
+            "SPOC SAP flux is required; PDCSAP was requested and no automatic "
+            "product substitution or CROWDSAP conversion is allowed."
+        )
+    search_args = {
+        "target": f"TIC {tic_id}",
+        "mission": "TESS",
+        "author": "SPOC",
+        "sector": int(sector),
+    }
+    lc_search = lk.search_lightcurve(**search_args)
+    tpf_search = lk.search_targetpixelfile(**search_args)
+    if len(lc_search) == 0 or len(tpf_search) == 0:
+        raise ValueError(f"No paired SPOC light-curve and TPF products for sector {sector}.")
+
+    lc_exptime = np.asarray(lc_search.table["exptime"], dtype=float)
+    tpf_exptime = np.asarray(tpf_search.table["exptime"], dtype=float)
+    matches = [
+        (i, j)
+        for i, lc_time in enumerate(lc_exptime)
+        for j, tpf_time in enumerate(tpf_exptime)
+        if np.isclose(lc_time, tpf_time, rtol=0, atol=1e-10)
+    ]
+    if not matches:
+        raise ValueError(f"No cadence-matched SPOC light-curve and TPF products for sector {sector}.")
+
+    best_matches = [(i, j) for i, j in matches
+                    if lc_exptime[i] == SPOC_EXPOSURE_SECONDS]
+    if not best_matches:
+        raise ValueError(f"No supported 120-second SPOC pair for sector {sector}; "
+                         "the unchanged TRICERATOPS exposure default requires this cadence.")
+    if len(best_matches) != 1:
+        raise ValueError(f"Ambiguous cadence-matched SPOC products for sector {sector}.")
+
+    lc_index, tpf_index = best_matches[0]
+    try:
+        lc = lc_search[lc_index].download(flux_column="sap_flux")
+    except Exception as e:
+        raise RuntimeError(
+            f"SPOC SAP flux is unavailable for sector {sector}; no PDCSAP "
+            f"fallback was attempted: {e}"
+        ) from e
+    tpf = tpf_search[tpf_index].download()
+    lc = lc.remove_nans().remove_outliers(sigma=5)
+    if int(tpf.sector) != int(sector):
+        raise ValueError(f"Downloaded TPF sector {tpf.sector} does not match requested sector {sector}.")
+
+    if int(lc.sector) != int(sector):
+        raise ValueError(f"Downloaded light-curve sector {lc.sector} does not match requested sector {sector}.")
+
+    flux = _sap_flux_only(lc.flux.value, flux_column)
+    flux_err = np.asarray(lc.flux_err.value, dtype=float)
+    return np.asarray(lc.time.btjd, dtype=float), flux, flux_err, _pipeline_aperture_pixels(tpf)
+
+
+def _normalize_sap_sector(times, flux, errors, t0_btjd, period, dur_days):
+    """Scale each aperture product before combining; preserve errors in the same units."""
+    times, flux, errors = (np.asarray(x, dtype=float) for x in (times, flux, errors))
+    if times.ndim != 1 or flux.shape != times.shape or errors.shape != times.shape:
+        raise ValueError("SAP time/flux/error arrays must be aligned one-dimensional arrays.")
+    if not (np.all(np.isfinite(times)) and np.all(np.isfinite(flux))
+            and np.all(np.isfinite(errors)) and np.all(errors >= 0)):
+        raise ValueError("SAP time/flux/error arrays contain invalid evidence.")
+    dt = fold_phase_centered(times, t0_btjd, period, in_days=False) * period
+    # Reuse the existing profile's out-of-transit window, before sector combination.
+    oot = (np.abs(dt) > 0.6 * dur_days) & (np.abs(dt) <= 2.0 * dur_days)
+    if not np.any(oot):
+        raise ValueError("SAP sector has no out-of-transit normalization support.")
+    baseline = float(np.median(flux[oot]))
+    if not np.isfinite(baseline) or baseline <= 0:
+        raise ValueError("SAP sector has no positive finite reference flux.")
+    return flux / baseline, errors / baseline, baseline
+
+
+def run_triceratops_validation(tic_id, period, t0_btjd, duration_hours, depth_ppm, sectors, n_mc=5, n_bins=60, results_dir: str = None, flux_column: str = "sap_flux"):
     print(f"\n{'='*75}")
     print(f" ALDEBARAN TIER-4 BAYESIAN FPP/NFPP ASSESSMENT (TRICERATOPS)")
     print(f" Target: TIC {tic_id}")
@@ -24,13 +128,30 @@ def run_triceratops_validation(tic_id, period, t0_btjd, duration_hours, depth_pp
     print(f"{'='*75}\n")
 
     try:
+        installed_version = version("triceratops")
+        if installed_version != SUPPORTED_TRICERATOPS_VERSION:
+            raise RuntimeError(
+                f"This adapter requires TRICERATOPS {SUPPORTED_TRICERATOPS_VERSION}; "
+                f"found {installed_version}."
+            )
         import triceratops.triceratops as tr
+    except PackageNotFoundError as e:
+        print(f"[!] TRICERATOPS import error: {e}")
+        return False
     except ImportError as e:
         print(f"[!] TRICERATOPS import error: {e}")
         return False
+    except RuntimeError as e:
+        print(f"[!] Unsupported TRICERATOPS version: {e}")
+        return False
+    if flux_column != "sap_flux":
+        print(
+            "[!] This TRICERATOPS 1.0.21 adapter requires SPOC SAP flux. "
+            "PDCSAP conversion is not enabled without an approved scientific contract."
+        )
+        return False
 
-    depth_frac = depth_ppm * 1e-6
-    dur_days = duration_hours / 24.0
+    dur_days = hours_to_days(duration_hours)
 
     print(f"[TRICERATOPS] Initializing target object for TIC {tic_id}...")
     try:
@@ -45,29 +166,27 @@ def run_triceratops_validation(tic_id, period, t0_btjd, duration_hours, depth_pp
         print(f"[!] Error initializing TRICERATOPS target: {e}")
         return False
 
-    print(f"[TRICERATOPS] Calculating transit depths on all stars in aperture (tdepth={depth_frac:.6f})...")
-    try:
-        target.calc_depths(tdepth=depth_frac)
-        print("   -> Depths calculated successfully across all candidate host configurations.")
-    except Exception as e:
-        print(f"[!] Error calculating depths: {e}")
-        return False
-
-    # Fetch light curve around transit window for probability calculation
+    # Fetch explicitly paired SAP/TPF products; never stitch raw aperture counts.
     import lightkurve as lk
-    print(f"[TRICERATOPS] Fetching SPOC light curve data across sectors...")
+    sector_normalization = []
     try:
-        search = lk.search_lightcurve(f"TIC {tic_id}", mission="TESS", author="SPOC")
-        lc_coll = search.download_all()
-        lc = lc_coll.stitch()
-        
-        # Flatten and phase fold
-        lc = lc.remove_nans().remove_outliers(sigma=5)
-        phase = ((lc.time.btjd - t0_btjd) / period + 0.5) % 1.0 - 0.5
+        if sorted(target.sectors.tolist()) != sorted(int(s) for s in sectors):
+            raise ValueError("TRICERATOPS target sectors differ from requested evidence.")
+        time_parts, flux_parts, error_parts, aperture_pixels = [], [], [], []
+        for sector in target.sectors:
+            times, flux, errors, pixels = _download_spoc_sector(lk, tic_id, int(sector), flux_column)
+            flux, errors, baseline = _normalize_sap_sector(
+                times, flux, errors, t0_btjd, period, dur_days)
+            time_parts.append(times)
+            flux_parts.append(flux)
+            error_parts.append(errors)
+            aperture_pixels.append(pixels)
+            sector_normalization.append({"sector": int(sector), "reference_flux": baseline})
+        time_all = np.concatenate(time_parts)
+        f_raw, e_raw = np.concatenate(flux_parts), np.concatenate(error_parts)
+        phase = fold_phase_centered(time_all, t0_btjd, period, in_days=False)
         dt_days = phase * period
-        f_raw = lc.flux.value
-        e_raw = lc.flux_err.value
-        
+
         # Crop to transit window: [-2.0 * duration, +2.0 * duration]
         win_mask = np.abs(dt_days) <= (2.0 * dur_days)
         dt_win = dt_days[win_mask]
@@ -101,6 +220,27 @@ def run_triceratops_validation(tic_id, period, t0_btjd, duration_hours, depth_pp
         norm_factor = float(np.nanmedian(flux_binned[oot_mask])) if np.sum(oot_mask) >= 5 else float(np.nanmedian(flux_binned))
         flux_binned = flux_binned / norm_factor
         
+        # Retain the pending adapter estimator exactly; it is not S3's 90%-box mean.
+        # This diagnostic convention still needs scientific review before real-target use.
+        transit_mask = np.abs(time_binned) <= (0.5 * dur_days)
+        if not np.any(transit_mask):
+            raise ValueError("No populated phase bins fall inside the transit duration.")
+        sap_depth = float(1.0 - np.nanmedian(flux_binned[transit_mask]))
+        if not np.isfinite(sap_depth) or sap_depth <= 0:
+            raise ValueError(f"Measured SAP profile depth is not positive: {sap_depth}.")
+        input_contract = {
+            "flux_column": flux_column, "depth_fraction": sap_depth,
+            "depth_estimator": "median_binned_full_duration_provisional",
+            "depth_policy_status": "SCIENTIFIC_REVIEW_REQUIRED",
+            "reference_depth_ppm": float(depth_ppm),
+            "sector_normalization": sector_normalization,
+            "product_exposure_seconds": SPOC_EXPOSURE_SECONDS,
+            "library_default_exposure_days": TRICERATOPS_EXPTIME_DAYS,
+        }
+        target.calc_depths(tdepth=sap_depth, all_ap_pixels=aperture_pixels)
+        print(f"   -> SAP depth {sap_depth * 1e6:.1f} ppm; reference input {depth_ppm:.1f} ppm. "
+              "Provisional depth estimator; not scientific approval.")
+
         # Representative flux uncertainty (scalar float for TRICERATOPS)
         flux_err_scalar = float(np.nanmedian(b_err) / norm_factor)
         
@@ -144,8 +284,8 @@ def run_triceratops_validation(tic_id, period, t0_btjd, duration_hours, depth_pp
 
     print(f"\n{'='*65}")
     print(f" BAYESIAN FPP/NFPP ASSESSMENT (TRICERATOPS)")
-    print(f" Conditional scenario-model FPP: {mean_fpp:.4f} ± {std_fpp:.4f} ({mean_fpp*100:.2f}%)")
-    print(f" Conditional nearby false-positive probability (NFPP): {mean_nfpp:.4f} ± {std_nfpp:.4f} ({mean_nfpp*100:.2f}%)")
+    print(f" Conditional scenario-model FPP: {mean_fpp:.4f} Â± {std_fpp:.4f} ({mean_fpp*100:.2f}%)")
+    print(f" Conditional nearby false-positive probability (NFPP): {mean_nfpp:.4f} Â± {std_nfpp:.4f} ({mean_nfpp*100:.2f}%)")
     
     # These thresholds classify conditional scenario-model outputs; they are not independent validation.
     if mean_fpp < 0.015 and mean_nfpp < 0.001:
@@ -195,6 +335,7 @@ def run_triceratops_validation(tic_id, period, t0_btjd, duration_hours, depth_pp
         if base_df['prob'].sum() > 0:
             base_df['prob'] = base_df['prob'] / base_df['prob'].sum()
     prob_df = base_df
+    prob_df["input_contract_json"] = json.dumps(input_contract, sort_keys=True)
 
     csv_path = os.path.join(out_dir, f"triceratops_probs_TIC_{tic_id}.csv")
     prob_df.to_csv(csv_path)
@@ -221,6 +362,7 @@ def run_triceratops_validation(tic_id, period, t0_btjd, duration_hours, depth_pp
     print(f"   -> Non-Planetary EB Probability   : {p_eb_total*100:.2f}% (Nearby NEB={mean_nfpp*100:.2f}%)")
 
     return {
+        'input_contract': input_contract,
         'tic_id': tic_id,
         'fpp_mean': mean_fpp,
         'fpp_std': std_fpp,
@@ -228,6 +370,19 @@ def run_triceratops_validation(tic_id, period, t0_btjd, duration_hours, depth_pp
         'nfpp_std': std_nfpp,
         'disposition': disposition
     }
+
+
+def _sector_evidence(value):
+    import re
+    text = str(value).strip()
+    if text.startswith("[") and text.endswith("]"):
+        text = text[1:-1].strip()
+    if not re.fullmatch(r"[1-9][0-9]*(?:\s*,\s*[1-9][0-9]*)*", text):
+        raise ValueError(f"Invalid explicit sector evidence: {value!r}")
+    values = [int(x.strip()) for x in text.split(",")]
+    if len(set(values)) != len(values):
+        raise ValueError("Duplicate sectors in explicit evidence")
+    return sorted(values)
 
 
 def validate_auto(n_mc: int = 5, n_bins: int = 60, top_csv: str = None, results_dir: str = None):
@@ -243,16 +398,20 @@ def validate_auto(n_mc: int = 5, n_bins: int = 60, top_csv: str = None, results_
         print(f"[!] Top candidates table '{top_csv}' not found. Skipping auto-validation.")
         return
 
-    import re
-    sep = "|" if "|" in open(top_csv, encoding="utf-8").readline() else ","
+    with open(top_csv, encoding="utf-8") as stream:
+        sep = "|" if "|" in stream.readline() else ","
     df_top = pd.read_csv(top_csv, sep=sep)
     col_tic = [c for c in df_top.columns if "TIC" in c.upper()][0]
     col_p = [c for c in df_top.columns if "PERIOD" in c.upper()][0]
     col_epoch = [c for c in df_top.columns if "EPOCH" in c.upper() or "T0" in c.upper()][0]
-    col_depth = [c for c in df_top.columns if "DEPTH" in c.upper()][0]
+    col_depth = next((c for c in ("Depth", "measured_box_depth_ppm", "depth_ppm")
+                      if c in df_top.columns), None)
+    if col_depth is None:
+        raise ValueError("No explicit photometric depth column; geometric/model aliases are not accepted")
     col_dur = [c for c in df_top.columns if "DUR" in c.upper()][0]
 
-    ranking_csv = os.path.join(results_dir, "prioritized_targets_ranking.csv")
+    prefix = "antares_" if os.path.basename(top_csv).startswith("antares_") else ""
+    ranking_csv = os.path.join(results_dir, prefix + "prioritized_targets_ranking.csv")
     df_rank = pd.read_csv(ranking_csv) if os.path.exists(ranking_csv) else None
 
     targets_to_run = []
@@ -260,27 +419,22 @@ def validate_auto(n_mc: int = 5, n_bins: int = 60, top_csv: str = None, results_
         tid = int(row[col_tic])
         p_val = float(row[col_p])
         epoch_val = float(row[col_epoch])
-        t0_btjd = epoch_val - 2457000.0 if epoch_val > 2450000.0 else epoch_val
+        t0_btjd = bjd_to_btjd(epoch_val)
         depth_val = float(row[col_depth])
         dur_val = float(row[col_dur])
 
-        sectors = None
+        sector_sources = []
         if df_rank is not None and "tic_id" in df_rank.columns:
-            m = df_rank[df_rank["tic_id"].astype(str) == str(tid)]
-            if len(m) > 0 and "sectors" in m.columns:
-                s_str = str(m.iloc[0]["sectors"])
-                s_nums = [int(x) for x in re.findall(r"\b\d+\b", s_str)]
-                if s_nums:
-                    sectors = s_nums
-        if not sectors:
-            if tid == 301152169:
-                sectors = [100, 101, 102, 103]
-            elif tid == 322051865:
-                sectors = [103, 104, 105, 106]
-            elif tid == 350190949:
-                sectors = [1, 28, 104, 105]
-            else:
-                sectors = [100]
+            matching = df_rank[pd.to_numeric(df_rank["tic_id"], errors="coerce") == tid]
+            if "sectors" in matching.columns:
+                sector_sources.extend(_sector_evidence(v) for v in matching["sectors"])
+        if "sectors" in row.index:
+            sector_sources.append(_sector_evidence(row["sectors"]))
+        if not sector_sources:
+            raise ValueError(f"No explicit sector provenance for TIC {tid} in {ranking_csv}")
+        if any(value != sector_sources[0] for value in sector_sources[1:]):
+            raise ValueError(f"Conflicting sector provenance for TIC {tid}")
+        sectors = sector_sources[0]
 
         targets_to_run.append({
             "tic_id": tid,
