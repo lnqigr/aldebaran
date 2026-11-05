@@ -92,6 +92,205 @@ import lightkurve as lk
 from astroquery.mast import Observations, Catalogs
 import known_signals
 
+# Accepted Cp policy: ARGON_DECISIONS items 12-14 and 17-20.
+# PORT-CP-01: ordinary source; no runtime replay dependency.
+VR_DT_GRID = 0.045 / 10.0           # item 12: main-search minimum duration / astropy oversample 10 (days)
+VR_ALPHA_CIRC = 0.001               # item 13
+VR_FULL_TRANSIT_FRACTION = 0.75     # preregistration D-3
+VR_CADENCE_DAYS = 2.0 / 1440.0      # TESS 2-min cadence used by VALIDATION-02
+
+
+# ---------------------------------------------------------------- item 12: archival timing and refinement
+def vr_timing(best_t0, best_p, best_dur, sde, t_curr, archival_times_by_sector):
+    """Pivot epoch, interim floor sigma_T0', sigma_P' (D-1) and per-sector sigma_pred (D-2)."""
+    baseline = float(np.max(t_curr) - np.min(t_curr))
+    n_cyc = max(1.0, baseline / best_p)
+    s0 = 0.5 * best_dur / max(float(sde), 5.0)
+    sigma_t0 = float(np.sqrt(s0 ** 2 + VR_DT_GRID ** 2 / 12.0 + (0.08 * best_dur) ** 2))
+    sigma_p = float(np.sqrt(12.0) * sigma_t0 / n_cyc)
+    t0_pivot = float(best_t0 + np.round((float(np.median(t_curr)) - best_t0) / best_p) * best_p)
+    pred, cycles = {}, {}
+    for sec, ts in archival_times_by_sector:
+        n_s = int(np.round((float(np.median(ts)) - t0_pivot) / best_p))
+        pred[int(sec)] = float(np.sqrt(sigma_t0 ** 2 + (n_s * sigma_p) ** 2)); cycles[int(sec)] = n_s
+    return dict(t0_pivot=t0_pivot, sigma_t0=sigma_t0, sigma_p=sigma_p, n_cycles=n_cyc, sigma_pred=pred, n_s=cycles,
+                max_sigma_pred=max(pred.values()), mode1=max(pred.values()) <= 0.25 * best_dur)
+
+
+def vr_box_stats(t, y, dy, period, t0, dur):
+    """Weighted box depth, its error and the BLS likelihood power at one (P, t0, duration)."""
+    w = 1.0 / np.asarray(dy, float) ** 2
+    tau = np.abs(((np.asarray(t, float) - t0 + 0.5 * period) % period) - 0.5 * period)
+    m = tau < 0.5 * dur
+    w_in, w_out = w[m].sum(), w[~m].sum()
+    if w_in <= 0 or w_out <= 0:
+        return np.nan, np.nan, 0.0
+    depth = (w[~m] * y[~m]).sum() / w_out - (w[m] * y[m]).sum() / w_in
+    err = np.sqrt(1.0 / w_in + 1.0 / w_out)
+    return float(depth), float(err), float(0.5 * depth ** 2 * w_in) if depth > 0 else 0.0
+
+
+def vr_constrained_box_search(t, y, dy, periods, durations, t0_pivot, half_window, step):
+    """Box search over P x t0 x duration with t0 restricted to t0_pivot +/- half_window (D-4).
+
+    Same likelihood objective as astropy BoxLeastSquares (0.5 * depth^2 * W_in, dips only). Returns the best
+    (period, t0, duration, power) and the evaluated offsets, so tests can confirm none lies outside the window.
+    """
+    t = np.asarray(t, float); y = np.asarray(y, float); w = 1.0 / np.asarray(dy, float) ** 2
+    W, WY = w.sum(), (w * y).sum()
+    offsets = np.arange(-half_window, half_window + 0.5 * step, step)
+    offsets = offsets[np.abs(offsets) <= half_window + 1e-12]
+    best = (np.nan, np.nan, np.nan, -np.inf)
+    reach = half_window + 0.5 * float(np.max(durations))
+    for P in np.asarray(periods, float):
+        d = ((t - t0_pivot + 0.5 * P) % P) - 0.5 * P
+        near = np.abs(d) < reach
+        if not np.any(near):
+            continue
+        order = np.argsort(d[near])
+        ds = d[near][order]; cw = np.concatenate([[0.0], np.cumsum(w[near][order])])
+        cwy = np.concatenate([[0.0], np.cumsum((w[near] * y[near])[order])])
+        for dur in np.asarray(durations, float):
+            lo = np.searchsorted(ds, offsets - 0.5 * dur, side="right")
+            hi = np.searchsorted(ds, offsets + 0.5 * dur, side="left")
+            w_in = cw[hi] - cw[lo]; wy_in = cwy[hi] - cwy[lo]
+            ok = (w_in > 0) & (W - w_in > 0)
+            if not np.any(ok):
+                continue
+            depth = np.where(ok, (WY - wy_in) / np.where(ok, W - w_in, 1.0) - wy_in / np.where(ok, w_in, 1.0), 0.0)
+            power = np.where(ok & (depth > 0), 0.5 * depth ** 2 * w_in, 0.0)
+            k = int(np.argmax(power))
+            if power[k] > best[3]:
+                best = (float(P), float(t0_pivot + offsets[k]), float(dur), float(power[k]))
+    return dict(period=best[0], t0=best[1], duration=best[2], power=best[3], offsets=offsets)
+
+
+def vr_count_full_transits(t, period, t0, dur):
+    """Archival transits with >= 75% of expected 2-min cadences inside |phase| < 0.45 T14 (D-3)."""
+    t = np.asarray(t, float)
+    tau = ((t - t0 + 0.5 * period) % period) - 0.5 * period
+    m = np.abs(tau) < 0.45 * dur
+    if not np.any(m):
+        return 0
+    epochs = np.round((t[m] - t0) / period).astype(np.int64)
+    expected = 0.9 * dur / VR_CADENCE_DAYS
+    _, counts = np.unique(epochs, return_counts=True)
+    return int(np.sum(counts >= VR_FULL_TRANSIT_FRACTION * expected))
+
+
+def vr_period_scan(t, y, dy, periods, durations, t0_pivot, half_window, step):
+    """Per-period best of the constrained search (same objective and epoch window as vr_constrained_box_search)."""
+    out = []
+    for P in np.asarray(periods, float):
+        r = vr_constrained_box_search(t, y, dy, [P], durations, t0_pivot, half_window, step)
+        out.append((float(P), r['t0'], r['duration'], r['power']))
+    return out
+
+
+def vr_refine_p3(t, y, dy, p_min, p_max, n_trials, durations, t0_pivot, half_window, step, n_max, dur):
+    """Item 18 (P3): period grid with half-step drift <= T14/8 at max|n_s|; two stages above 4000 points."""
+    W = float(p_max - p_min)
+    n_req = int(np.ceil(4.0 * W * n_max / dur)) + 1
+    if n_req <= 4000:
+        n = int(np.clip(max(4 * n_trials, n_req), 60, 4000))
+        r = vr_constrained_box_search(t, y, dy, np.linspace(p_min, p_max, n), durations, t0_pivot, half_window, step)
+        r.update(n_req=n_req, n_grid=n, stages=1)
+        return r
+    coarse = np.linspace(p_min, p_max, 4000); step1 = W / 3999.0
+    scan = vr_period_scan(t, y, dy, coarse, durations, t0_pivot, half_window, step)
+    power = np.array([s[3] for s in scan]); order = np.argsort(-power); tops = []
+    for k in order:
+        if all(abs(k - j) > 2 for j in tops):
+            tops.append(int(k))
+        if len(tops) == 3:
+            break
+    step2 = dur / (8.0 * max(n_max, 1))
+    best = dict(period=scan[order[0]][0], t0=scan[order[0]][1], duration=scan[order[0]][2], power=scan[order[0]][3])
+    n2_total = 0
+    for k in tops:
+        lo, hi = max(p_min, coarse[k] - 2 * step1), min(p_max, coarse[k] + 2 * step1)
+        n2 = int(np.ceil((hi - lo) / step2)) + 1; n2_total += n2
+        r = vr_constrained_box_search(t, y, dy, np.linspace(lo, hi, n2), durations, t0_pivot, half_window, step)
+        if r['power'] > best['power']:
+            best = dict(period=r['period'], t0=r['t0'], duration=r['duration'], power=r['power'])
+    best.update(n_req=n_req, n_grid=4000 + n2_total, stages=2, offsets=np.arange(-half_window, half_window + 0.5 * step, step))
+    return best
+
+
+# ---------------------------------------------------------------- item 13: circular-zone Sidak threshold
+def vr_z_crit_circ(period, dur, alpha=VR_ALPHA_CIRC):
+    n_eff = max(1.0, 1.0 + 0.08 / (0.85 * dur / period))
+    p_crit = 1.0 - (1.0 - alpha) ** (1.0 / n_eff)
+    return float(stats.norm.isf(p_crit)), float(n_eff)
+
+
+# ---------------------------------------------------------------- item 14: TPF local noise and hierarchy
+def vr_tpf_maps(t, flux, period, t0, dur):
+    """Per-transit baseline-subtracted difference image dI, MAD-based sigma_pix and z (frozen windows)."""
+    t = np.asarray(t, float); f = np.asarray(flux, float)
+    tau = ((t - t0 + 0.5 * period) % period) - 0.5 * period
+    epoch = np.round((t - t0) / period).astype(np.int64)
+    in_m = np.abs(tau) < 0.45 * dur
+    sh_m = (np.abs(tau) > 0.75 * dur) & (np.abs(tau) < 2.5 * dur)
+    r_in, r_out = [], []
+    for e in np.unique(epoch[in_m | sh_m]):
+        sel_sh = sh_m & (epoch == e); sel_in = in_m & (epoch == e)
+        if not np.any(sel_sh):
+            continue
+        base = np.nanmedian(f[sel_sh], axis=0)
+        r_out.append(f[sel_sh] - base)
+        if np.any(sel_in):
+            r_in.append(f[sel_in] - base)
+    if not r_in or not r_out:
+        return None
+    r_in = np.concatenate(r_in); r_out = np.concatenate(r_out)
+    n_in = np.sum(np.isfinite(r_in), axis=0); n_out = np.sum(np.isfinite(r_out), axis=0)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        d_i = np.nanmean(r_out, axis=0) - np.nanmean(r_in, axis=0)
+        mad_in = 1.4826 * np.nanmedian(np.abs(r_in - np.nanmedian(r_in, axis=0)), axis=0)
+        mad_out = 1.4826 * np.nanmedian(np.abs(r_out - np.nanmedian(r_out, axis=0)), axis=0)
+        sig = np.sqrt(mad_in ** 2 / n_in + mad_out ** 2 / n_out)
+        z = d_i / sig
+    bad = ~np.isfinite(z) | (sig <= 0)
+    d_i = np.where(np.isfinite(d_i), d_i, 0.0); z = np.where(bad, 0.0, z); sig = np.where(bad, np.inf, sig)
+    return dict(dI=d_i, sigma=sig, z=z, n_in=int(np.max(n_in)), n_out=int(np.max(n_out)))
+
+
+def vr_tpf_decide(d_i, sig, z, aperture):
+    """Item 14 order: off-target test first, then weak localization, then dipole. Returns (outcome, reason, info).
+
+    outcome is 'REJECT', 'REVIEW' or 'PASS'. Interpretations recorded in the report: the off-target peak is the
+    off-aperture pixel with the largest dI; other off-aperture pixels with z >= 3.5 and z_diff >= 2 go to REVIEW.
+    """
+    ap = np.asarray(aperture, bool); off = ~ap
+    nr, nc = ap.shape
+    in_flat = np.where(ap, d_i, -np.inf)
+    i_max = np.unravel_index(int(np.argmax(in_flat)), ap.shape)
+    def zdiff(ix):
+        return float((d_i[ix] - d_i[i_max]) / np.sqrt(sig[ix] ** 2 + sig[i_max] ** 2))
+    info = dict(in_max_pixel=[int(i_max[1]), int(i_max[0])], dI_in_max=float(d_i[i_max]), z_in_star=float(np.max(np.where(ap, z, -np.inf))))
+    if np.any(off):
+        off_flat = np.where(off, d_i, -np.inf)
+        ip = np.unravel_index(int(np.argmax(off_flat)), ap.shape)
+        zd = zdiff(ip); info.update(off_peak_pixel=[int(ip[1]), int(ip[0])], z_off_peak=float(z[ip]), z_diff_peak=zd)
+        if z[ip] >= 5.0 and zd >= 3.0:
+            interior = 1 <= ip[0] <= nr - 2 and 1 <= ip[1] <= nc - 2
+            if interior:
+                return "REJECT", f"Off-target source! Pixel (col={ip[1]}, row={ip[0]}) z={z[ip]:.1f}, z_diff={zd:.1f} -> BEB", info
+            return "REVIEW", f"REVIEW_TPF_EDGE_OR_MARGINAL: border pixel (col={ip[1]}, row={ip[0]}) z={z[ip]:.1f}, z_diff={zd:.1f}", info
+        for ix in zip(*np.nonzero(off & (z >= 3.5))):
+            zd_x = zdiff(ix)
+            if zd_x >= 2.0:
+                return "REVIEW", f"REVIEW_TPF_EDGE_OR_MARGINAL: pixel (col={ix[1]}, row={ix[0]}) z={z[ix]:.1f}, z_diff={zd_x:.1f}", info
+    if info["z_in_star"] < 3.0:
+        return "PASS", "OK_WEAK_LOCALIZATION", info
+    dip = ap & (d_i < -0.25 * d_i[i_max]) & (z <= -4.0)
+    if np.any(dip):
+        ix = tuple(int(v[0]) for v in np.nonzero(dip))
+        return "REVIEW", f"REVIEW_TPF_DIPOLE_JITTER: pixel (col={ix[1]}, row={ix[0]}) z={z[ix]:.1f}", info
+    return "PASS", "OK", info
+
+
 PIPELINE_VERSION = "v9.0"
 CANDIDATE_SCHEMA_VERSION = "v1.1"
 
@@ -1105,6 +1304,148 @@ def compute_keplerian_duration_bounds_hours(
     return nom_max_hr, 0.35 * lower_circ_hr, 1.38 * upper_circ_hr
 
 
+from typing import NamedTuple
+
+
+class OddEvenV2Result(NamedTuple):
+    status: str
+    reason: str
+    sigma: float
+    odd_depth: float
+    even_depth: float
+    odd_err: float
+    even_err: float
+    diagnostics: dict
+
+
+def _student_t_to_gaussian_z(abs_t: float, df: float) -> float:
+    """Map a Student reference tail to Z, not calibrate observed event depths.
+
+    norm.sf(Z) == t.sf(abs_t, df). The two-sided factors of two cancel.
+    Independent, Gaussian, equal-variance event assumptions are NOT guaranteed
+    by detrending, event selection or the OOT noise floor.
+    """
+    from scipy.special import betaln, ndtri_exp
+    if np.isnan(abs_t) or abs_t < 0 or not np.isfinite(df) or df <= 0:
+        raise ValueError('Invalid Student reference statistic/degrees of freedom')
+    if abs_t == 0:
+        return 0.0
+    if np.isposinf(abs_t):
+        return np.inf
+    log_sf = float(stats.t.logsf(abs_t, df=df))
+    if not np.isfinite(log_sf):
+        # The incomplete-beta small-x expansion has a relative O(x) correction.
+        # It is used only after SciPy's tail underflows, not as sqrt(-2 log p).
+        log_x = float(np.log(df) - np.logaddexp(np.log(df), 2*np.log(abs_t)))
+        a = df/2.0
+        if log_x >= np.log(1e-8):
+            raise ArithmeticError('Student log-tail failed outside small-x domain')
+        log_sf = -np.log(2.) + a*log_x - np.log(a) - betaln(a,.5)
+    return max(0.0, float(-ndtri_exp(log_sf)))
+
+
+def compute_odd_even_v2(
+    t: np.ndarray, flat_f: np.ndarray, phase: np.ndarray,
+    in_tr: np.ndarray, out_tr: np.ndarray, orbit_num: np.ndarray,
+    best_p: float, best_dur: float, baseline: float,
+    min_complete_frac: float = .60, prior_block_df: int = 0,
+    min_oot_blocks: int = 6,
+) -> OddEvenV2Result:
+    """Experimental Argon event/OOT-block diagnostic, not a calibrated test.
+
+    Unweighted event depths, pooled empirical event variance and a separate
+    OOT floor retain Argon's main construction without adding white variance
+    twice. min(Z_emp,Z_oot) is a diagnostic score, not a universal exact tail.
+    Relative cadence support .60 and six OOT blocks are heuristic engineering
+    settings, not guarantees of full-event coverage or independent blocks.
+    No unestimated pseudo-prior df is used: singleton parity is INCONCLUSIVE.
+    The errors are component diagnostics; score != delta/hypot(errors) generally.
+    """
+    if prior_block_df != 0:
+        raise ValueError('Unestimated prior_block_df is unsupported; use zero')
+    if not(0 < min_complete_frac <= 1) or min_oot_blocks < 2:
+        raise ValueError('Invalid support settings')
+    if not(np.isfinite(best_p) and np.isfinite(best_dur) and np.isfinite(baseline)
+           and best_p > 0 and 0 < best_dur < best_p):
+        raise ValueError('Invalid period/duration/baseline')
+    t, flat_f, phase, orbit_num = [np.asarray(x,dtype=float) for x in (t,flat_f,phase,orbit_num)]
+    in_tr, out_tr = np.asarray(in_tr,dtype=bool), np.asarray(out_tr,dtype=bool)
+    arrays=(t,flat_f,phase,orbit_num,in_tr,out_tr)
+    if any(x.ndim != 1 or x.shape != t.shape for x in arrays):
+        raise ValueError('Unaligned odd/even inputs')
+    if np.any(in_tr & out_tr):
+        raise ValueError('Overlapping in/out masks')
+    order=np.argsort(t,kind='stable')
+    t,flat_f,phase,orbit_num,in_tr,out_tr=[x[order] for x in arrays]
+    finite=np.isfinite(t)&np.isfinite(flat_f)&np.isfinite(phase)&np.isfinite(orbit_num)
+    if np.any(np.diff(t[np.isfinite(t)])<=0):
+        raise ValueError('Duplicate timestamps')
+    if np.any(orbit_num[finite] != np.rint(orbit_num[finite])):
+        raise ValueError('Non-integer orbit indices')
+    info=dict(method='ODD_EVEN_V2_EXPERIMENTAL',prior_df=0,calibrated=False,
+              support_fraction=min_complete_frac,min_oot_blocks=min_oot_blocks,
+              support_definition='count relative to most-supported observed event; not proof of geometric completeness')
+    odd_depth=even_depth=odd_err=even_err=np.nan
+    def inconclusive(reason):
+        return OddEvenV2Result('INCONCLUSIVE',reason,np.nan,odd_depth,even_depth,odd_err,even_err,dict(info))
+    events=[]
+    for orb in np.unique(orbit_num[finite&in_tr]):
+        m=finite&in_tr&(orbit_num==orb);n=int(m.sum())
+        if n:events.append((int(orb),n,float((baseline-np.mean(flat_f[m]))*1e6)))
+    info['events_before_support']=len(events)
+    if not events:return inconclusive('NO_FINITE_TRANSIT_EVENTS')
+    max_cad=max(x[1] for x in events)
+    min_cad=max(3,int(np.ceil(min_complete_frac*max_cad)))
+    supported=[x for x in events if x[1]>=min_cad]
+    odd=[x for x in supported if x[0]%2];even=[x for x in supported if not x[0]%2]
+    no,ne=len(odd),len(even)
+    info.update(n_odd=no,n_even=ne,min_supported_cadences=min_cad,
+                supported_orbits=[x[0] for x in supported],excluded_orbits=[x[0] for x in events if x[1]<min_cad])
+    if no:odd_depth=float(np.mean([x[2] for x in odd]))
+    if ne:even_depth=float(np.mean([x[2] for x in even]))
+    if no<2 or ne<2:return inconclusive('UNREPLICATED_PARITY_NO_VALIDATED_PRIOR')
+    od=np.array([x[2] for x in odd]);ed=np.array([x[2] for x in even])
+    nc_o=np.array([x[1] for x in odd]);nc_e=np.array([x[1] for x in even])
+    dt=np.diff(t[finite]);dt=dt[dt>0]
+    if not len(dt):return inconclusive('NO_CADENCE_SCALE')
+    cadence=float(np.median(dt))
+    pure=finite&out_tr&(np.abs(np.abs(phase)-.5*best_p)>max(.06*best_p,1.2*best_dur))
+    if np.sum(pure)<min_cad*min_oot_blocks:return inconclusive('INSUFFICIENT_OOT_SUPPORT')
+    sigma_cad=float(1.4826*np.median(np.abs(flat_f[finite&out_tr]-baseline))*1e6)
+    block_width=.9*best_dur
+    ids=np.flatnonzero(pure);bt=t[ids];bf=flat_f[ids]
+    block_ids=np.floor((bt-bt[0])/block_width).astype(np.int64)
+    # Never join separated OOT islands or bridge a data gap inside a time bin.
+    split=np.flatnonzero((np.diff(block_ids)!=0)|(np.diff(bt)>1.5*cadence))+1
+    depths=[]
+    for inds in np.split(np.arange(len(bt)),split):
+        if len(inds)>=min_cad:
+            depths.append(float((baseline-np.mean(bf[inds]))*1e6))
+    info.update(n_oot_blocks=len(depths),cadence_days=cadence)
+    if len(depths)<min_oot_blocks:return inconclusive('INSUFFICIENT_OOT_BLOCKS')
+    bd=np.array(depths);sigma_block=float(1.4826*np.median(abs(bd-np.median(bd))))
+    var_o=sigma_cad**2*np.sum(1/nc_o)/no**2
+    var_e=sigma_cad**2*np.sum(1/nc_e)/ne**2
+    oe_oot=float(np.sqrt(max(var_o,sigma_block**2/no)))
+    ee_oot=float(np.sqrt(max(var_e,sigma_block**2/ne)))
+    se_oot=max(float(np.hypot(oe_oot,ee_oot)),1.0)
+    df=no+ne-2
+    s2_pool=float((np.sum((od-odd_depth)**2)+np.sum((ed-even_depth)**2))/df)
+    oe_emp=float(np.sqrt(s2_pool/no));ee_emp=float(np.sqrt(s2_pool/ne))
+    se_emp=float(np.hypot(oe_emp,ee_emp));delta=abs(odd_depth-even_depth)
+    z_emp=0. if delta==0 else _student_t_to_gaussian_z(delta/se_emp if se_emp>0 else np.inf,df)
+    z_oot=delta/se_oot
+    score=float(min(z_emp,z_oot))
+    odd_err=max(oe_emp,oe_oot);even_err=max(ee_emp,ee_oot)
+    info.update(reference_df=df,pooled_event_variance_ppm2=s2_pool,z_emp=z_emp,z_oot=z_oot,
+                se_emp_ppm=se_emp,se_oot_ppm=se_oot,sigma_cad_ppm=sigma_cad,
+                sigma_block_ppm=sigma_block,contrast_numerical_floor_ppm=1.,
+                empirical_odd_err_ppm=oe_emp,empirical_even_err_ppm=ee_emp,
+                oot_odd_err_ppm=oe_oot,oot_even_err_ppm=ee_oot)
+    if not np.isfinite(score):return inconclusive('NONFINITE_REFERENCE_SCORE')
+    return OddEvenV2Result('ASSESSED','POOLED_T_REFERENCE_WITH_OOT_FLOOR',score,odd_depth,even_depth,odd_err,even_err,info)
+
+
 def compute_whitened_kovacs_sde(power_arr: np.ndarray, window_pts: int = 501) -> tuple[np.ndarray, np.ndarray]:
     """
     Converts Astropy quadratic log-likelihood power (0.5 * dChi^2) into linear Signal Residue (SR),
@@ -1223,6 +1564,112 @@ def scan_full_orbit_secondary_eclipse(
             max_snr, max_depth_ppm, best_phi = ecc_max_snr, ecc_max_depth, ecc_best_phi
             
     return is_eb, max_snr, max_depth_ppm, best_phi, z_crit
+
+
+
+def _scan_full_orbit_secondary_eclipse_cp(
+    t: np.ndarray,
+    flat_f: np.ndarray,
+    period: float,
+    t0: float,
+    dur: float,
+    primary_depth_ppm: float,
+    details: Optional[dict] = None
+) -> tuple[bool, float, float, float, float]:
+    """
+    Scans all out-of-transit orbital phases phi in [min_phi, 1 - min_phi] using a sliding
+    box of width 0.85 * dur to detect eccentric secondary eclipses (e > 0.1).
+    Applies Sidak-Bonferroni trials-factor correction for alpha = 0.001 false-alarm rate.
+    Returns: (is_eb_flag, max_sec_snr, max_sec_depth_ppm, best_sec_phase, z_crit_threshold)
+    Note: z_crit is the eccentric trials-factor threshold and is retained in the return tuple
+    even when the circular branch is selected. When circular is selected, best_sec_phase is 0.50.
+    """
+    phase_0to1 = fold_phase_0to1(t, t0, period)
+    dur_phase = dur / period
+    min_phi = max(0.06, 1.6 * dur_phase)
+    
+    if min_phi >= 0.45:
+        return False, 0.0, 0.0, 0.5, 4.0
+        
+    oot_mask = (phase_0to1 >= min_phi) & (phase_0to1 <= (1.0 - min_phi))
+    if np.sum(oot_mask) < 50:
+        return False, 0.0, 0.0, 0.5, 4.0
+        
+    oot_baseline = float(np.nanmedian(flat_f[oot_mask]))
+    oot_noise = float(1.4826 * np.nanmedian(np.abs(flat_f[oot_mask] - oot_baseline)) + 1e-12)
+    
+    # Number of independent duration-wide windows across the out-of-transit orbit
+    n_indep_win = max(5, int((1.0 - 2.0 * min_phi) / max(dur_phase, 0.005)))
+    # Sidak-Bonferroni critical sigma for alpha = 0.001 family-wise false-alarm rate
+    z_crit = float(stats.norm.isf(0.001 / n_indep_win))
+    
+    # Evaluate sliding box on a half-duration-spaced phase grid
+    n_steps = max(20, n_indep_win * 2)
+    trial_phases = np.linspace(min_phi + 0.5 * dur_phase, 1.0 - min_phi - 0.5 * dur_phase, n_steps)
+    half_box = 0.425 * dur_phase
+    
+    ph_oot = phase_0to1[oot_mask]
+    f_oot = flat_f[oot_mask]
+    sort_idx = np.argsort(ph_oot)
+    ph_sorted = ph_oot[sort_idx]
+    f_sorted = f_oot[sort_idx]
+    
+    left_idx = np.searchsorted(ph_sorted, trial_phases - half_box, side="left")
+    right_idx = np.searchsorted(ph_sorted, trial_phases + half_box, side="right")
+    
+    circ_max_snr, circ_max_depth = 0.0, 0.0
+    ecc_max_snr, ecc_max_depth, ecc_best_phi = 0.0, 0.0, 0.5
+    
+    for phi_c, l_i, r_i in zip(trial_phases, left_idx, right_idx):
+        n_pts = r_i - l_i
+        if n_pts < 5:
+            continue
+        dip_ppm = float((oot_baseline - np.nanmean(f_sorted[l_i:r_i])) * 1e6)
+        err_ppm = (oot_noise * 1e6) / np.sqrt(n_pts)
+        snr = dip_ppm / max(err_ppm, 1.0)
+        
+        if abs(phi_c - 0.50) <= 0.04:
+            if snr > circ_max_snr:
+                circ_max_snr = snr
+                circ_max_depth = dip_ppm
+        else:
+            if snr > ecc_max_snr:
+                ecc_max_snr = snr
+                ecc_max_depth = dip_ppm
+                ecc_best_phi = float(phi_c)
+                
+    # Circular zone (|phi - 0.50| <= 0.04): 1 hypothesis test -> threshold SNR > 3.1
+    # VETTING-REPLAY-01 A2 (ARGON_DECISIONS item 13): Sidak threshold over N_eff_circ, white-noise error kept.
+    z_crit_circ, n_eff_circ = vr_z_crit_circ(period, dur)
+    if details is not None:
+        details.update(circ_snr=float(circ_max_snr), circ_depth=float(circ_max_depth), z_crit_circ=z_crit_circ, n_eff_circ=n_eff_circ)
+    circ_eb = (circ_max_snr > z_crit_circ) and (circ_max_depth > 100.0) and (circ_max_depth >= 0.10 * primary_depth_ppm)
+    # Eccentric zone (|phi - 0.50| > 0.04): N independent trials -> Sidak-Bonferroni z_crit
+    ecc_eb = (ecc_max_snr > z_crit) and (ecc_max_depth > 100.0) and (ecc_max_depth >= 0.10 * primary_depth_ppm)
+    
+    # ALD-013: Independent circular and eccentric qualifying branches (logical OR).
+    # Selection occurs only among qualifying branches. A nonqualifying raw peak in one
+    # zone must not suppress an independently qualifying peak in the other zone.
+    if circ_eb and ecc_eb:
+        is_eb = True
+        if circ_max_snr >= ecc_max_snr:
+            max_snr, max_depth_ppm, best_phi = circ_max_snr, circ_max_depth, 0.50
+        else:
+            max_snr, max_depth_ppm, best_phi = ecc_max_snr, ecc_max_depth, ecc_best_phi
+    elif circ_eb:
+        is_eb = True
+        max_snr, max_depth_ppm, best_phi = circ_max_snr, circ_max_depth, 0.50
+    elif ecc_eb:
+        is_eb = True
+        max_snr, max_depth_ppm, best_phi = ecc_max_snr, ecc_max_depth, ecc_best_phi
+    else:
+        is_eb = False
+        if circ_max_snr > ecc_max_snr:
+            max_snr, max_depth_ppm, best_phi = circ_max_snr, circ_max_depth, 0.50
+        else:
+            max_snr, max_depth_ppm, best_phi = ecc_max_snr, ecc_max_depth, ecc_best_phi
+            
+    return is_eb, max_snr, max_depth_ppm, best_phi, (z_crit_circ if (is_eb and circ_eb and best_phi == 0.50) else z_crit)
 
 
 def extract_and_stitch_arrays(lc_collection, edge_trim_days: float = 0.10) -> tuple:
@@ -1424,6 +1871,42 @@ def verify_and_filter_tpf(tic_id: str, sector: int, p_val: float, t0_val: float,
             )
             
         return True, "OK", diff_image, aperture
+        
+    except Exception as e:
+        return False, f"TPF read error: {str(e)[:40]}", None, None
+
+
+
+def _verify_and_filter_tpf_cp(tic_id: str, sector: int, p_val: float, t0_val: float, dur_val: float) -> tuple:
+    try:
+        tpf_search = lk.search_targetpixelfile(f"TIC {tic_id}", mission="TESS", author="SPOC", sector=sector, exptime=120)
+        if len(tpf_search) == 0:
+            return False, "TPF unavailable on MAST", None, None
+            
+        tpf = safe_download(tpf_search[0], tic_id, download_all=False)
+        t_tpf = to_numpy(tpf.time)
+        f_tpf = to_numpy(tpf.flux)
+        aperture = np.asarray(tpf.pipeline_mask, dtype=bool)
+        
+        if not np.any(aperture):
+            return False, "Empty SPOC pipeline aperture mask", None, None
+            
+        phase = fold_phase_centered(t_tpf, t0_val, p_val, in_days=True)
+        in_transit = np.abs(phase) < (0.45 * dur_val)
+        out_transit = (np.abs(phase) > (0.75 * dur_val)) & (np.abs(phase) < (2.5 * dur_val))
+        
+        if np.sum(in_transit) < 3 or np.sum(out_transit) < 10:
+            return False, "Insufficient TPF cadences in transit window", None, None
+            
+        # VETTING-REPLAY-01 A3 (ARGON_DECISIONS item 14): per-transit baseline, MAD sigma_pix, new test order.
+        maps = vr_tpf_maps(t_tpf, f_tpf, p_val, t0_val, dur_val)
+        if maps is None:
+            return False, "Insufficient TPF cadences in transit window", None, None
+        diff_image = maps['dI']
+        outcome, reason, _info = vr_tpf_decide(maps['dI'], maps['sigma'], maps['z'], aperture)
+        if outcome == 'REJECT':
+            return False, reason, diff_image, aperture
+        return True, reason, diff_image, aperture
         
     except Exception as e:
         return False, f"TPF read error: {str(e)[:40]}", None, None
@@ -1844,6 +2327,444 @@ def verify_multi_epoch(
         return True, f"Single-Sector_Only (Archival {failed_stage.capitalize()} Error: {type(exc).__name__})", diag_refine_failed
 
 
+
+def _verify_multi_epoch_cp(
+    tic_id: str,
+    current_sector: int,
+    t_curr: np.ndarray,
+    flat_f_curr: np.ndarray,
+    flat_ferr_curr: np.ndarray,
+    best_p: float,
+    best_t0: float,
+    best_dur: float,
+    depth_ppm_curr: float,
+    sde_curr: float
+) -> tuple:
+    products_requested = []
+    sectors_requested = []
+    products_attempted = []
+    sectors_attempted = []
+    products_used = []
+    sectors_used = []
+    products_failed = []
+
+    # Stage 0: Archival search query
+    try:
+        all_search = lk.search_lightcurve(f"TIC {tic_id}", mission="TESS", author="SPOC", exptime=120)
+    except Exception as exc:
+        logger.warning("Archival search query failed for TIC %s (%s)", tic_id, exc)
+        products_failed.append({
+            "product_id": "UNAVAILABLE",
+            "sector": int(current_sector),
+            "stage": "QUERY",
+            "reason": f"{type(exc).__name__}: {str(exc)}"[:150]
+        })
+        diag_info = {
+            "n_archival_sectors": 0,
+            "archival_sectors_str": "None",
+            "refined_p": np.nan,
+            "refined_t0": np.nan,
+            "archival_snr": np.nan,
+            "est_multi_sde_proxy": float(sde_curr),
+            "multi_sde": float(sde_curr),
+            "arch_bin_centers": None,
+            "arch_bin_means": None,
+            "n_trials": 1,
+            "snr_crit": 2.4,
+            "is_projected_strict": True,
+            "delta_t_arch_days": 0.0,
+            "sigma_p_sec": np.nan,
+            "sigma_t0_sec": np.nan,
+            "archival_sectors_requested": [],
+            "archival_sectors_attempted": [],
+            "archival_sectors_used": [],
+            "archival_products_requested": [],
+            "archival_products_attempted": [],
+            "archival_products_used": [],
+            "archival_products_failed": products_failed,
+            "ephemeris_source": "DISCOVERY_SINGLE_SECTOR",
+            "ephemeris_status": "FALLBACK_DISCOVERY",
+            "ephemeris_fallback_reason": f"ARCHIVAL_QUERY_FAILED: {type(exc).__name__}"
+        }
+        if sde_curr < 6.5:
+            return False, f"Archival lookup failed ({type(exc).__name__}) and single-sector SDE < 6.5", diag_info
+        return True, "Single-Sector_Only (Archival Query Error)", diag_info
+
+    prior_indices = []
+    prior_sec_nums = []
+    for i, row in enumerate(all_search):
+        try:
+            mission_val = row.mission[0] if isinstance(row.mission, (list, tuple, np.ndarray)) else row.mission
+            sec_num = int(str(mission_val).split()[-1])
+        except Exception:
+            sec_num = -1
+        if sec_num != current_sector and sec_num > 0:
+            prior_indices.append(i)
+            prior_sec_nums.append(sec_num)
+
+    if len(prior_indices) == 0:
+        diag_no_prior = {
+            "n_archival_sectors": 0,
+            "archival_sectors_str": "None",
+            "refined_p": np.nan,
+            "refined_t0": np.nan,
+            "archival_snr": np.nan,
+            "est_multi_sde_proxy": float(sde_curr),
+            "multi_sde": float(sde_curr),
+            "arch_bin_centers": None,
+            "arch_bin_means": None,
+            "n_trials": 1,
+            "snr_crit": 2.4,
+            "is_projected_strict": True,
+            "delta_t_arch_days": 0.0,
+            "sigma_p_sec": np.nan,
+            "sigma_t0_sec": np.nan,
+            "archival_sectors_requested": [],
+            "archival_sectors_attempted": [],
+            "archival_sectors_used": [],
+            "archival_products_requested": [],
+            "archival_products_attempted": [],
+            "archival_products_used": [],
+            "archival_products_failed": [],
+            "ephemeris_source": "DISCOVERY_SINGLE_SECTOR",
+            "ephemeris_status": "FALLBACK_DISCOVERY",
+            "ephemeris_fallback_reason": "SINGLE_SECTOR_ONLY_NO_PRIOR"
+        }
+        if sde_curr < 6.5:
+            return False, f"Single-sector only and borderline SDE ({sde_curr:.1f} < 6.5)", diag_no_prior
+        return True, "Single-Sector_Only", diag_no_prior
+
+    chosen_idx = prior_indices[-3:]
+    chosen_secs = [prior_sec_nums[i] for i, idx in enumerate(prior_indices) if idx in chosen_idx]
+
+    products_requested = [_get_stable_product_id(all_search[idx], sec, idx) for idx, sec in zip(chosen_idx, chosen_secs)]
+    sectors_requested = sorted(list(dict.fromkeys(chosen_secs)))
+
+    t_raw_list, f_raw_list, ferr_raw_list, f_init_list = [], [], [], []
+    for idx, sec_num in zip(chosen_idx, chosen_secs):
+        pid = _get_stable_product_id(all_search[idx], sec_num, idx)
+        products_attempted.append(pid)
+        if sec_num not in sectors_attempted:
+            sectors_attempted.append(sec_num)
+        stage = "DOWNLOAD"
+        try:
+            lc_p = safe_download(all_search[idx], tic_id, download_all=False)
+            if lc_p is None:
+                raise ValueError("safe_download returned None")
+
+            stage = "EXTRACTION"
+            tp, fp, ferrp, _, _, _ = extract_and_stitch_arrays([lc_p], edge_trim_days=0.10)
+            if tp is None or len(tp) == 0:
+                raise ValueError("Extracted arrays empty or None")
+            if np.any(~np.isfinite(tp)) or np.any(~np.isfinite(fp)) or np.any(~np.isfinite(ferrp)):
+                raise ValueError("Extracted arrays contain non-finite values")
+
+            stage = "CLIPPING"
+            tp_c, fp_c, ferrp_c = clip_upper_outliers(tp, fp, ferrp)
+            if tp_c is None or len(tp_c) == 0:
+                raise ValueError("Empty arrays after outlier clipping")
+
+            stage = "DETRENDING"
+            tr_init = piecewise_savgol_detrend(tp_c, fp_c, mask=None, max_win=601)
+            if tr_init is None or len(tr_init) != len(tp_c):
+                raise ValueError("Detrending returned invalid trend")
+            if np.any(~np.isfinite(tr_init)) or np.any(tr_init <= 0):
+                raise ValueError("Trend contains non-finite or non-positive values")
+
+            norm_f = fp_c / tr_init
+            norm_ferr = ferrp_c / tr_init
+            if np.any(~np.isfinite(norm_f)) or np.any(~np.isfinite(norm_ferr)):
+                raise ValueError("Normalized flux or error contains non-finite values")
+
+            t_raw_list.append(tp_c)
+            f_raw_list.append(fp_c)
+            ferr_raw_list.append(norm_ferr)
+            f_init_list.append(norm_f)
+            products_used.append(pid)
+            sectors_used.append(sec_num)
+        except Exception as exc:
+            products_failed.append({
+                "product_id": pid,
+                "sector": int(sec_num),
+                "stage": stage,
+                "reason": f"{type(exc).__name__}: {str(exc)}"[:150]
+            })
+            continue
+
+    if not t_raw_list:
+        diag_all_failed = {
+            "n_archival_sectors": 0,
+            "archival_sectors_str": "None",
+            "refined_p": np.nan,
+            "refined_t0": np.nan,
+            "archival_snr": np.nan,
+            "est_multi_sde_proxy": float(sde_curr),
+            "multi_sde": float(sde_curr),
+            "arch_bin_centers": None,
+            "arch_bin_means": None,
+            "n_trials": 1,
+            "snr_crit": 2.4,
+            "is_projected_strict": True,
+            "delta_t_arch_days": 0.0,
+            "sigma_p_sec": np.nan,
+            "sigma_t0_sec": np.nan,
+            "archival_sectors_requested": sectors_requested,
+            "archival_sectors_attempted": sorted(list(dict.fromkeys(sectors_attempted))),
+            "archival_sectors_used": [],
+            "archival_products_requested": products_requested,
+            "archival_products_attempted": products_attempted,
+            "archival_products_used": [],
+            "archival_products_failed": products_failed,
+            "ephemeris_source": "DISCOVERY_SINGLE_SECTOR",
+            "ephemeris_status": "FALLBACK_DISCOVERY",
+            "ephemeris_fallback_reason": "ARCHIVAL_DOWNLOAD_OR_PREPARATION_FAILED"
+        }
+        if sde_curr < 6.5:
+            return False, "Archival sectors unreadable and SDE < 6.5", diag_all_failed
+        return True, "Single-Sector_Only (Archival Download Failed)", diag_all_failed
+
+    unique_secs_used = sorted(list(dict.fromkeys(sectors_used)))
+    n_used_secs = len(unique_secs_used)
+    used_secs_str = ",".join(str(s) for s in unique_secs_used)
+
+    # Stage 5: Combined multi-sector concatenation, detrending, refinement, and evaluation
+    try:
+        comb_stage = "CONCATENATION"
+        t_prior = np.concatenate(t_raw_list)
+        f_prior_raw = np.concatenate(f_raw_list)
+        f_prior_init = np.concatenate(f_init_list)
+        ferr_prior = np.concatenate(ferr_raw_list)
+
+        t_comb = np.concatenate([t_prior, t_curr])
+        f_comb = np.concatenate([f_prior_init, flat_f_curr])
+        ferr_comb = np.concatenate([ferr_prior, flat_ferr_curr])
+        sort_c = np.argsort(t_comb)
+        t_comb, f_comb, ferr_comb = t_comb[sort_c], f_comb[sort_c], ferr_comb[sort_c]
+
+        comb_stage = "TIMING_UNCERTAINTY"
+        delta_t_arch = abs(float(np.median(t_curr) - np.median(t_prior)))
+        baseline_curr = float(np.max(t_curr) - np.min(t_curr))
+
+        # VETTING-REPLAY-01 A1 (ARGON_DECISIONS item 12): pivot epoch, interim floor, per-sector mode.
+        vr_t = vr_timing(best_t0, best_p, best_dur, sde_curr, t_curr, list(zip(sectors_used, t_raw_list)))
+        sigma_t0, sigma_p = vr_t['sigma_t0'], vr_t['sigma_p']
+        vr_diag = dict(t0_pivot=vr_t['t0_pivot'], sigma_t0_d=sigma_t0, sigma_p_d=sigma_p,
+                       sigma_pred_d={str(k): v for k, v in vr_t['sigma_pred'].items()},
+                       max_sigma_pred_d=vr_t['max_sigma_pred'], mode=1 if vr_t['mode1'] else 2)
+
+        if vr_t['mode1']:
+            comb_stage = "PROJECTION"
+            # Contiguous or near-contiguous sectors: strict zero-freedom forward projection (N_trials = 1)
+            # Refined ephemeris fit not performed; unused refinement is np.nan
+            refined_p = np.nan
+            refined_t0 = np.nan
+            n_trials = 1
+            snr_crit = 2.4
+            is_projected_strict = True
+            ephem_src = "DISCOVERY_SINGLE_SECTOR"
+            ephem_stat = "FALLBACK_DISCOVERY"
+            fallback_reas = "STRICT_PROJECTION_NEARBY_SECTOR"
+        else:
+            comb_stage = "REFINEMENT"
+            # Multi-year archival baseline: search strictly within Cramer-Rao 2-sigma corridor
+            # with Sidak-Bonferroni trial penalty (eliminates circular overfitting of noise dips)
+            p_hw = 3.5 * sigma_p
+            p_min = max(0.5, best_p - p_hw)
+            p_max = best_p + p_hw
+            delta_p_indep = (best_p * best_dur) / delta_t_arch
+            n_trials = max(1, int(np.ceil((2.0 * p_hw) / max(delta_p_indep, 1e-6))))
+            snr_crit = max(2.8, float(np.sqrt(2.0 * np.log(max(n_trials, 2))) + 1.2))
+            is_projected_strict = False
+
+            n_grid_pts = int(np.clip(n_trials * 4, 60, 4000))
+            fine_periods = np.linspace(p_min, p_max, n_grid_pts)
+            fine_durs = np.array([max(0.03, best_dur * 0.90), best_dur, min(0.22, best_dur * 1.10)])
+
+            # VETTING-REPLAY-02 item 18 (P3): drift-based grid, two stages above 4000 points.
+            _vr_ref = vr_refine_p3(t_comb, f_comb, ferr_comb, p_min, p_max, n_trials, fine_durs,
+                                   vr_t['t0_pivot'], 3.0 * sigma_t0, VR_DT_GRID,
+                                   max(abs(v) for v in vr_t['n_s'].values()), best_dur)
+            vr_diag.update(p3_n_req=_vr_ref['n_req'], p3_n_grid=_vr_ref['n_grid'], p3_stages=_vr_ref['stages'])
+            cand_refined_p = _vr_ref['period']
+            cand_refined_t0 = _vr_ref['t0']
+            if (
+                cand_refined_p is not None
+                and cand_refined_t0 is not None
+                and np.isfinite(cand_refined_p)
+                and cand_refined_p > 0
+                and np.isfinite(cand_refined_t0)
+            ):
+                refined_p = cand_refined_p
+                refined_t0 = cand_refined_t0
+                ephem_src = "REFINED_MULTI_SECTOR"
+                ephem_stat = "REFINED_VALID"
+                fallback_reas = "NONE"
+            else:
+                refined_p = np.nan
+                refined_t0 = np.nan
+                ephem_src = "DISCOVERY_SINGLE_SECTOR"
+                ephem_stat = "FALLBACK_DISCOVERY"
+                fallback_reas = "REFINED_EPHEMERIS_INVALID"
+
+        vr_diag.update(n_trials=n_trials, snr_crit=snr_crit, refined_p=refined_p, refined_t0=refined_t0)
+        comb_stage = "DETRENDING"
+        eff_p = refined_p if (refined_p is not None and np.isfinite(refined_p)) else best_p
+        eff_t0 = refined_t0 if (refined_t0 is not None and np.isfinite(refined_t0)) else best_t0
+
+        phase_prior = fold_phase_centered(t_prior, eff_t0, eff_p, in_days=True)
+        tr_mask_prior = np.abs(phase_prior) < (0.6 * best_dur)
+        trend_prior_ref = piecewise_savgol_detrend(t_prior, f_prior_raw, mask=tr_mask_prior, max_win=601)
+        f_prior = f_prior_raw / trend_prior_ref
+
+        comb_stage = "EVALUATION"
+        in_tr_p = np.abs(phase_prior) < (0.45 * best_dur)
+        out_tr_p = np.abs(phase_prior) > (0.65 * best_dur)
+
+        base_diag = {
+            "n_archival_sectors": n_used_secs,
+            "archival_sectors_str": used_secs_str,
+            "refined_p": refined_p,
+            "refined_t0": refined_t0,
+            "archival_snr": np.nan,
+            "est_multi_sde_proxy": float(sde_curr),
+            "multi_sde": float(sde_curr),
+            "arch_bin_centers": None,
+            "arch_bin_means": None,
+            "n_trials": n_trials,
+            "snr_crit": snr_crit,
+            "is_projected_strict": is_projected_strict,
+            "delta_t_arch_days": delta_t_arch,
+            "sigma_p_sec": float(sigma_p * 86400.0),
+            "sigma_t0_sec": float(sigma_t0 * 86400.0),
+            "archival_sectors_requested": sectors_requested,
+            "archival_sectors_attempted": sorted(list(dict.fromkeys(sectors_attempted))),
+            "archival_sectors_used": unique_secs_used,
+            "archival_products_requested": products_requested,
+            "archival_products_attempted": products_attempted,
+            "archival_products_used": products_used,
+            "archival_products_failed": products_failed,
+            "ephemeris_source": ephem_src,
+            "ephemeris_status": ephem_stat,
+            "ephemeris_fallback_reason": fallback_reas
+        }
+
+        base_diag["vr"] = vr_diag
+        if not is_projected_strict and refined_p is not None and np.isfinite(refined_p):
+            # VETTING-REPLAY-02 item 19 (P4): the refined ephemeris must keep the discovery-sector transits.
+            _tau_c = np.abs(((t_curr - eff_t0 + 0.5 * eff_p) % eff_p) - 0.5 * eff_p)
+            _in_c, _out_c = _tau_c < 0.45 * best_dur, _tau_c > 0.65 * best_dur
+            _d_disc = float((np.nanmedian(flat_f_curr[_out_c]) - np.nanmean(flat_f_curr[_in_c])) * 1e6) if (np.any(_in_c) and np.any(_out_c)) else float("nan")
+            vr_diag.update(p4_discovery_depth_ppm=_d_disc, p4_bls_depth_ppm=float(depth_ppm_curr))
+            if not (np.isfinite(_d_disc) and _d_disc >= 0.50 * depth_ppm_curr):
+                base_diag.update(refined_p=np.nan, refined_t0=np.nan, ephemeris_source="DISCOVERY_SINGLE_SECTOR",
+                                 ephemeris_status="FALLBACK_DISCOVERY", ephemeris_fallback_reason="P4_REFINEMENT_LOST_DISCOVERY_TRANSIT")
+                return (True, f"REVIEW_ARCHIVAL_REFINEMENT_LOST_DISCOVERY_TRANSIT: discovery-sector depth {_d_disc:.0f}ppm < 0.50 x "
+                              f"{depth_ppm_curr:.0f}ppm at refined P={eff_p:.6f}", base_diag)
+        if np.sum(in_tr_p) < 5:
+            return False, f"Insufficient archival in-transit points in sectors {used_secs_str}", base_diag
+
+        base_p = float(np.nanmedian(f_prior[out_tr_p]))
+        depth_prior_ppm = float((base_p - np.nanmean(f_prior[in_tr_p])) * 1e6)
+        err_prior_ppm = float(np.nanstd(f_prior[out_tr_p]) / np.sqrt(np.sum(in_tr_p)) * 1e6)
+        archival_snr = depth_prior_ppm / max(err_prior_ppm, 1.0)
+        base_diag["archival_snr"] = archival_snr
+
+        # Control Phase Null Test: measure flux deficit at 8 off-transit control phases
+        ctrl_phases = [0.15, 0.20, 0.25, 0.30, 0.70, 0.75, 0.80, 0.85]
+        ctrl_snrs = []
+        for cp in ctrl_phases:
+            # Compare on the periodic orbit: phase_prior is signed, while cp is in [0, 1).
+            cp_distance = np.abs(cyclic_orbital_distance(phase_prior, cp * eff_p, period=eff_p))
+            in_cp = cp_distance < (0.45 * best_dur)
+            if np.sum(in_cp) >= 5:
+                cp_depth = float((base_p - np.nanmean(f_prior[in_cp])) * 1e6)
+                ctrl_snrs.append(cp_depth / max(err_prior_ppm, 1.0))
+        max_ctrl_snr = max(ctrl_snrs) if ctrl_snrs else 0.0
+
+        if archival_snr < snr_crit or depth_prior_ppm < 0.25 * depth_ppm_curr:
+            _msg = f"Archival non-detection in sectors {used_secs_str} (Prior Depth={depth_prior_ppm:.0f}ppm, SNR={archival_snr:.1f}sigma < crit={snr_crit:.1f}sigma, N_trials={n_trials}) -> Transient artifact"
+            _snr_exp = float(depth_ppm_curr / max(err_prior_ppm, 1.0))  # item 12; R_crowd = 1 (PDCSAP)
+            _n_full = vr_count_full_transits(t_prior, eff_p, eff_t0, best_dur)  # D-3
+            base_diag["vr"].update(snr_exp_arch=_snr_exp, n_full_archival_transits=_n_full)
+            if is_projected_strict and _n_full >= 2 and _snr_exp >= 6.0:
+                return (False, _msg, base_diag)
+            return (True, "REVIEW_ARCHIVAL_NONDETECTION: " + _msg, base_diag)
+
+        if not is_projected_strict and (archival_snr < max_ctrl_snr + 1.5):
+            return (False, f"Archival signal failed control phase null test in sectors {used_secs_str} (Transit SNR={archival_snr:.1f}sigma vs control peak {max_ctrl_snr:.1f}sigma) -> Red noise fluctuation", base_diag)
+
+        if depth_prior_ppm < 0.50 * depth_ppm_curr:
+            return (True, f"REVIEW_ARCHIVAL_DEPTH_BAND: archival depth {depth_prior_ppm:.0f}ppm is 25 to 50% of "
+                          f"{depth_ppm_curr:.0f}ppm; secondary scan skipped", base_diag)
+
+        # Multi-sector secondary eclipse check on combined baseline
+        _sec = {}
+        is_sec_eb, sec_snr, sec_depth_ppm, sec_phi, _zc = _scan_full_orbit_secondary_eclipse_cp(
+            t_comb, f_comb, eff_p, eff_t0, best_dur, depth_prior_ppm, details=_sec
+        )
+        if is_sec_eb:
+            return (False, f"Multi-sector secondary eclipse in sectors {used_secs_str} at phase {sec_phi:.2f} ({sec_depth_ppm:.0f}ppm, {sec_snr:.1f}sigma) -> {'Circular EB' if abs(sec_phi - 0.50) <= 0.04 else 'Eccentric EB'}, z_crit={_zc:.2f}", base_diag)
+        if _sec and 3.1 < _sec['circ_snr'] < _sec['z_crit_circ'] and _sec['circ_depth'] > 100.0 \
+                and _sec['circ_depth'] >= 0.10 * depth_prior_ppm:
+            return (True, f"REVIEW_ARCHIVAL_MARGINAL_SECONDARY: circular {_sec['circ_snr']:.2f}sigma, "
+                          f"3.1 < z < z_crit_circ={_sec['z_crit_circ']:.2f}", base_diag)
+
+        win_phase = min(0.15 * eff_p, 3.0 * best_dur)
+        vis_p = np.abs(phase_prior) <= win_phase
+        bins = np.linspace(-win_phase, win_phase, 41)
+        arch_means, arch_edges, _ = stats.binned_statistic(phase_prior[vis_p], f_prior[vis_p], statistic="mean", bins=bins)
+        arch_centers = 0.5 * (arch_edges[:-1] + arch_edges[1:])
+
+        proxy_sde = sde_curr * np.sqrt(1.0 + n_used_secs * 0.5)
+        base_diag.update({
+            "est_multi_sde_proxy": proxy_sde,
+            "multi_sde": proxy_sde,
+            "arch_bin_centers": arch_centers,
+            "arch_bin_means": arch_means,
+        })
+        return True, f"Confirmed_in_Sectors_{used_secs_str}", base_diag
+
+    except Exception as exc:
+        logger.warning("Archival %s error for TIC %s (%s)", comb_stage.lower(), tic_id, exc)
+        failed_stage = comb_stage
+        products_failed.append({
+            "product_id": "COMBINED_PIPELINE",
+            "sector": int(current_sector),
+            "stage": failed_stage,
+            "reason": f"{type(exc).__name__}: {str(exc)}"[:150]
+        })
+        diag_refine_failed = {
+            "n_archival_sectors": n_used_secs,
+            "archival_sectors_str": used_secs_str,
+            "refined_p": np.nan,
+            "refined_t0": np.nan,
+            "archival_snr": np.nan,
+            "est_multi_sde_proxy": float(sde_curr),
+            "multi_sde": float(sde_curr),
+            "arch_bin_centers": None,
+            "arch_bin_means": None,
+            "n_trials": 1,
+            "snr_crit": 2.4,
+            "is_projected_strict": True,
+            "delta_t_arch_days": 0.0,
+            "sigma_p_sec": np.nan,
+            "sigma_t0_sec": np.nan,
+            "archival_sectors_requested": sectors_requested,
+            "archival_sectors_attempted": sorted(list(dict.fromkeys(sectors_attempted))),
+            "archival_sectors_used": unique_secs_used,
+            "archival_products_requested": products_requested,
+            "archival_products_attempted": products_attempted,
+            "archival_products_used": products_used,
+            "archival_products_failed": products_failed,
+            "ephemeris_source": "DISCOVERY_SINGLE_SECTOR",
+            "ephemeris_status": "FALLBACK_DISCOVERY",
+            "ephemeris_fallback_reason": f"ARCHIVAL_{failed_stage}_FAILED: {type(exc).__name__}"
+        }
+        if sde_curr < 6.5:
+            return False, f"Archival evaluation failed ({failed_stage}: {type(exc).__name__}) and single-sector SDE < 6.5", diag_refine_failed
+        return True, f"Single-Sector_Only (Archival {failed_stage.capitalize()} Error: {type(exc).__name__})", diag_refine_failed
+
+
 def analyze_single_target(
     tic_id: str,
     sector: int,
@@ -1852,7 +2773,8 @@ def analyze_single_target(
     run_id: str = None,
     attempt_id: str = None,
     *,
-    observer_context: Any = None
+    observer_context: Any = None,
+    odd_even_method: str = "legacy"
 ) -> AnalysisResult:
     """
     Worker entrypoint. Guarantees the per-target FITS cache is purged on EVERY non-candidate
@@ -1885,9 +2807,14 @@ def analyze_single_target(
             pass
 
     try:
+        kwargs = dict(observer_context=observer_context, ledger=ledger)
+        if odd_even_method not in ("legacy", "v2"):
+            raise ValueError("odd_even_method must be legacy or v2")
+        if odd_even_method == "v2":
+            kwargs["odd_even_method"] = odd_even_method
         result = _analyze_single_target_impl(
             tic_id, sector, min_period, max_period, run_id=run_id, attempt_id=attempt_id,
-            observer_context=observer_context, ledger=ledger
+            **kwargs
         )
         return result
     finally:
@@ -1928,6 +2855,56 @@ def _extract_product_identity(prod) -> dict:
     return info
 
 
+def review_event_link(stronger, period, epoch, duration, times):
+    """Conservative unresolved-event association, not a planet/alias classifier.
+
+    Require every supported event of the stronger REVIEW peak to overlap a
+    distinct supported event of the lower-ranked peak. Each solution uses its
+    own cadence counts and support floor: max(3, ceil(0.60 * its maximum)).
+    Extra lower-peak events do not resolve the original odd/even uncertainty.
+    Period ratios alone are unused. Windows are measured transit intervals,
+    with no fitted timing tolerance.
+    """
+    times = np.asarray(times, dtype=float)
+    times = np.sort(times[np.isfinite(times)])
+    if not len(times):
+        return None
+    def events(p, t0, width):
+        if not all(np.isfinite(x) for x in (p, t0, width)) or p <= 0 or width <= 0:
+            return np.array([])
+        cycles = np.arange(np.ceil((times[0] - t0) / p),
+                           np.floor((times[-1] - t0) / p) + 1)
+        centers = t0 + cycles * p
+        # Match compute_odd_even_v2's in-transit cadence mask.
+        half_width = 0.45 * width
+        left = np.searchsorted(times, centers - half_width, side='right')
+        right = np.searchsorted(times, centers + half_width, side='left')
+        cadence_counts = right - left
+        if not len(cadence_counts):
+            return np.array([])
+        support_floor = max(3, int(np.ceil(0.60 * np.max(cadence_counts))))
+        return np.asarray([c for c, n in zip(centers, cadence_counts)
+                           if n >= support_floor])
+    a = events(stronger['period_days'], stronger['t0_btjd'], stronger['duration_days'])
+    b = events(period, epoch, duration)
+    if len(a) < 2 or len(b) < len(a):
+        return None
+    half_window = (stronger['duration_days'] + duration) / 2
+    pairs = []
+    j = 0
+    for center in a:
+        while j < len(b) and b[j] < center - half_window:
+            j += 1
+        if j == len(b) or abs(b[j] - center) > half_window:
+            return None
+        pairs.append(float(b[j] - center))
+        j += 1
+    return dict(stronger_peak_rank=stronger['peak_rank'],
+                stronger_supported_events=len(a), lower_supported_events=len(b),
+                matched_events=len(pairs), center_residual_days=pairs,
+                overlap_half_window_days=float(half_window))
+
+
 def _analyze_single_target_impl(
     tic_id: str,
     sector: int,
@@ -1937,7 +2914,8 @@ def _analyze_single_target_impl(
     attempt_id: str = None,
     *,
     observer_context: Any = None,
-    ledger: Any = None
+    ledger: Any = None,
+    odd_even_method: str = "legacy"
 ) -> AnalysisResult:
     if ledger is None and observer_context is not None and ObserverContext is not None and SubmissionLedger is not None:
         try:
@@ -1961,7 +2939,30 @@ def _analyze_single_target_impl(
             except Exception:
                 pass
 
+    # Cp is opt-in. Public helpers retain the baseline legacy contract.
+    secondary_scan = _scan_full_orbit_secondary_eclipse_cp if odd_even_method == "v2" else scan_full_orbit_secondary_eclipse
+    tpf_check = _verify_and_filter_tpf_cp if odd_even_method == "v2" else verify_and_filter_tpf
+    archival_check = _verify_multi_epoch_cp if odd_even_method == "v2" else verify_multi_epoch
+
     attempt_diagnostics = []
+    vetting_diagnostics = []
+    review_peaks = []
+    peak_evidence = None
+
+    def evidence_safe(value):
+        if isinstance(value, dict): return {k: evidence_safe(v) for k, v in value.items()}
+        if isinstance(value, (list, tuple)): return [evidence_safe(v) for v in value]
+        if isinstance(value, np.generic): return evidence_safe(value.item())
+        if isinstance(value, float) and not np.isfinite(value): return None
+        return value
+
+    def note_gate(name, status, **metrics):
+        if peak_evidence is not None:
+            peak_evidence['gates'].append(dict(gate=name, status=status, metrics=metrics))
+            if status in ('REJECT', 'MISSING_INPUT'):
+                peak_evidence['disposition'] = 'REJECT' if status == 'REJECT' else 'INCOMPLETE'
+                peak_evidence['cause'] = name
+
 
     def make_res(t_id, status_val, msg_val, cand_val=None):
         if ledger is not None:
@@ -1977,6 +2978,26 @@ def _analyze_single_target_impl(
                 )
             except Exception:
                 pass
+        if odd_even_method == 'v2':
+            for item in vetting_diagnostics:
+                if item['disposition'] == 'EVALUATING':
+                    item['disposition'] = 'ERROR' if status_val == 'ERROR' else 'INCOMPLETE'
+                    item['cause'] = status_val
+            # Separate fail-closed evidence sink: REVIEW never enters candidate CSV.
+            os.makedirs(OUTPUT_DIR, exist_ok=True)
+            payload = dict(tic_id=str(t_id), run_id=run_id, attempt_id=attempt_id,
+                           final_status=status_val, peaks=vetting_diagnostics)
+            with open(os.path.join(OUTPUT_DIR, 'experimental_v2_vetting.jsonl'), 'a', encoding='utf-8') as handle:
+                handle.write(json.dumps(evidence_safe(payload), allow_nan=False) + '\n')
+                handle.flush()
+            rows = [dict(tic_id=str(t_id), run_id=run_id, attempt_id=attempt_id,
+                         target_status=status_val, peak_rank=item['peak_rank'],
+                         disposition=item['disposition'], cause=item['cause'],
+                         evidence_json=json.dumps(evidence_safe(item), allow_nan=False))
+                    for item in vetting_diagnostics]
+            if rows:
+                csv_path = os.path.join(OUTPUT_DIR, 'experimental_v2_vetting.csv')
+                pd.DataFrame(rows).to_csv(csv_path, mode='a', header=not os.path.exists(csv_path), index=False)
         return AnalysisResult(
             t_id,
             status_val,
@@ -2171,6 +3192,9 @@ def _analyze_single_target_impl(
         first_reject_msg = "Empty"
         
         for rank_idx, peak_idx in enumerate(top_peak_indices, 1):
+            peak_evidence = None
+            odd_even_unresolved = False
+            vet_holds = []
             best_p = float(bls_res.period[peak_idx])
             best_t0 = float(bls_res.transit_time[peak_idx])
             best_dur = float(bls_res.duration[peak_idx])
@@ -2318,22 +3342,59 @@ def _analyze_single_target_impl(
             odd_mask = in_tr & (orbit_num % 2 != 0)
             even_mask = in_tr & (orbit_num % 2 == 0)
             
-            if np.sum(odd_mask) < 3 or np.sum(even_mask) < 3:
+            if odd_even_method == "legacy" and (np.sum(odd_mask) < 3 or np.sum(even_mask) < 3):
                 if rank_idx == 1:
                     first_reject_code = "REJECT_SINGLE"
                     first_reject_msg = f"REJECT {base_telemetry}: Missing odd or even coverage"
                 continue
                 
-            odd_depth = float((baseline - np.nanmean(flat_f[odd_mask])) * 1e6)
-            even_depth = float((baseline - np.nanmean(flat_f[even_mask])) * 1e6)
-            odd_err = float(np.nanstd(flat_f[odd_mask]) / np.sqrt(np.sum(odd_mask)) * 1e6)
-            even_err = float(np.nanstd(flat_f[even_mask]) / np.sqrt(np.sum(even_mask)) * 1e6)
-            
-            odd_even_sigma = abs(odd_depth - even_depth) / max(np.hypot(odd_err, even_err), 1.0)
-            if odd_even_sigma > 2.8:
+            if odd_even_method == "v2":
+                odd_even_result = compute_odd_even_v2(
+                    t_curr_eval, flat_f, phase, in_tr, out_tr, orbit_num,
+                    best_p, best_dur, baseline
+                )
+                logger.info("ODD_EVEN_V2_EXPERIMENTAL %s", odd_even_result)
+                odd_even_unresolved = odd_even_result.status != "ASSESSED"
+                def finite_or_none(value):
+                    return float(value) if np.isfinite(value) else None
+                peak_evidence = dict(peak_rank=int(rank_idx), period_days=best_p,
+                    t0_btjd=best_t0, duration_days=best_dur,
+                    odd_even_status='INCONCLUSIVE' if odd_even_unresolved else ('REJECT' if odd_even_result.sigma > 2.8 else 'PASS'),
+                    odd_even_reason=odd_even_result.reason,
+                    odd_even_metrics={key: finite_or_none(getattr(odd_even_result, key))
+                                      for key in ('sigma', 'odd_depth', 'even_depth', 'odd_err', 'even_err')},
+                    odd_even_diagnostics=odd_even_result.diagnostics,
+                    gates=[], disposition='EVALUATING', cause=None)
+                # Existing diagnostics contain nonfinite missing measurements.
+                peak_evidence = json.loads(json.dumps(peak_evidence, default=lambda v: v.item()))
+                def json_finite(value):
+                    if isinstance(value, dict): return {k: json_finite(v) for k, v in value.items()}
+                    if isinstance(value, list): return [json_finite(v) for v in value]
+                    if isinstance(value, float) and not np.isfinite(value): return None
+                    return value
+                peak_evidence = json_finite(peak_evidence)
+                vetting_diagnostics.append(peak_evidence)
+                odd_even_sigma = odd_even_result.sigma
+                odd_depth, even_depth = odd_even_result.odd_depth, odd_even_result.even_depth
+                odd_err, even_err = odd_even_result.odd_err, odd_even_result.even_err
+            elif odd_even_method == "legacy":
+                odd_depth = float((baseline - np.nanmean(flat_f[odd_mask])) * 1e6)
+                even_depth = float((baseline - np.nanmean(flat_f[even_mask])) * 1e6)
+                odd_err = float(np.nanstd(flat_f[odd_mask]) / np.sqrt(np.sum(odd_mask)) * 1e6)
+                even_err = float(np.nanstd(flat_f[even_mask]) / np.sqrt(np.sum(even_mask)) * 1e6)
+
+                odd_even_sigma = abs(odd_depth - even_depth) / max(np.hypot(odd_err, even_err), 1.0)
+            else:
+                raise ValueError("odd_even_method must be legacy or v2")
+            if odd_even_method == 'v2':
+                note_gate('ODD_EVEN', peak_evidence['odd_even_status'])
+            if not odd_even_unresolved and odd_even_sigma > 2.8:
                 if rank_idx == 1:
                     first_reject_code = "REJECT_ODD_EVEN"
-                    first_reject_msg = f"REJECT {base_telemetry}: Odd/Even asymmetry ({odd_even_sigma:.1f} sigma) -> EB / Gap Alias"
+                    if odd_even_method == "v2":
+                        first_reject_msg = f"REJECT {base_telemetry}: Experimental odd/even reference Z={odd_even_sigma:.3f} > 2.8 (uncalibrated; possible EB / Gap Alias)"
+                    else:
+                        first_reject_msg = f"REJECT {base_telemetry}: Odd/Even asymmetry ({odd_even_sigma:.1f} sigma) -> EB / Gap Alias"
                 continue
 
             # Robust individual transit consistency: require >= 60% of observed transit events to show a flux deficit
@@ -2345,6 +3406,7 @@ def _analyze_single_target_impl(
                 and np.nanmean(flat_f[(orbit_num == orb) & in_tr]) < baseline
             )
             consistency_frac = neg_transits / max(len(tr_orbits), 1)
+            note_gate('TRANSIT_CONSISTENCY', 'REJECT' if len(tr_orbits) >= 4 and consistency_frac < 0.60 else 'PASS', fraction=float(consistency_frac))
             if len(tr_orbits) >= 4 and consistency_frac < 0.60:
                 if rank_idx == 1:
                     first_reject_code = "REJECT_INCONSISTENT_TRANSITS"
@@ -2352,13 +3414,17 @@ def _analyze_single_target_impl(
                 continue
                 
             # Secondary Eclipse Test (full out-of-transit scan for eccentric EBs with Sidak-Bonferroni trials correction)
-            is_sec_eb, sec_snr, sec_depth_ppm, sec_phi, z_crit = scan_full_orbit_secondary_eclipse(
+            is_sec_eb, sec_snr, sec_depth_ppm, sec_phi, z_crit = secondary_scan(
                 t_curr_eval, flat_f, best_p, best_t0, best_dur, depth_ppm
             )
+            note_gate('SECONDARY', 'REJECT' if is_sec_eb else 'PASS', snr=float(sec_snr), depth_ppm=float(sec_depth_ppm))
             if is_sec_eb:
                 if rank_idx == 1:
                     first_reject_code = "REJECT_SECONDARY_ECLIPSE"
                     first_reject_msg = (
+                        f"REJECT {base_telemetry}: Secondary eclipse at Phase {sec_phi:.2f} "
+                        f"({sec_depth_ppm:.0f}ppm, {sec_snr:.1f}sigma > z_crit={z_crit:.2f}) -> {'Circular EB' if abs(sec_phi - 0.50) <= 0.04 else 'Eccentric EB'}"
+                        if odd_even_method == "v2" else
                         f"REJECT {base_telemetry}: Secondary eclipse at Phase {sec_phi:.2f} "
                         f"({sec_depth_ppm:.0f}ppm, {sec_snr:.1f}sigma > z_crit={z_crit:.1f}) -> Eccentric EB"
                     )
@@ -2372,6 +3438,7 @@ def _analyze_single_target_impl(
             _, p_val_y = stats.ttest_ind(dy_in, dy_out, equal_var=False)
             shift_arcsec = float(np.hypot(np.mean(dx_in) - np.mean(dx_out), np.mean(dy_in) - np.mean(dy_out)) * 21.0)
             
+            note_gate('CENTROID', 'REJECT' if (p_val_x < 0.001 or p_val_y < 0.001) and shift_arcsec > 2.0 else ('PASS' if np.isfinite(p_val_x) and np.isfinite(p_val_y) and np.isfinite(shift_arcsec) else 'MISSING_INPUT'), shift_arcsec=shift_arcsec)
             if (p_val_x < 0.001 or p_val_y < 0.001) and shift_arcsec > 2.0:
                 if rank_idx == 1:
                     first_reject_code = "REJECT_CENTROID"
@@ -2381,6 +3448,7 @@ def _analyze_single_target_impl(
             # Filter 5: Stellar parameters, Gaia DR3 RUWE, dilution-corrected Rp & Keplerian duration bound
             if star_info_cache is None:
                 star_info_cache = get_stellar_and_gaia_params(tic_id)
+            note_gate('STELLAR_INPUT', 'PASS' if star_info_cache['has_params'] else 'MISSING_INPUT')
             if not star_info_cache["has_params"]:
                 return make_res(tic_id, "REJECT_NO_STELLAR_PARAMS", f"REJECT {base_telemetry}: Missing measured R_star/Teff in TIC catalog", None)
                 
@@ -2393,12 +3461,15 @@ def _analyze_single_target_impl(
             r_planet_earth = float(r_star * rp_rs * 109.076)
             ext_telemetry = f"[Peak#{rank_idx} | SDE={sde:.1f} | P={best_p:.4f}d | Depth={depth_ppm:.0f}ppm | Rp={r_planet_earth:.1f}R_E | R*={r_star:.2f}R_Sun | RUWE={ruwe:.2f}]"
             
+            note_gate('EVOLVED_STAR', 'REJECT' if r_star > 1.75 or teff > 9500 else 'PASS')
             if r_star > 1.75 or teff > 9500:
                 return make_res(tic_id, "REJECT_EVOLVED_STAR", f"REJECT {ext_telemetry}: Evolved giant or hot subdwarf host", None)
                 
+            note_gate('RUWE', 'REJECT' if np.isfinite(ruwe) and ruwe > 1.4 else ('MISSING_INPUT' if not np.isfinite(ruwe) else 'PASS'))
             if np.isfinite(ruwe) and ruwe > 1.4:
                 return make_res(tic_id, "REJECT_RUWE", f"REJECT {ext_telemetry}: Unresolved binary companion (RUWE > 1.4)", None)
                 
+            note_gate('RADIUS', 'REJECT' if r_planet_earth > 15.0 or r_planet_earth < 0.8 else 'PASS')
             if r_planet_earth > 15.0 or r_planet_earth < 0.8:
                 if rank_idx == 1:
                     first_reject_code = "REJECT_RADIUS"
@@ -2410,11 +3481,13 @@ def _analyze_single_target_impl(
                 best_p, r_star, star_info_cache["e_r_star"], m_star, star_info_cache["e_m_star"], rp_rs
             )
             obs_dur_hr = days_to_hours(best_dur)
+            note_gate('KEPLER_DURATION_LONG', 'REJECT' if obs_dur_hr > max_kepler_dur_hr else 'PASS')
             if obs_dur_hr > max_kepler_dur_hr:
                 if rank_idx == 1:
                     first_reject_code = "REJECT_KEPLER_DURATION_LONG"
                     first_reject_msg = f"REJECT {ext_telemetry}: Duration ({obs_dur_hr:.2f}h) exceeds Keplerian limit ({max_kepler_dur_hr:.2f}h, nom={nom_max_dur_hr:.2f}h) -> Blend/Subgiant"
                 continue
+            note_gate('KEPLER_DURATION_SHORT', 'REJECT' if obs_dur_hr < min_kepler_dur_hr else 'PASS')
             if obs_dur_hr < min_kepler_dur_hr:
                 if rank_idx == 1:
                     first_reject_code = "REJECT_KEPLER_DURATION_SHORT"
@@ -2422,7 +3495,10 @@ def _analyze_single_target_impl(
                 continue
 
             # Filter 6: Pixel-level TPF localization & strict dipole rejection
-            tpf_ok, tpf_reason, diff_image, aperture = verify_and_filter_tpf(tic_id, last_sector, best_p, best_t0, best_dur)
+            tpf_ok, tpf_reason, diff_image, aperture = tpf_check(tic_id, last_sector, best_p, best_t0, best_dur)
+            if odd_even_method == 'v2' and tpf_ok and str(tpf_reason).startswith('REVIEW_'):
+                vet_holds.append(str(tpf_reason))
+            note_gate('TPF', ('HOLD' if str(tpf_reason).startswith('REVIEW_') else 'PASS') if tpf_ok else ('MISSING_INPUT' if diff_image is None else 'REJECT'), reason=str(tpf_reason))
             if not tpf_ok:
                 if rank_idx == 1:
                     first_reject_code = "REJECT_TPF_PIXEL"
@@ -2430,7 +3506,7 @@ def _analyze_single_target_impl(
                 continue
 
             # Filter 7: Multi-Epoch Archival Verification across prior TESS sectors
-            arch_ok, arch_status, arch_info = verify_multi_epoch(
+            arch_ok, arch_status, arch_info = archival_check(
                 tic_id, last_sector, t_curr_eval, flat_f, flat_ferr, best_p, best_t0, best_dur, depth_ppm, sde
             )
             arch_display_status = str(arch_status).replace(
@@ -2462,14 +3538,79 @@ def _analyze_single_target_impl(
                 "multi_sde": float(arch_info["multi_sde"]) if (arch_info.get("multi_sde") is not None and np.isfinite(arch_info["multi_sde"])) else None,
                 "est_multi_sde_proxy": float(arch_info["est_multi_sde_proxy"]) if (arch_info.get("est_multi_sde_proxy") is not None and np.isfinite(arch_info["est_multi_sde_proxy"])) else None,
             }
+            if odd_even_method == "v2":
+                target_diag["vr"] = evidence_safe(arch_info.get("vr"))
             record_archival_diagnostic(target_diag)
             attempt_diagnostics.append(target_diag)
 
+            if odd_even_method == 'v2' and arch_ok and str(arch_status).startswith('REVIEW_'):
+                vet_holds.append(str(arch_status))
+            note_gate('ARCHIVAL', ('HOLD' if str(arch_status).startswith('REVIEW_') else 'PASS') if arch_ok else 'REJECT', reason=str(arch_status))
             if not arch_ok:
                 if rank_idx == 1:
                     first_reject_code = "REJECT_ARCHIVAL"
                     first_reject_msg = f"REJECT {ext_telemetry}: {arch_status}"
                 continue
+
+            if odd_even_method == 'v2' and vet_holds:
+                peak_evidence['vetting_holds'] = list(vet_holds)
+                peak_evidence['disposition'] = 'REVIEW'
+                peak_evidence['cause'] = 'VETTING_HOLD_DOWNSTREAM_INCONCLUSIVE' if odd_even_unresolved else 'VETTING_HOLD_PASSED_DOWNSTREAM'
+                if any(g['status'] == 'MISSING_INPUT' for g in peak_evidence['gates']):
+                    peak_evidence['disposition'] = 'INCOMPLETE'
+                    peak_evidence['cause'] = 'VETTING_HOLD_DOWNSTREAM_NOT_RUN'
+                review_peaks.append(peak_evidence)
+                continue
+            if odd_even_unresolved:
+                peak_evidence['disposition'] = 'REVIEW'
+                peak_evidence['cause'] = 'ODD_EVEN_INCONCLUSIVE'
+                if any(g['status'] == 'MISSING_INPUT' for g in peak_evidence['gates']):
+                    peak_evidence['disposition'] = 'INCOMPLETE'
+                    peak_evidence['cause'] = 'MISSING_DOWNSTREAM_EVIDENCE'
+                review_peaks.append(peak_evidence)
+                continue
+            # D1 insertion point: intentionally deferred until ALIAS-D1-D3
+            # step 2 and its held-out PASS. No D1 rule is active here.
+            # VETTING-REPLAY-02 item 17 (P1): a peak sharing all events with a stronger peak that an EB-indicating gate
+            # hard-rejected goes to REVIEW and cannot become CANDIDATE (frozen review_event_link, unchanged).
+            if odd_even_method == "v2" and peak_evidence is not None:
+                _vr_alias = None
+                for stronger in vetting_diagnostics:
+                    if stronger is peak_evidence or stronger.get('peak_rank', rank_idx) >= rank_idx or stronger.get('disposition') != 'REJECT':
+                        continue
+                    _g = next((g for g in stronger.get('gates', []) if g['status'] == 'REJECT'), None)
+                    if _g is None or not (_g['gate'] in ('SECONDARY', 'ODD_EVEN', 'TPF', 'RADIUS') or (_g['gate'] == 'ARCHIVAL' and str(_g['metrics'].get('reason', '')).startswith('Multi-sector secondary eclipse'))):
+                        continue
+                    _vr_alias = review_event_link(stronger, best_p, best_t0, best_dur, t_curr_eval)
+                    if _vr_alias is not None:
+                        peak_evidence['disposition'] = 'REVIEW'
+                        peak_evidence['cause'] = 'SHARED_EVENTS_WITH_STRONGER_REJECTION'
+                        peak_evidence['review_event_link'] = _vr_alias
+                        peak_evidence['linked_rejected_rank'] = stronger.get('peak_rank')
+                        peak_evidence['linked_rejected_gate'] = _g['gate']
+                        review_peaks.append(peak_evidence)
+                        break
+                if _vr_alias is not None:
+                    continue
+            # A lower-ranked shared-event solution cannot resolve an earlier REVIEW.
+            if odd_even_method == "v2":
+                for stronger in review_peaks:
+                    if stronger.get('cause') == 'SHARED_EVENTS_WITH_STRONGER_REVIEW':
+                        continue
+                    link = review_event_link(stronger, best_p, best_t0, best_dur, t_curr_eval)
+                    if link is not None:
+                        peak_evidence['disposition'] = 'REVIEW'
+                        peak_evidence['cause'] = 'SHARED_EVENTS_WITH_STRONGER_REVIEW'
+                        peak_evidence['review_event_link'] = link
+                        review_peaks.append(peak_evidence)
+                        break
+                else:
+                    link = None
+                if link is not None:
+                    continue
+            if peak_evidence is not None:
+                peak_evidence['disposition'] = 'CANDIDATE'
+                peak_evidence['cause'] = 'ALL_REQUIRED_GATES_PASSED'
 
             # Coherent ephemeris selection: ensure (period_days, t0_btjd) come strictly from the same solution
             discovery_p = float(best_p)
@@ -2551,7 +3692,7 @@ def _analyze_single_target_impl(
             axes[1, 0].set_xlabel("Phase (days)")
             axes[1, 0].set_ylabel("Centroid Offset (arcsec)")
             axes[1, 0].set_title(
-                f"Centroid Stability: Shift = {shift_arcsec:.3f} arcsec | Odd/Even = {odd_even_sigma:.2f} sigma | RUWE = {ruwe:.2f}"
+                f"Centroid Stability: Shift = {shift_arcsec:.3f} arcsec | Odd/Even = {odd_even_sigma:.2f} {'reference Z (experimental, uncalibrated)' if odd_even_method == 'v2' else 'sigma'} | RUWE = {ruwe:.2f}"
             )
             axes[1, 0].legend(loc="upper right")
 
@@ -2636,6 +3777,13 @@ def _analyze_single_target_impl(
                 "exofop_url": f"https://exofop.ipac.caltech.edu/tess/target.php?id={tic_id}"
             }
             
+            if odd_even_method == "v2":
+                cand_data["odd_even_method"] = "ODD_EVEN_V2_EXPERIMENTAL"
+                cand_data["odd_even_status"] = odd_even_result.status
+                details = {k: (None if isinstance(v, (float, np.floating)) and not np.isfinite(v) else v)
+                           for k, v in odd_even_result.diagnostics.items()}
+                cand_data["odd_even_diagnostics_json"] = json.dumps(details, allow_nan=False)
+
             cand_tag = f"TOI SIBLING (Host of {known_transits[0]['toi']})" if is_toi_host else "CANDIDATE"
             trials_str = f"Trials={arch_info.get('n_trials', 1)}, Crit={arch_info.get('snr_crit', 2.4):.1f}s"
             msg = (
@@ -2646,6 +3794,14 @@ def _analyze_single_target_impl(
             
         if AUTO_PURGE_CACHE:
             purge_target_cache(tic_id)
+        if review_peaks:
+            incomplete = all(p['disposition'] == 'INCOMPLETE' for p in review_peaks)
+            code = 'INCOMPLETE_ODD_EVEN_DOWNSTREAM' if incomplete else 'REVIEW_ODD_EVEN_INCONCLUSIVE'
+            if any(p.get('cause') == 'SHARED_EVENTS_WITH_STRONGER_REJECTION' for p in review_peaks):
+                code = 'REVIEW_ALIAS_OF_REJECTED_PEAK'
+            if any(p.get('vetting_holds') for p in review_peaks):
+                code = 'INCOMPLETE_VETTING_DOWNSTREAM' if incomplete else 'REVIEW_VETTING_HOLD'
+            return make_res(tic_id, code, f'{code}: see experimental_v2_vetting.jsonl; not a CANDIDATE', None)
         return make_res(tic_id, first_reject_code, first_reject_msg, None)
         
     except Exception as e:
@@ -2658,7 +3814,12 @@ def save_candidates_to_report(report_path: str, candidate_records: list):
     """
     Saves candidate records to report_path using atomic replacement to prevent file corruption.
     """
-    df_out = pd.DataFrame(candidate_records, columns=CANDIDATE_COLUMNS)
+    if any(r.get('disposition') in ('REVIEW', 'INCOMPLETE', 'REJECT') for r in candidate_records):
+        raise ValueError('Non-candidate disposition cannot enter candidate report')
+    columns = list(CANDIDATE_COLUMNS)
+    if any(r.get("odd_even_method") == "ODD_EVEN_V2_EXPERIMENTAL" for r in candidate_records):
+        columns += ["odd_even_method", "odd_even_status", "odd_even_diagnostics_json"]
+    df_out = pd.DataFrame(candidate_records, columns=columns)
     dir_name = os.path.dirname(report_path) or "."
     os.makedirs(dir_name, exist_ok=True)
     temp_path = f"{report_path}.tmp.{os.getpid()}"
