@@ -7,6 +7,7 @@ import hashlib
 import glob
 import logging
 import warnings
+import urllib.error
 import urllib.request
 import urllib.parse
 from datetime import datetime, timezone
@@ -40,32 +41,21 @@ ssl._create_default_https_context = lambda: ssl.create_default_context(cafile=CA
 
 
 def safe_http_get(url: str, params: dict = None, headers: dict = None, timeout: int = 45) -> requests.Response:
-    """
-    Executes an HTTPS GET request with strict certifi TLS verification.
-    Falls back to unverified TLS strictly on legacy HPC nodes raising SSLError.
-    """
-    try:
-        resp = requests.get(url, params=params, headers=headers, timeout=timeout, verify=CA_BUNDLE_PATH)
-        resp.raise_for_status()
-        return resp
-    except requests.exceptions.SSLError as ssl_err:
-        logger.warning("TLS verification failed (%s); falling back to unverified context for %s", ssl_err, url)
-        resp = requests.get(url, params=params, headers=headers, timeout=timeout, verify=False)
-        resp.raise_for_status()
-        return resp
+    """Execute an HTTPS GET with certifi verification; propagate certificate errors."""
+    resp = requests.get(url, params=params, headers=headers, timeout=timeout, verify=CA_BUNDLE_PATH)
+    resp.raise_for_status()
+    return resp
 
 
 def safe_urlopen(req_or_url, timeout: int = 45):
-    """
-    Executes urllib.request.urlopen with explicit certifi CA bundle and logged SSLError fallback.
-    """
+    """Open a URL with certifi verification; propagate certificate errors."""
+    ctx = ssl.create_default_context(cafile=CA_BUNDLE_PATH)
     try:
-        ctx = ssl.create_default_context(cafile=CA_BUNDLE_PATH)
         return urllib.request.urlopen(req_or_url, timeout=timeout, context=ctx)
-    except ssl.SSLError as ssl_err:
-        logger.warning("urllib TLS handshake failed (%s); using unverified fallback.", ssl_err)
-        unverified_ctx = ssl._create_unverified_context()
-        return urllib.request.urlopen(req_or_url, timeout=timeout, context=unverified_ctx)
+    except urllib.error.URLError as exc:
+        if isinstance(exc.reason, ssl.SSLError):
+            raise exc.reason from exc
+        raise
 
 
 # Suppress non-critical library import warnings across multiprocessing workers
@@ -632,6 +622,8 @@ def fetch_csv_with_headers(url: str) -> pd.DataFrame:
     try:
         resp = safe_http_get(url, headers=headers, timeout=45)
         return pd.read_csv(io.StringIO(resp.text), comment="#", on_bad_lines="skip")
+    except requests.exceptions.SSLError:
+        raise
     except Exception:
         req = urllib.request.Request(url, headers=headers)
         with safe_urlopen(req, timeout=45) as response:
@@ -1277,6 +1269,8 @@ def get_stellar_and_gaia_params(tic_id: str) -> dict:
             ruwe_val = float(df_gaia["ruwe"].iloc[0])
             if np.isfinite(ruwe_val):
                 result["ruwe"] = ruwe_val
+    except (requests.exceptions.SSLError, ssl.SSLError):
+        raise
     except Exception:
         pass
     return result

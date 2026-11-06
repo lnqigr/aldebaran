@@ -49,19 +49,10 @@ ssl._create_default_https_context = lambda: ssl.create_default_context(cafile=CA
 
 
 def safe_http_get(url: str, params: dict = None, headers: dict = None, timeout: int = 45) -> requests.Response:
-    """
-    Executes an HTTPS GET request with strict certifi TLS verification.
-    Falls back to unverified TLS strictly on legacy HPC nodes raising SSLError.
-    """
-    try:
-        resp = requests.get(url, params=params, headers=headers, timeout=timeout, verify=CA_BUNDLE_PATH)
-        resp.raise_for_status()
-        return resp
-    except requests.exceptions.SSLError as ssl_err:
-        logger.warning("TLS verification failed (%s); falling back to unverified context for %s", ssl_err, url)
-        resp = requests.get(url, params=params, headers=headers, timeout=timeout, verify=False)
-        resp.raise_for_status()
-        return resp
+    """Execute an HTTPS GET with certifi verification; propagate certificate errors."""
+    resp = requests.get(url, params=params, headers=headers, timeout=timeout, verify=CA_BUNDLE_PATH)
+    resp.raise_for_status()
+    return resp
 
 
 os.environ["PYTHONWARNINGS"] = "ignore::UserWarning"
@@ -251,6 +242,8 @@ def check_binary_catalogs(ra: float, dec: float) -> dict:
                 res["is_gaia_nss"] = True
                 res["gaia_nss_type"] = sol
                 res["gaia_nss_period"] = safe_float(df_nss["period"].iloc[0], None)
+    except (requests.exceptions.SSLError, ssl.SSLError):
+        raise
     except Exception:
         pass
     return res
@@ -411,6 +404,8 @@ def query_gaia_contamination(tic_id: str, depth_ppm: float) -> dict:
                 
         info["contamination_ratio"] = rel_flux_total
         info["neb_capable_stars"] = neb_capable
+    except (requests.exceptions.SSLError, ssl.SSLError):
+        raise
     except Exception:
         pass
     return info
