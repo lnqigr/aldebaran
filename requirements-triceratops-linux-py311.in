@@ -1,0 +1,8 @@
+# Bounded runtime profile for the validated TRICERATOPS 1.0.21 adapter.
+# PyTransit 2.2.0 imports scipy.integrate.trapz, removed in SciPy 1.14.
+numpy==1.23.5
+scipy==1.13.1
+astropy==6.1.7
+lightkurve==2.6.0
+triceratops==1.0.21
+pytransit==2.2.0

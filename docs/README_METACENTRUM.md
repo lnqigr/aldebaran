@@ -94,6 +94,16 @@ is an incomplete installed-environment constraint set, not a validated lock.
 `constraints-linux-py311.txt` preserves the saved Linux Python 3.11.11 freeze
 (TRICERATOPS 1.0.21), with source path and SHA256. Versions differ by environment;
 neither dependency pins nor these contract tests establish scientific validity.
+`requirements.txt` describes the main pipeline profile (NumPy 2.4.6, SciPy 1.17.1
+in `constraints-linux-py311.txt`). It pins TRICERATOPS 1.0.21, the only version the
+adapter accepts, but PyTransit 2.2.0 imports `scipy.integrate.trapz`, which SciPy 1.14
+removed, so the full TRICERATOPS runtime cannot be imported in this profile; its
+contract tests read the installed source only. Tier 4 runs use the separate profile
+`requirements-triceratops-linux-py311.in`, resolved in
+`requirements-triceratops-linux-py311.lock` (NumPy 1.23.5, SciPy 1.13.1, Astropy
+6.1.7). The two Linux profiles cannot share one environment. The Windows
+snapshot's TRICERATOPS 1.1.0 is refused by the adapter and does not satisfy
+`requirements.txt`.
 The pinned Linux engineering verification passed on Python 3.11.11: MetaCentrum job 24793285, 339 regression tests and 50 PBS contract tests, with no failures or skips, plus two synthetic standalone checks. Dependency checks and imports passed; the network guard recorded 19 expected blocked probes and zero unexpected attempts. This does not establish scientific validation or production-survey readiness.
 
 Installation profile used by the isolated Linux verifier: select Python 3.11.11,

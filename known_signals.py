@@ -28,6 +28,7 @@ import json
 import logging
 import math
 import os
+import re
 import tempfile
 import uuid
 from dataclasses import dataclass, field
@@ -36,11 +37,19 @@ from typing import Any, Optional, Sequence, Union
 
 import numpy as np
 import pandas as pd
+from ephemeris_contract import (
+    days_to_hours,
+    hours_to_days,
+    BTJD_OFFSET,
+    bjd_to_btjd,
+    btjd_to_bjd,
+    calculate_cyclic_timing_residual as contract_calculate_cyclic_timing_residual
+)
 
 logger = logging.getLogger("aldebaran.known_signals")
 
 SCHEMA_VERSION = "known_signals_v1"
-BJD_BTJD_OFFSET = 2457000.0
+BJD_BTJD_OFFSET = BTJD_OFFSET
 CANONICAL_SOURCES = ("nasa_toi", "nasa_confirmed", "exofop_ctoi", "vizier_tess_eb")
 
 
@@ -85,16 +94,7 @@ def normalize_tic_id(val: Any) -> str:
 
 def convert_bjd_to_btjd(bjd: float) -> float:
     """Converts BJD to BTJD if > 2,400,000, otherwise preserves value."""
-    if bjd > 2400000.0:
-        return float(bjd - BJD_BTJD_OFFSET)
-    return float(bjd)
-
-
-def convert_btjd_to_bjd(btjd: float) -> float:
-    """Converts BTJD to BJD if < 100,000, otherwise preserves value."""
-    if btjd < 100000.0:
-        return float(btjd + BJD_BTJD_OFFSET)
-    return float(btjd)
+    return float(bjd_to_btjd(bjd, strict=False))
 
 
 def compute_payload_sha256(data: Union[str, bytes, pd.DataFrame]) -> str:
@@ -141,6 +141,74 @@ def make_solution_id(
         return f"{base}#unsolved"
     return f"{base}#" + "_".join(parts)
 
+
+
+def deduplicate_mask_signals(
+    signals: Sequence[KnownSignal],
+    excluded_signals: Optional[Sequence[dict[str, Any]]] = None,
+) -> list[KnownSignal]:
+    """
+    S3.4 (SCI-61): De-duplicate maskable signals for a host so duplicate registry entries
+    for the same physical planet do not produce redundant masks or survive blinding.
+
+    Priority when merging duplicates: nasa_confirmed > nasa_toi > exofop_ctoi.
+    If `excluded_signals` is provided (each dict may have 'signal_id', 'planet_name', 'period'),
+    any signal matching an excluded entry by identifier OR by period within 1% is dropped.
+    """
+    prio = {"nasa_confirmed": 0, "nasa_toi": 1, "exofop_ctoi": 2}
+    ordered = sorted(
+        signals,
+        key=lambda s: (prio.get(s.source_catalog, 9), str(s.signal_id)),
+    )
+
+    def _norm_name(val: Optional[str]) -> str:
+        return re.sub(r"[^a-z0-9]", "", str(val or "").lower())
+
+    ex_ids = {str(e.get("signal_id", "")).strip() for e in (excluded_signals or []) if e.get("signal_id")}
+    ex_names = {_norm_name(e.get("planet_name")) for e in (excluded_signals or []) if e.get("planet_name")}
+    ex_periods = [
+        float(e["period"])
+        for e in (excluded_signals or [])
+        if e.get("period") is not None and math.isfinite(float(e["period"])) and float(e["period"]) > 0
+    ]
+
+    kept: list[KnownSignal] = []
+    for s in ordered:
+        if s.quarantined or s.disposition in ("FALSE_POSITIVE", "ECLIPSING_BINARY"):
+            continue
+        if s.period_days is None or not math.isfinite(s.period_days) or s.period_days <= 0:
+            continue
+        if s.epoch_btjd is None or not math.isfinite(s.epoch_btjd):
+            continue
+        if s.duration_hours is None or not math.isfinite(s.duration_hours) or s.duration_hours <= 0:
+            continue
+
+        s_name = _norm_name(s.planet_or_signal_name)
+        if s.signal_id in ex_ids or (s_name and s_name in ex_names):
+            continue
+        if any(abs(s.period_days - ep) / min(s.period_days, ep) <= 0.01 for ep in ex_periods):
+            continue
+
+        dur_d = hours_to_days(s.duration_hours)
+        is_dup = False
+        for k in kept:
+            k_name = _norm_name(k.planet_or_signal_name)
+            if s_name and k_name and s_name == k_name:
+                is_dup = True
+                break
+            if s.source_catalog == k.source_catalog and s.source_record_id and s.source_record_id == k.source_record_id:
+                is_dup = True
+                break
+            p_ref = min(s.period_days, k.period_days)
+            if abs(s.period_days - k.period_days) / p_ref <= 0.01:
+                k_dur_d = hours_to_days(k.duration_hours)
+                dt = abs(((s.epoch_btjd - k.epoch_btjd + 0.5 * p_ref) % p_ref) - 0.5 * p_ref)
+                if dt <= max(dur_d, k_dur_d, 0.05 * p_ref):
+                    is_dup = True
+                    break
+        if not is_dup:
+            kept.append(s)
+    return kept
 
 
 def normalize_disposition(source_catalog: str, raw_disp: Any) -> tuple[str, str]:
@@ -336,6 +404,20 @@ class HostCatalogContext:
         return any(s.disposition == "FALSE_POSITIVE" and not s.quarantined for s in self.signals)
 
     @property
+    def has_known_planet(self) -> bool:
+        return any(
+            s.disposition in ("CONFIRMED_PLANET", "PLANET_CANDIDATE") and not s.quarantined
+            for s in self.signals
+        )
+
+    @property
+    def known_planet_signals(self) -> list[KnownSignal]:
+        return [
+            s for s in self.signals
+            if s.disposition in ("CONFIRMED_PLANET", "PLANET_CANDIDATE") and not s.quarantined
+        ]
+
+    @property
     def maskable_signals(self) -> list[KnownSignal]:
         return [s for s in self.signals if s.maskable and not s.quarantined]
 
@@ -474,6 +556,7 @@ class KnownSignalsRegistry:
         self.persistence_status: str = "NOT_ATTEMPTED"  # 'NOT_ATTEMPTED', 'PERSISTED', 'FAILED'
         self.persistence_error: Optional[str] = None
         self.persistence_path: Optional[str] = None
+        self.unmaskable_duration_events: list[dict[str, Any]] = []
 
     def add_signal(self, signal: KnownSignal) -> None:
         if signal.tic_id == "quarantine" or signal.tic_id is None:
@@ -708,31 +791,87 @@ class KnownSignalsRegistry:
 
     def export_legacy_toi_ephemerides(self) -> dict[str, list[dict[str, Any]]]:
         """
-        Exports TOI signals in the legacy dict format required by existing Aldebaran consumers:
+        Exports active TOI planet/candidate mask signals in the legacy dict format:
           {'toi': str, 'period': float, 't0': float, 'duration': float, 'depth_ppm': float, 'disp': str}
-        NOTE:
-          - duration is converted to days, with legacy 0.08d fallback if unavailable.
-          - disp defaults to 'PC' if unavailable.
-          These fallbacks are STRICTLY confined to this legacy adapter; canonical KnownSignal objects
-          preserve duration=None and unaugmented raw dispositions.
+        S3.4 (SCI-11, SCI-61, C1e):
+          - Excludes FALSE_POSITIVE (FP/FA) and ECLIPSING_BINARY dispositions from known-planet masks.
+          - Records signals with missing/unparseable duration in `unmaskable_duration_events` instead of
+            silently substituting a 0.08 d fallback mask.
+          - De-duplicates duplicate entries for the same physical signal on a host.
         """
         legacy: dict[str, list[dict[str, Any]]] = {}
+        self.unmaskable_duration_events = []
         for tid, host in self.hosts.items():
-            toi_list = []
+            candidates: list[KnownSignal] = []
             for s in host.signals:
-                if s.source_catalog == "nasa_toi" and not s.quarantined and s.period_days is not None and s.epoch_btjd is not None:
-                    dur_days = (s.duration_hours / 24.0) if s.duration_hours is not None else 0.08
-                    toi_list.append({
+                if s.source_catalog != "nasa_toi" or s.quarantined:
+                    continue
+                if s.disposition in ("FALSE_POSITIVE", "ECLIPSING_BINARY"):
+                    continue
+                if s.period_days is None or s.epoch_btjd is None:
+                    continue
+                if s.duration_hours is None or not math.isfinite(s.duration_hours) or s.duration_hours <= 0:
+                    self.unmaskable_duration_events.append({
+                        "tic_id": tid,
+                        "signal_id": s.signal_id,
                         "toi": str(s.source_record_id),
-                        "period": float(s.period_days),
-                        "t0": float(s.epoch_btjd),
-                        "duration": float(dur_days),
-                        "depth_ppm": float(s.depth_ppm) if s.depth_ppm is not None else float("nan"),
-                        "disp": str(s.raw_disposition) if s.raw_disposition else "PC",
+                        "reason": "MISSING_OR_UNPARSEABLE_DURATION",
+                        "raw_duration": s.raw_fields.get("unparseable_duration"),
                     })
+                    continue
+                candidates.append(s)
+            deduped = deduplicate_mask_signals(candidates)
+            toi_list = [
+                {
+                    "toi": str(s.source_record_id),
+                    "period": float(s.period_days),
+                    "t0": float(s.epoch_btjd),
+                    "duration": float(hours_to_days(s.duration_hours)),
+                    "depth_ppm": float(s.depth_ppm) if s.depth_ppm is not None else float("nan"),
+                    "disp": str(s.raw_disposition) if s.raw_disposition else "PC",
+                }
+                for s in deduped
+            ]
             if toi_list:
                 legacy[tid] = toi_list
         return legacy
+
+    def export_known_planet_ephemerides(
+        self, excluded_signals: Optional[Sequence[dict[str, Any]]] = None
+    ) -> dict[str, list[dict[str, Any]]]:
+        """
+        S3.4 (SCI-10, SCI-11, SCI-61): Exports per-planet maskable ephemerides across
+        confirmed planets (nasa_confirmed) and non-FP/FA TOIs (nasa_toi), deduplicated
+        per physical planet so one entry cannot mask another planet or survive blinding.
+        """
+        out: dict[str, list[dict[str, Any]]] = {}
+        for tid, host in self.hosts.items():
+            candidates = [
+                s for s in host.signals
+                if s.source_catalog in ("nasa_confirmed", "nasa_toi")
+                and not s.quarantined
+                and s.disposition not in ("FALSE_POSITIVE", "ECLIPSING_BINARY")
+                and s.period_days is not None and math.isfinite(s.period_days) and s.period_days > 0
+                and s.epoch_btjd is not None and math.isfinite(s.epoch_btjd)
+                and s.duration_hours is not None and math.isfinite(s.duration_hours) and s.duration_hours > 0
+            ]
+            deduped = deduplicate_mask_signals(candidates, excluded_signals=excluded_signals)
+            if deduped:
+                out[tid] = [
+                    {
+                        "toi": str(s.planet_or_signal_name or s.source_record_id),
+                        "signal_id": str(s.signal_id),
+                        "source_catalog": str(s.source_catalog),
+                        "period": float(s.period_days),
+                        "t0": float(s.epoch_btjd),
+                        "duration": float(hours_to_days(s.duration_hours)),
+                        "depth_ppm": float(s.depth_ppm) if s.depth_ppm is not None else float("nan"),
+                        "disp": str(s.raw_disposition) if s.raw_disposition else "CONFIRMED",
+                        "disposition": str(s.disposition),
+                    }
+                    for s in deduped
+                ]
+        return out
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -838,7 +977,7 @@ class KnownSignalsRegistry:
                     if sig.duration_days is not None and (not math.isfinite(sig.duration_days) or sig.duration_days <= 0):
                         raise ValueError(f"Malformed cache: signal {sig.signal_id} is maskable=True but has invalid duration_days: {sig.duration_days}")
                     if sig.duration_hours is not None and sig.duration_days is not None:
-                        if abs(sig.duration_hours - sig.duration_days * 24.0) > 1e-3:
+                        if abs(sig.duration_hours - days_to_hours(sig.duration_days)) > 1e-3:
                             raise ValueError(f"Malformed cache: signal {sig.signal_id} duration_hours ({sig.duration_hours}) inconsistent with duration_days ({sig.duration_days})")
 
                 if sig.has_transit_ephemeris:
@@ -1127,9 +1266,11 @@ def ingest_nasa_toi_df(
                 dur_val = float(row[dur_col])
                 if math.isfinite(dur_val) and dur_val > 0:
                     dur_h = dur_val
-                    dur_d = dur_h / 24.0
+                    dur_d = hours_to_days(dur_h)
+                else:
+                    raw_fields["unparseable_duration"] = str(row.get(dur_col))
             except Exception:
-                pass
+                raw_fields["unparseable_duration"] = str(row.get(dur_col))
         if dur_err_col and pd.notna(row.get(dur_err_col)):
             try:
                 dur_err_pos = float(row[dur_err_col])
@@ -1410,7 +1551,8 @@ def ingest_nasa_confirmed_df(
                     epoch_bjd = tmid
                     epoch_btjd = tmid - BJD_BTJD_OFFSET
             except Exception:
-                pass
+                quarantined = True
+                quarantine_reason = f"Unparseable transit midpoint: {row.get(tmid_col)}"
 
         if tmid_err_col and pd.notna(row.get(tmid_err_col)):
             try:
@@ -1429,9 +1571,11 @@ def ingest_nasa_confirmed_df(
                 dur_val = float(row[dur_col])
                 if math.isfinite(dur_val) and dur_val > 0:
                     dur_h = dur_val
-                    dur_d = dur_h / 24.0
+                    dur_d = hours_to_days(dur_h)
+                else:
+                    raw_fields["unparseable_duration"] = str(row.get(dur_col))
             except Exception:
-                pass
+                raw_fields["unparseable_duration"] = str(row.get(dur_col))
         if dur_err_col and pd.notna(row.get(dur_err_col)):
             try:
                 dur_err_pos = float(row[dur_err_col])
@@ -1704,16 +1848,19 @@ def ingest_exofop_ctoi_df(
                         time_format = "BTJD"
                         time_scale = "UNKNOWN"
             except Exception:
-                pass
+                quarantined = True
+                quarantine_reason = f"Unparseable transit epoch: {row.get(epoch_col)}"
 
         if dur_col and pd.notna(row.get(dur_col)):
             try:
                 dur_val = float(row[dur_col])
                 if math.isfinite(dur_val) and dur_val > 0:
                     dur_h = dur_val
-                    dur_d = dur_h / 24.0
+                    dur_d = hours_to_days(dur_h)
+                else:
+                    raw_fields["unparseable_duration"] = str(row.get(dur_col))
             except Exception:
-                pass
+                raw_fields["unparseable_duration"] = str(row.get(dur_col))
 
         if dep_col and pd.notna(row.get(dep_col)):
             try:
@@ -1907,15 +2054,20 @@ def ingest_vizier_eb_df(
                     quarantined = True
                     quarantine_reason = f"Non-finite or non-positive period: {period_val}"
             except Exception:
-                pass
+                quarantined = True
+                quarantine_reason = f"Unparseable period: {row.get(per_col)}"
         if bjd_col and pd.notna(row.get(bjd_col)):
             try:
                 bjd_val = float(row[bjd_col])
                 if math.isfinite(bjd_val):
                     epoch_bjd = bjd_val
                     epoch_btjd = convert_bjd_to_btjd(bjd_val)
+                else:
+                    quarantined = True
+                    quarantine_reason = f"Non-finite transit epoch: {bjd_val}"
             except Exception:
-                pass
+                quarantined = True
+                quarantine_reason = f"Unparseable transit epoch: {row.get(bjd_col)}"
 
         has_ephem = bool(period is not None and epoch_btjd is not None and not quarantined)
         # EB without explicit duration cannot be masked
@@ -2021,44 +2173,11 @@ def calculate_cyclic_timing_residual(
     """
     Calculates physical timing difference between candidate and catalog solutions,
     strictly invariant to integer-cycle epoch shifts in either candidate or catalog.
-
-    Methodology:
-      1. Uses pivot_time as a common fixed time anchor (if None, defaults to cand_t0).
-      2. Projects candidate ephemeris to nearest cycle around pivot_time:
-           N_cand = round((pivot_time - cand_t0) / cand_p)
-           T_cand_proj = cand_t0 + N_cand * cand_p
-      3. Projects catalog ephemeris to nearest cycle around T_cand_proj:
-           N_cat = round((T_cand_proj - cat_t0) / cat_p)
-           T_cat_proj = cat_t0 + N_cat * cat_p
-      4. Timing residual dt = T_cand_proj - T_cat_proj.
-      5. Centered cyclic residual:
-           dt_cyclic = dt - round(dt / cat_p) * cat_p
-      6. Phase offset in [-0.5, 0.5]:
-           phase = dt_cyclic / cat_p
-
-    Returns:
-      (dt_days, dt_minutes, phase_offset)
+    Delegates to canonical implementation in ephemeris_contract.
     """
-    if cand_p <= 0 or cat_p <= 0:
-        raise ValueError(f"Periods must be strictly positive: cand_p={cand_p}, cat_p={cat_p}")
-
-    anchor = cand_t0 if pivot_time is None else float(pivot_time)
-
-    # Transport candidate to anchor
-    n_cand = round((anchor - cand_t0) / cand_p)
-    t_cand_proj = cand_t0 + n_cand * cand_p
-
-    # Transport catalog to nearest cycle at candidate predicted time
-    n_cat = round((t_cand_proj - cat_t0) / cat_p)
-    t_cat_proj = cat_t0 + n_cat * cat_p
-
-    dt_days = t_cand_proj - t_cat_proj
-    # Ensure cyclic centering within [-P_cat / 2, +P_cat / 2]
-    dt_cyclic_days = dt_days - round(dt_days / cat_p) * cat_p
-    dt_minutes = dt_cyclic_days * 1440.0
-    phase_offset = dt_cyclic_days / cat_p
-
-    return dt_cyclic_days, dt_minutes, phase_offset
+    return contract_calculate_cyclic_timing_residual(
+        cand_p, cand_t0, cat_p, cat_t0, pivot_time=pivot_time
+    )
 
 
 @dataclass

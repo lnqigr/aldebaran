@@ -1,3 +1,7 @@
+# Main pipeline profile. Exact Linux versions: constraints-linux-py311.txt.
+# TRICERATOPS is pinned to 1.0.21, the only version validate_triceratops.py accepts.
+# Its full runtime cannot import here (PyTransit 2.2.0 needs SciPy below 1.14);
+# Tier 4 runs use requirements-triceratops-linux-py311.in and its .lock instead.
 numpy>=1.26.0
 pandas>=2.1.0
 scipy>=1.11.0
@@ -8,4 +12,4 @@ matplotlib>=3.8.0
 requests>=2.31.0
 urllib3>=2.0.0
 certifi>=2024.2.2
-triceratops>=1.0.12
+triceratops==1.0.21

@@ -1,6 +1,8 @@
 import os
 import sys
 import unittest
+import tempfile
+from unittest import mock
 import numpy as np
 from astropy.timeseries import BoxLeastSquares
 
@@ -14,6 +16,7 @@ from aldebaran import (
     piecewise_savgol_detrend,
     verify_multi_epoch
 )
+import aldebaran
 
 
 class TestAldebaranV9Goals(unittest.TestCase):
@@ -23,24 +26,34 @@ class TestAldebaranV9Goals(unittest.TestCase):
     - Goal 3: Cramer-Rao Bounded Ephemeris Projection in Archival Verification
     """
 
+    @unittest.skipUnless(os.environ.get("ALDEBARAN_NETWORK_TESTS") == "1", "live catalog download; set ALDEBARAN_NETWORK_TESTS=1 to run")
     def test_goal2_toi_ephemerides_ingestion(self):
-        """Verifies ingestion of official TOI catalog ephemerides."""
-        known_cats, known_ebs, toi_ephems = load_known_catalogs_and_toi_ephemerides()
-        self.assertIsInstance(known_cats, set)
-        self.assertIsInstance(known_ebs, set)
-        self.assertIsInstance(toi_ephems, dict)
-        self.assertGreater(len(toi_ephems), 1000, "Should load thousands of TOI planetary systems")
+        with tempfile.TemporaryDirectory() as tmp, \
+             mock.patch.object(aldebaran, "CATALOG_CACHE_FILE", os.path.join(tmp, "known_catalog_cache.txt")), \
+             mock.patch.object(aldebaran, "TOI_EPHEMERIS_CACHE_FILE", os.path.join(tmp, "toi_ephemerides_cache.json")), \
+             mock.patch.object(aldebaran, "KNOWN_SIGNALS_REGISTRY_CACHE_FILE", os.path.join(tmp, "known_signals_registry.json")), \
+             mock.patch.object(aldebaran, "LOG_FILE", os.path.join(tmp, "pipeline_run.log")), \
+             mock.patch.object(aldebaran, "EVENTS_LOG_FILE", os.path.join(tmp, "pipeline_events.log")), \
+             mock.patch.object(aldebaran, "GLOBAL_TOI_EPHEMERIDES", {}), \
+             mock.patch.object(aldebaran, "GLOBAL_KNOWN_SIGNALS_REGISTRY", None), \
+             mock.patch.dict(os.environ, {"ALDEBARAN_OFFLINE": "0"}):
+            """Verifies ingestion of official TOI catalog ephemerides."""
+            known_cats, known_ebs, toi_ephems = load_known_catalogs_and_toi_ephemerides()
+            self.assertIsInstance(known_cats, set)
+            self.assertIsInstance(known_ebs, set)
+            self.assertIsInstance(toi_ephems, dict)
+            self.assertGreater(len(toi_ephems), 1000, "Should load thousands of TOI planetary systems")
 
-        # Check structure of ephemeris record
-        sample_tic = next(iter(toi_ephems.keys()))
-        planets = toi_ephems[sample_tic]
-        self.assertIsInstance(planets, list)
-        self.assertGreater(len(planets), 0)
-        p0 = planets[0]
-        for key in ["toi", "period", "t0", "duration", "depth_ppm", "disp"]:
-            self.assertIn(key, p0)
-            self.assertTrue(np.isfinite(p0["period"]))
-            self.assertGreater(p0["period"], 0.0)
+            # Check structure of ephemeris record
+            sample_tic = next(iter(toi_ephems.keys()))
+            planets = toi_ephems[sample_tic]
+            self.assertIsInstance(planets, list)
+            self.assertGreater(len(planets), 0)
+            p0 = planets[0]
+            for key in ["toi", "period", "t0", "duration", "depth_ppm", "disp"]:
+                self.assertIn(key, p0)
+                self.assertTrue(np.isfinite(p0["period"]))
+                self.assertGreater(p0["period"], 0.0)
 
     def test_goal2_known_transit_masking_and_sibling_recovery(self):
         """
@@ -115,10 +128,11 @@ class TestAldebaranV9Goals(unittest.TestCase):
         flat_ferr_curr = np.full_like(t_curr, 0.0003)
 
         # Single sector without prior archive returns Single-Sector_Only
-        ok, status, info = verify_multi_epoch(
-            tic_id, curr_sec, t_curr, flat_f_curr, flat_ferr_curr,
-            p_disc, t0_disc, dur_disc, depth_ppm, sde_curr
-        )
+        with mock.patch.object(aldebaran.lk, "search_lightcurve", return_value=[]):
+            ok, status, info = verify_multi_epoch(
+                tic_id, curr_sec, t_curr, flat_f_curr, flat_ferr_curr,
+                p_disc, t0_disc, dur_disc, depth_ppm, sde_curr
+            )
         self.assertTrue(ok)
         self.assertEqual(status, "Single-Sector_Only")
         self.assertEqual(info["n_trials"], 1)

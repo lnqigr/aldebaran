@@ -1,4 +1,5 @@
 import os
+from depth_contract import photometric_depth, geometric_radius, validate_observables, check_output_schema, DEPTH_SCHEMA
 import io
 import ssl
 import glob
@@ -12,6 +13,16 @@ import certifi
 import requests
 from astropy.io import fits
 from astroquery.mast import Catalogs
+from vps_contract import resolve_secondary_evidence
+from ephemeris_contract import BTJD_OFFSET, btjd_to_bjd
+from stellar_metrics import (  # C9: shared copies, see stellar_metrics.py
+    G_SI, M_SUN, R_SUN, T_SUN, AU_M, M_EARTH, R_EARTH, H_PLANCK, C_LIGHT, K_BOLTZ,
+    to_clean_float, estimate_missing_photometry, batch_query_tic_photometry,
+    extract_camera_ccd_from_cache, planck_spectral_radiance, compute_astrophysical_metrics,
+)
+
+# Progress line printed by batch_query_tic_photometry for this packager (text unchanged by C9)
+CTOI_TIC_QUERY_PROGRESS_PREFIX = "[1/4] Querying MAST TIC v8.2 catalog in batch mode"
 
 logger = logging.getLogger(__name__)
 
@@ -23,18 +34,7 @@ ssl._create_default_https_context = lambda: ssl.create_default_context(cafile=CA
 os.environ["PYTHONWARNINGS"] = "ignore::UserWarning"
 warnings.filterwarnings("ignore", category=UserWarning)
 
-# Physical & Astronomical Constants (SI / IAU 2015 Nominal)
-G_SI = 6.67430e-11
-M_SUN = 1.98847e30
-R_SUN = 6.957e8
-T_SUN = 5772.0
-AU_M = 1.495978707e11
-M_EARTH = 5.97217e24
-R_EARTH = 6.371e6
-H_PLANCK = 6.62607015e-34
-C_LIGHT = 2.99792458e8
-K_BOLTZ = 1.380649e-23
-BTJD_OFFSET = 2457000.0
+# BTJD_OFFSET imported from ephemeris_contract
 
 # File Paths
 RESULTS_DIR = "tess_results"
@@ -43,287 +43,36 @@ TIER2_CSV = os.path.join(RESULTS_DIR, "deep_vetting", "scientific_dossier_summar
 RANKING_OUT_CSV = os.path.join(RESULTS_DIR, "prioritized_targets_ranking.csv")
 EXOFOP_OUT_CSV = os.path.join(RESULTS_DIR, "exofop_ctoi_upload.csv")
 
-
-def to_clean_float(val, default: float = np.nan) -> float:
-    try:
-        if pd.isna(val) or str(val).strip().upper() in ("", "N/A", "NAN", "NONE", "NULL"):
-            return default
-        f_val = float(val)
-        return f_val if np.isfinite(f_val) else default
-    except Exception:
-        return default
+# S3.13 (Codex S3.10 review): only a candidate row may be exported. The Pleiades pass disposition, its
+# pre-ALD wording found in saved summaries, and the Tier-1-only default when no Tier-2 summary exists.
+CTOI_CANDIDATE_DISPOSITION_PREFIXES = (
+    "TIER-2 HEURISTIC SCREEN PASS",
+    "TIER-2 VETTED CANDIDATE",
+)
+TIER1_ONLY_DISPOSITION = "TIER-1 CANDIDATE"
 
 
-def estimate_missing_photometry(tmag: float, vmag: float, gmag: float, jmag: float, hmag: float, kmag: float, teff: float) -> dict:
+def ctoi_export_block_reason(row, tier2_present: bool = True):
+    """Why a merged row is not a candidate for export, or None (S3.13).
+
+    A failed Pleiades fit (fit_status FAILED, item 39) and an ERROR record are never exported, whatever the
+    disposition. Otherwise the disposition must be a candidate one; a Tier-1 row with no Tier-2 record while a
+    Tier-2 summary exists has none and is not exported.
     """
-    Reconstructs missing optical/NIR magnitudes using empirical main-sequence dwarf
-    color-temperature relations (Pecaut & Mamajek 2013; Stassun et al. 2019).
-    """
-    teff_clamped = float(np.clip(teff if np.isfinite(teff) else 5500.0, 2800.0, 10000.0))
-    
-    # Empirical grid: Teff -> (V - G, G - T, T - J, J - H, H - Ks)
-    teff_grid = np.array([3000.0, 3500.0, 4000.0, 4500.0, 5000.0, 5770.0, 6500.0, 7500.0, 9500.0])
-    vg_grid   = np.array([1.45,   0.95,   0.55,   0.35,   0.22,   0.12,   0.06,   0.02,   0.00])
-    gt_grid   = np.array([1.35,   1.05,   0.78,   0.60,   0.46,   0.33,   0.22,   0.10,   0.00])
-    tj_grid   = np.array([1.55,   1.32,   1.12,   0.92,   0.75,   0.58,   0.42,   0.25,   0.05])
-    jh_grid   = np.array([0.60,   0.62,   0.64,   0.56,   0.46,   0.33,   0.23,   0.12,   0.02])
-    hk_grid   = np.array([0.26,   0.23,   0.19,   0.14,   0.10,   0.07,   0.05,   0.03,   0.01])
-    
-    vg = float(np.interp(teff_clamped, teff_grid, vg_grid))
-    gt = float(np.interp(teff_clamped, teff_grid, gt_grid))
-    tj = float(np.interp(teff_clamped, teff_grid, tj_grid))
-    jh = float(np.interp(teff_clamped, teff_grid, jh_grid))
-    hk = float(np.interp(teff_clamped, teff_grid, hk_grid))
-    
-    # Establish optical/TESS anchor magnitude
-    if not np.isfinite(tmag):
-        if np.isfinite(gmag):
-            tmag = gmag - gt
-        elif np.isfinite(vmag):
-            tmag = vmag - vg - gt
-        elif np.isfinite(jmag):
-            tmag = jmag + tj
-        else:
-            tmag = 12.5  # Conservative fallback if all magnitudes are missing
-            
-    if not np.isfinite(gmag):
-        gmag = tmag + gt
-    if not np.isfinite(vmag):
-        vmag = gmag + vg
-        
-    # Reconstruct 2MASS NIR magnitudes (J, H, Ks)
-    j_fallback = False
-    if not np.isfinite(jmag):
-        jmag = tmag - tj
-        j_fallback = True
-    if not np.isfinite(hmag):
-        hmag = jmag - jh
-    if not np.isfinite(kmag):
-        kmag = hmag - hk
-        
-    return {
-        "Tmag": round(float(tmag), 3),
-        "Vmag": round(float(vmag), 3),
-        "Gmag": round(float(gmag), 3),
-        "Jmag": round(float(jmag), 3),
-        "Hmag": round(float(hmag), 3),
-        "Kmag": round(float(kmag), 3),
-        "nir_estimated": j_fallback
-    }
+    def _text(key):
+        value = row.get(key)
+        return "" if value is None or (isinstance(value, float) and np.isnan(value)) else str(value).strip()
 
-
-def batch_query_tic_photometry(tic_ids: list[str]) -> dict:
-    """
-    Performs a single fast batch query to the MAST TIC v8.2 catalog for all surviving TIC IDs.
-    Extracts Tmag, Vmag, GAIAmag, Jmag, Hmag, Kmag, RA, Dec, R_star, M_star, Teff.
-    """
-    catalog_map = {}
-    int_ids = [int(t) for t in tic_ids if str(t).isdigit()]
-    if not int_ids:
-        return catalog_map
-        
-    print(f"[1/4] Querying MAST TIC v8.2 catalog in batch mode for {len(int_ids)} targets...")
-    try:
-        tic_table = Catalogs.query_criteria(catalog="Tic", ID=int_ids)
-        for row in tic_table:
-            tid = str(int(row["ID"]))
-            catalog_map[tid] = {
-                "ra": to_clean_float(row["ra"]),
-                "dec": to_clean_float(row["dec"]),
-                "Tmag": to_clean_float(row["Tmag"]),
-                "Vmag": to_clean_float(row["Vmag"]),
-                "Gmag": to_clean_float(row["GAIAmag"]),
-                "Jmag": to_clean_float(row["Jmag"]),
-                "Hmag": to_clean_float(row["Hmag"]),
-                "Kmag": to_clean_float(row["Kmag"]),
-                "r_star": to_clean_float(row["rad"]),
-                "e_r_star": to_clean_float(row["e_rad"]) if "e_rad" in row.colnames else np.nan,
-                "m_star": to_clean_float(row["mass"]),
-                "e_m_star": to_clean_float(row["e_mass"]) if "e_mass" in row.colnames else np.nan,
-                "teff": to_clean_float(row["Teff"]),
-                "e_teff": to_clean_float(row["e_Teff"]) if "e_Teff" in row.colnames else np.nan,
-            }
-    except Exception as e:
-        print(f"      [!] Batch TIC query warning ({e}), falling back to individual lookups...")
-        for tid in int_ids:
-            try:
-                sub = Catalogs.query_criteria(catalog="Tic", ID=tid)
-                if len(sub) > 0:
-                    row = sub[0]
-                    catalog_map[str(tid)] = {
-                        "ra": to_clean_float(row["ra"]),
-                        "dec": to_clean_float(row["dec"]),
-                        "Tmag": to_clean_float(row["Tmag"]),
-                        "Vmag": to_clean_float(row["Vmag"]),
-                        "Gmag": to_clean_float(row["GAIAmag"]),
-                        "Jmag": to_clean_float(row["Jmag"]),
-                        "Hmag": to_clean_float(row["Hmag"]),
-                        "Kmag": to_clean_float(row["Kmag"]),
-                        "r_star": to_clean_float(row["rad"]),
-                        "e_r_star": to_clean_float(row["e_rad"]) if "e_rad" in row.colnames else np.nan,
-                        "m_star": to_clean_float(row["mass"]),
-                        "e_m_star": to_clean_float(row["e_mass"]) if "e_mass" in row.colnames else np.nan,
-                        "teff": to_clean_float(row["Teff"]),
-                        "e_teff": to_clean_float(row["e_Teff"]) if "e_Teff" in row.colnames else np.nan,
-                    }
-            except Exception:
-                continue
-    return catalog_map
-
-
-def extract_camera_ccd_from_cache(tic_id: str) -> tuple[str, str]:
-    """Scans local Lightkurve cache for FITS headers of tic_id to extract CAMERA and CCD numbers."""
-    cache_dirs = [
-        os.environ.get("LIGHTKURVE_CACHE_DIR", ""),
-        os.path.join(os.path.expanduser("~"), ".lightkurve", "cache"),
-        os.path.join(os.path.expanduser("~"), ".cache", "lightkurve")
-    ]
-    padded = str(tic_id).zfill(16)
-    for cdir in cache_dirs:
-        if not cdir or not os.path.exists(cdir):
-            continue
-        matches = glob.glob(os.path.join(cdir, "**", f"*{padded}*lc.fits"), recursive=True)
-        if matches:
-            try:
-                with fits.open(matches[-1], memmap=False) as hdul:
-                    hdr = hdul[0].header
-                    cam = str(hdr.get("CAMERA", "N/A"))
-                    ccd = str(hdr.get("CCD", "N/A"))
-                    return cam, ccd
-            except Exception:
-                pass
-    return "N/A", "N/A"
-
-
-def planck_spectral_radiance(wavelength_m: float, temp_k: float) -> float:
-    """Evaluates Planck blackbody spectral radiance B_lambda(T) at wavelength_m."""
-    if temp_k <= 20.0:
-        return 0.0
-    exponent = (H_PLANCK * C_LIGHT) / (wavelength_m * K_BOLTZ * temp_k)
-    exponent = min(float(exponent), 500.0)
-    return float((2.0 * H_PLANCK * (C_LIGHT ** 2) / (wavelength_m ** 5)) / np.expm1(exponent))
-
-
-def compute_astrophysical_metrics(
-    rp_earth: float,
-    p_days: float,
-    b_impact: float,
-    r_star_sun: float,
-    m_star_sun: float,
-    teff_k: float,
-    jmag: float,
-    kmag: float,
-    v_or_tmag: float
-) -> dict:
-    """
-    Computes planet mass (Chen & Kipping 2017; Wolfgang et al. 2016), bulk density,
-    surface gravity, semi-major axis, insolation, Teq, RV semi-amplitude K,
-    and Kempton et al. (2018) TSM & ESM atmospheric characterization metrics.
-    """
-    rp_e = max(0.3, float(rp_earth))
-    p_d = max(0.1, float(p_days))
-    r_s = max(0.08, float(r_star_sun))
-    m_s = max(0.08, float(m_star_sun)) if (np.isfinite(m_star_sun) and m_star_sun > 0) else (r_s ** 1.1)
-    t_eff = max(2500.0, float(teff_k)) if (np.isfinite(teff_k) and teff_k > 0) else 5500.0
-    b_val = float(np.clip(b_impact if np.isfinite(b_impact) else 0.3, 0.0, 0.98))
-    
-    # 1. Planet Mass M_p (M_Earth)
-    # Chen & Kipping (2017, ApJ, 834, 17) piecewise power-law:
-    if rp_e < 1.23:
-        mp_ck17 = (rp_e / 1.008) ** (1.0 / 0.279)
-    elif rp_e <= 14.26:
-        mp_ck17 = (rp_e / 0.8081) ** (1.0 / 0.589)
-    else:
-        mp_ck17 = 131.6 * ((rp_e / 14.26) ** 2.0)
-        
-    # Wolfgang et al. (2016, ApJ, 825, 19) sub-Neptune relation:
-    mp_w16 = 2.7 * (rp_e ** 1.3)
-    
-    # 2. Bulk Density (g/cm^3) & Surface Gravity (m/s^2) using Chen & Kipping mass
-    rp_m = rp_e * R_EARTH
-    vol_cm3 = (4.0 / 3.0) * np.pi * ((rp_m * 100.0) ** 3)
-    rho_p_cgs = (mp_ck17 * M_EARTH * 1000.0) / vol_cm3
-    g_p_ms2 = (G_SI * mp_ck17 * M_EARTH) / (rp_m ** 2)
-    
-    # 3. Orbital Dynamics, Insolation & Equilibrium Temperature
-    p_sec = p_d * 86400.0
-    m_star_kg = m_s * M_SUN
-    r_star_m = r_s * R_SUN
-    a_m = (G_SI * m_star_kg * (p_sec ** 2) / (4.0 * np.pi ** 2)) ** (1.0 / 3.0)
-    a_au = a_m / AU_M
-    a_over_rs = a_m / r_star_m
-    
-    l_star_sun = (r_s ** 2) * ((t_eff / T_SUN) ** 4)
-    insolation_earth = l_star_sun / (a_au ** 2)
-    
-    # Kempton et al. (2018) standard zero-albedo, full-redistribution Teq & dayside T_day
-    teq_k = t_eff * np.sqrt(r_star_m / (2.0 * a_m))
-    t_day_k = 1.10 * teq_k
-    
-    # 4. Radial Velocity Semi-Amplitude K (m/s)
-    sin_i = np.sqrt(max(0.01, 1.0 - (b_val / max(a_over_rs, 1.1)) ** 2))
-    rv_prefactor = ((2.0 * np.pi * G_SI / p_sec) ** (1.0 / 3.0)) * sin_i / (m_star_kg ** (2.0 / 3.0))
-    k_rv_ck17 = float(rv_prefactor * (mp_ck17 * M_EARTH))
-    k_rv_w16 = float(rv_prefactor * (mp_w16 * M_EARTH))
-    
-    # 5. Transmission Spectroscopy Metric (TSM, Kempton et al. 2018 Eq. 1 & Table 1)
-    if rp_e < 1.50:
-        tsm_scale = 0.190
-        tsm_benchmark = 10.0
-    elif rp_e < 2.75:
-        tsm_scale = 1.26
-        tsm_benchmark = 90.0
-    elif rp_e < 4.00:
-        tsm_scale = 1.28
-        tsm_benchmark = 90.0
-    elif rp_e <= 10.00:
-        tsm_scale = 1.15
-        tsm_benchmark = 90.0
-    else:
-        tsm_scale = 1.00
-        tsm_benchmark = 90.0
-        
-    tsm = float(tsm_scale * ((rp_e ** 3) * teq_k / (mp_ck17 * (r_s ** 2))) * (10.0 ** (-0.2 * jmag)))
-    
-    # 6. Emission Spectroscopy Metric (ESM, Kempton et al. 2018 Eq. 4 at lambda = 7.5 um)
-    lam_75um = 7.5e-6
-    b_planet = planck_spectral_radiance(lam_75um, t_day_k)
-    b_star = max(1e-30, planck_spectral_radiance(lam_75um, t_eff))
-    rp_over_rs_phys = rp_m / r_star_m
-    esm = float(4.29e6 * (b_planet / b_star) * (rp_over_rs_phys ** 2) * (10.0 ** (-0.2 * kmag)))
-    
-    # 7. Spectroscopic Follow-Up Tiering (ESPRESSO / HARPS-N / MAROON-X & JWST)
-    if k_rv_ck17 >= 3.0 and v_or_tmag <= 13.5:
-        rv_tier = "HIGH (Tier-1 ESPRESSO/HARPS-N/MAROON-X)"
-    elif k_rv_ck17 >= 1.5 and v_or_tmag <= 15.0:
-        rv_tier = "MEDIUM (Tier-2 MAROON-X/ESPRESSO)"
-    else:
-        rv_tier = "LOW (Faint host or K < 1.5 m/s)"
-        
-    if tsm >= tsm_benchmark or esm >= 7.5:
-        jwst_tier = "TOP-QUARTILE JWST TARGET (TSM/ESM Pass)"
-    elif tsm >= 0.5 * tsm_benchmark or esm >= 4.0:
-        jwst_tier = "MODERATE JWST TARGET"
-    else:
-        jwst_tier = "BASELINE PHOTOMETRIC TARGET"
-        
-    return {
-        "mp_ck17_earth": round(mp_ck17, 2),
-        "mp_w16_earth": round(mp_w16, 2),
-        "rho_p_gcm3": round(rho_p_cgs, 2),
-        "g_p_ms2": round(g_p_ms2, 2),
-        "a_au": round(a_au, 5),
-        "a_over_rstar": round(a_over_rs, 2),
-        "insolation_earth": round(insolation_earth, 1),
-        "teq_k": round(teq_k, 0),
-        "t_day_k": round(t_day_k, 0),
-        "rv_k_ck17_ms": round(k_rv_ck17, 2),
-        "rv_k_w16_ms": round(k_rv_w16, 2),
-        "tsm": round(tsm, 1),
-        "esm": round(esm, 2),
-        "rv_followup_priority": rv_tier,
-        "jwst_followup_priority": jwst_tier
-    }
+    if _text("fit_status").upper() == "FAILED":
+        return "fit_status FAILED"
+    if _text("operational_status").upper() == "ERROR":
+        return "operational_status ERROR"
+    disposition = _text("disposition")
+    if not tier2_present and disposition == TIER1_ONLY_DISPOSITION:
+        return None
+    if disposition.upper().startswith(CTOI_CANDIDATE_DISPOSITION_PREFIXES):
+        return None
+    return f"non-candidate disposition ({disposition or 'no Tier-2 record'})"
 
 
 def run_ctoi_packager():
@@ -338,7 +87,8 @@ def run_ctoi_packager():
     df_t1["tic_id"] = df_t1["tic_id"].astype(str).str.strip()
     df_t1 = df_t1.drop_duplicates(subset=["tic_id"], keep="last")
     
-    if os.path.exists(TIER2_CSV):
+    tier2_present = os.path.exists(TIER2_CSV)
+    if tier2_present:
         df_t2 = pd.read_csv(TIER2_CSV)
         df_t2["tic_id"] = df_t2["tic_id"].astype(str).str.strip()
         df_t2 = df_t2.drop_duplicates(subset=["tic_id"], keep="last")
@@ -352,9 +102,9 @@ def run_ctoi_packager():
             ("fp_risk_percent", 25.0),
             ("refined_period_days", np.nan),
             ("fitted_rp_earth", np.nan),
-            ("impact_param_b", 0.30),
+            ("impact_param_b", np.nan),
             ("dur_to_kepler_max", 1.00),
-            ("secondary_snr_sigma", 0.0),
+            ("secondary_snr_sigma", np.nan),
             ("sec_eclipse_phase", 0.50),
             ("is_known_tess_eb", False),
             ("gaia_nss_type", np.nan),
@@ -370,7 +120,11 @@ def run_ctoi_packager():
     has_gaia_nss = df_merged["gaia_nss_type"].notna() & (
         ~df_merged["gaia_nss_type"].astype(str).str.strip().str.upper().isin(["", "NAN", "NONE", "N/A", "FALSE"])
     )
-    has_sec_eb = pd.to_numeric(df_merged["secondary_snr_sigma"], errors="coerce").fillna(0.0) > 3.5
+    # Unknown legacy evidence remains unknown in the resolver; compatibility
+    # packaging excludes only an established positive CTOI-policy predicate.
+    has_sec_eb = pd.Series(
+        [resolve_secondary_evidence(row)["ctoi_reject"] is True for _, row in df_merged.iterrows()],
+        index=df_merged.index, dtype=bool)
     has_tess_eb = df_merged["is_known_tess_eb"].astype(str).str.strip().str.upper() == "TRUE"
     
     fp_mask = has_gaia_nss | has_sec_eb | has_tess_eb
@@ -381,14 +135,24 @@ def run_ctoi_packager():
     if len(df_rejected) > 0:
         for _, r_row in df_rejected.iterrows():
             print(f"      -> Excluded TIC {r_row['tic_id']}: {r_row.get('disposition', 'FP')}")
-            
+
+    # S3.13: disposition and fit_status gate; an INCOMPLETE_FIT_FAILED or other non-candidate row is never exported.
+    block_reasons = [ctoi_export_block_reason(r_row, tier2_present) for _, r_row in df_clean.iterrows()]
+    not_candidate = pd.Series([b is not None for b in block_reasons], index=df_clean.index, dtype=bool)
+    if not_candidate.any():
+        print(f"Excluded {int(not_candidate.sum())} non-candidate row(s) (disposition / fit_status gate).")
+        for (_, r_row), reason in zip(df_clean.iterrows(), block_reasons):
+            if reason is not None:
+                print(f"      -> Not exported TIC {r_row['tic_id']}: {reason}")
+    df_clean = df_clean[~not_candidate].copy()
+
     if len(df_clean) == 0:
         print("[!] No surviving candidates remain after FP filtering.")
         return
 
     # Step 3: Batch query TIC v8.2 photometry
     surviving_tics = df_clean["tic_id"].tolist()
-    tic_phot_map = batch_query_tic_photometry(surviving_tics)
+    tic_phot_map = batch_query_tic_photometry(surviving_tics, progress_prefix=CTOI_TIC_QUERY_PROGRESS_PREFIX)
     
     # Step 4: Calculate astrophysical parameters & build ranking + ExoFOP rows
     print(f"[2/4] Computing M_p, RV semi-amplitude K, TSM, and ESM for {len(df_clean)} candidates...")
@@ -399,17 +163,25 @@ def run_ctoi_packager():
         tid = str(row["tic_id"])
         t_meta = tic_phot_map.get(tid, {})
         
-        p_days = to_clean_float(row.get("refined_period_days"), to_clean_float(row.get("period_days"), 1.0))
-        t0_btjd = to_clean_float(row.get("refined_t0_btjd"), to_clean_float(row.get("t0_btjd"), 3980.0))
-        epoch_bjd = t0_btjd + BTJD_OFFSET
-        dur_hr = to_clean_float(row.get("fitted_duration_hours"), to_clean_float(row.get("duration_hours"), 2.0))
-        depth_ppm = to_clean_float(row.get("fitted_depth_ppm"), to_clean_float(row.get("depth_ppm"), 1000.0))
-        rp_earth = to_clean_float(row.get("fitted_rp_earth"), to_clean_float(row.get("r_planet_earth"), 2.0))
-        b_imp = to_clean_float(row.get("impact_param_b"), 0.30)
+        p_days = to_clean_float(row.get("refined_period_days"), to_clean_float(row.get("period_days"), np.nan))
+        t0_btjd = to_clean_float(row.get("refined_t0_btjd"), to_clean_float(row.get("t0_btjd"), np.nan))
+        epoch_bjd = btjd_to_bjd(t0_btjd, strict=True)
+        dur_hr = to_clean_float(row.get("fitted_duration_hours"), to_clean_float(row.get("duration_hours"), np.nan))
+        try:
+            depth_ppm, depth_source = photometric_depth(row)
+            rp_earth, radius_source = geometric_radius(row)
+            validate_observables(p_days, t0_btjd, dur_hr, depth_ppm, rp_earth)
+        except ValueError as exc:
+            logger.error("TIC %s not characterizable: %s", tid, exc)
+            continue
+        b_imp = to_clean_float(row.get("impact_param_b"), np.nan)
         
-        r_star = to_clean_float(row.get("r_star_sun"), t_meta.get("r_star", 1.0))
-        m_star = to_clean_float(row.get("m_star_sun"), t_meta.get("m_star", r_star ** 1.1))
-        teff = to_clean_float(row.get("teff_k"), t_meta.get("teff", 5500.0))
+        r_star = to_clean_float(row.get("r_star_sun"), t_meta.get("r_star", np.nan))
+        m_star = to_clean_float(row.get("m_star_sun"), t_meta.get("m_star", np.nan))
+        teff = to_clean_float(row.get("teff_k"), t_meta.get("teff", np.nan))
+        if not all(np.isfinite(v) and v > 0 for v in (r_star, m_star, teff)):
+            logger.error("TIC %s lacks host measurements; no nominal host exported", tid)
+            continue
         
         phot = estimate_missing_photometry(
             t_meta.get("Tmag", np.nan),
@@ -448,6 +220,13 @@ def run_ctoi_packager():
         
         ranking_rows.append({
             "tic_id": tid,
+            "depth_schema_version": DEPTH_SCHEMA,
+            "depth_kind": "measured_box_photometric",
+            "depth_source": depth_source,
+            "radius_source": radius_source,
+            "impact_parameter_source": "input_fit_or_legacy" if np.isfinite(b_imp) else "missing",
+            "characterization_assumptions": "legacy_model_b_default_0.3" if not np.isfinite(b_imp) else "legacy_characterization_model",
+            "output_producer": "ctoi_packager",
             "priority_score": priority_score,
             "disposition": row.get("disposition", "CANDIDATE"),
             "vps_score": round(vps_score, 1),
@@ -494,6 +273,8 @@ def run_ctoi_packager():
             f"Teq={int(astro['teq_k'])}K, Mp_est={astro['mp_ck17_earth']:.1f} M_E, RV K={astro['rv_k_ck17_ms']:.1f} m/s, "
             f"TSM={astro['tsm']:.1f}, ESM={astro['esm']:.1f}. "
             f"Gaia 120arcsec Contam={contam_pct:.1f}% ({neb_cnt} NEB-capable neighbors). "
+            f"Depth=measured box ({depth_source}); radius={radius_source}. "
+            f"Impact source={'input_fit_or_legacy' if np.isfinite(b_imp) else 'missing; characterization assumes b=0.3'}. "
             f"Disposition: {row.get('disposition', 'PC')} (VPS heuristic points={fp_risk:.1f}/100; uncalibrated, not a probability)."
         )
         
@@ -510,6 +291,8 @@ def run_ctoi_packager():
         })
 
     # Step 5: Sort by priority_score, TSM, and RV K descending
+    if not ranking_rows:
+        raise ValueError("No candidates with required physical observables; existing outputs untouched")
     df_rank = pd.DataFrame(ranking_rows)
     df_rank = df_rank.sort_values(
         by=["priority_score", "tsm", "rv_k_ck17_ms"],
@@ -525,6 +308,9 @@ def run_ctoi_packager():
     
     # Step 6: Save outputs
     os.makedirs(RESULTS_DIR, exist_ok=True)
+    check_output_schema(RANKING_OUT_CSV, df_rank.columns)
+    check_output_schema(EXOFOP_OUT_CSV, df_exofop.columns, "|")
+    check_output_schema(EXOFOP_OUT_CSV.replace(".csv", "_comma.csv"), df_exofop.columns)
     df_rank.to_csv(RANKING_OUT_CSV, index=False)
     df_exofop.to_csv(EXOFOP_OUT_CSV, index=False, sep="|")
     # Also save comma-separated copy for spreadsheet inspection

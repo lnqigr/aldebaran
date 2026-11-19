@@ -1,4 +1,10 @@
 import os
+import sys
+from pathlib import Path
+
+# Preserve the documented direct-script entrypoint as well as module imports.
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import unittest
 import numpy as np
 import pandas as pd
@@ -6,6 +12,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from unittest.mock import patch
+from vps_contract import compute_vps_ledger
 
 RESULTS_DIR = "tess_results"
 os.makedirs(RESULTS_DIR, exist_ok=True)
@@ -21,41 +28,19 @@ def compute_vps_score(
     contam_pct: float,
     is_gaia_nss: bool = False,
     is_tess_eb: bool = False,
-    primary_snr: float = 10.0
+    primary_snr: float = 10.0,
+    is_sec_eb: bool = False
 ) -> float:
     """
     Computes the heuristic Vetting Penalty Score (VPS, 0-100) from configured
     secondary-eclipse and blend-related penalties; it is not a calibrated probability.
     """
-    if is_gaia_nss or is_tess_eb:
-        return 99.9
-
-    vps = 0.2
-    is_circular_zone = abs(sec_phase - 0.50) <= 0.04
-    if (is_circular_zone and sec_snr > 2.8) or ((not is_circular_zone) and sec_snr > 3.4):
-        vps += 45.0 * (sec_snr / 3.0)
-
-    if dur_ratio > 1.25:
-        vps += 35.0 * (dur_ratio - 1.0)
-    elif dur_ratio < 0.45:
-        vps += 25.0
-
-    if b_impact > 0.80:
-        vps += 30.0 * ((b_impact - 0.75) / 0.25)
-
-    if np.isfinite(ruwe) and ruwe > 1.25:
-        vps += min(25.0, (ruwe - 1.20) * 100.0)
-
-    if neb_count > 0:
-        vps += min(35.0, neb_count * 8.0)
-
-    if contam_pct > 10.0:
-        vps += min(25.0, (contam_pct - 10.0) * 1.2)
-
-    if primary_snr < 5.5:
-        vps += min(65.0, (5.5 - primary_snr) * 22.0)
-
-    return float(np.round(np.clip(vps, 0.2, 99.9), 1))
+    return compute_vps_ledger(
+        b_fit=b_impact, sec_center_phi=sec_phase, sec_snr=sec_snr,
+        is_sec_eb=is_sec_eb, is_tess_eb=is_tess_eb, is_gaia_nss=is_gaia_nss,
+        neb_capable_stars=neb_count, contamination_ratio=contam_pct / 100.0,
+        dur_ratio_kepler=dur_ratio, ruwe=ruwe,
+        stitched_primary_snr=primary_snr)["final_score"]
 
 
 def compute_empirical_roc(y_true_planet: np.ndarray, vps_scores: np.ndarray) -> dict:

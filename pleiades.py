@@ -1,5 +1,7 @@
 import os
+from depth_contract import fit_depth_fields, number
 import io
+import sys
 import ssl
 import json
 import urllib.parse
@@ -20,6 +22,23 @@ from vps_contract import (
     VPS_PRODUCER_NAME,
     PLEIADES_CLEAN_VPS_THRESHOLD
 )
+
+# SCI-32 / SCI-33: label stating all conditions joined by AND in is_clean
+PLEIADES_CLEAN_GATE_LABEL = (
+    f"Pleiades Clean Criterion < {PLEIADES_CLEAN_VPS_THRESHOLD:.1f} "
+    "AND b < 0.82 AND sec_snr <= sec_snr_threshold AND not is_sec_eb "
+    "AND not is_tess_eb AND not is_gaia_nss "
+    "AND 0.35 <= dur_ratio <= 1.38 AND primary_snr >= 5.5"
+)
+from ephemeris_contract import (
+    BTJD_OFFSET,
+    fold_phase_0to1,
+    fold_phase_centered,
+    cyclic_orbital_distance,
+    compute_orbit_number,
+    days_to_hours,
+    hours_to_days
+)
 from scipy.optimize import curve_fit
 from scipy.ndimage import median_filter
 from astropy.timeseries import BoxLeastSquares
@@ -28,6 +47,8 @@ import astropy.units as u
 from astroquery.vizier import Vizier
 import lightkurve as lk
 from astroquery.mast import Catalogs
+from lightcurve_helpers import (  # C9: shared copies, see lightcurve_helpers.py
+    to_numpy, calc_max_keplerian_duration_hours, compute_keplerian_duration_bounds_hours)
 
 logger = logging.getLogger(__name__)
 
@@ -39,45 +60,84 @@ ssl._create_default_https_context = lambda: ssl.create_default_context(cafile=CA
 
 
 def safe_http_get(url: str, params: dict = None, headers: dict = None, timeout: int = 45) -> requests.Response:
-    """
-    Executes an HTTPS GET request with strict certifi TLS verification.
-    Falls back to unverified TLS strictly on legacy HPC nodes raising SSLError.
-    """
-    try:
-        resp = requests.get(url, params=params, headers=headers, timeout=timeout, verify=CA_BUNDLE_PATH)
-        resp.raise_for_status()
-        return resp
-    except requests.exceptions.SSLError as ssl_err:
-        logger.warning("TLS verification failed (%s); falling back to unverified context for %s", ssl_err, url)
-        resp = requests.get(url, params=params, headers=headers, timeout=timeout, verify=False)
-        resp.raise_for_status()
-        return resp
+    """Execute an HTTPS GET with certifi verification; propagate certificate errors."""
+    resp = requests.get(url, params=params, headers=headers, timeout=timeout, verify=CA_BUNDLE_PATH)
+    resp.raise_for_status()
+    return resp
 
 
 os.environ["PYTHONWARNINGS"] = "ignore::UserWarning"
 warnings.filterwarnings("ignore", category=UserWarning)
 
 PIPELINE_VERSION = "v2.5"
+_ACTIVE_BOUND_RUN = None
+
+
+def _record_pleiades_mast_product(lc_obj, tic_id: str, vet_dir: str) -> None:
+    """Record SHA256 of downloaded Pleiades SPOC lightcurve products (OPS-33)."""
+    import run_identity as ri
+    paths = ri.extract_mast_product_paths(lc_obj)
+    if not paths:
+        return
+    prod_dir = os.path.join(vet_dir, "mast_products")
+    os.makedirs(prod_dir, exist_ok=True)
+    for p in paths:
+        digest = ri.sha256_file(p)
+        key = ri.sha256_bytes(f"pleiades:{p}".encode("utf-8"))[:24]
+        rec_path = os.path.join(prod_dir, f"mast_{key}.json")
+        if os.path.exists(rec_path):
+            existing = ri.load_verified_json(rec_path, required_keys=("path", "sha256"))
+            if existing.get("sha256") != digest:
+                raise ri.RunIdentityError(
+                    f"STALE_MAST_PRODUCT: Pleiades MAST product '{p}' changed "
+                    f"(recorded {existing.get('sha256')}, got {digest})"
+                )
+        else:
+            ri.atomic_write_json(
+                rec_path,
+                {
+                    "tic_id": str(tic_id),
+                    "path": p,
+                    "sha256": digest,
+                    "size_bytes": os.path.getsize(p),
+                },
+            )
+        if _ACTIVE_BOUND_RUN is not None:
+            _ACTIVE_BOUND_RUN.record_mast_product(
+                p,
+                tic_id=tic_id,
+                product_type="MAST_SPOC_LC",
+                expected_sha256=digest,
+                save=True,
+            )
+
+
+def sync_pleiades_mast_products(bound_run, vet_dir: str) -> None:
+    """Verify and merge Pleiades MAST product sidecar SHA256s into bound_run."""
+    import run_identity as ri
+    prod_dir = os.path.join(vet_dir, "mast_products")
+    if not os.path.isdir(prod_dir):
+        return
+    changed = False
+    for fname in sorted(os.listdir(prod_dir)):
+        if not (fname.startswith("mast_") and fname.endswith(".json")):
+            continue
+        rec = ri.load_verified_json(os.path.join(prod_dir, fname), required_keys=("path", "sha256"))
+        bound_run.record_mast_product(
+            rec["path"],
+            tic_id=rec.get("tic_id"),
+            product_type="MAST_SPOC_LC",
+            expected_sha256=rec["sha256"],
+            save=False,
+        )
+        changed = True
+    if changed:
+        bound_run.save()
 if os.environ.get("LIGHTKURVE_CACHE_DIR"):
     os.makedirs(os.environ["LIGHTKURVE_CACHE_DIR"], exist_ok=True)
     lk.conf.cache_dir = os.environ["LIGHTKURVE_CACHE_DIR"]
 INPUT_CSV = os.path.join("tess_results", "candidates_report.csv")
 VET_DIR = os.path.join("tess_results", "deep_vetting")
-
-
-def to_numpy(col) -> np.ndarray:
-    mask = None
-    if hasattr(col, "mask") and col.mask is not None:
-        mask = np.asarray(col.mask, dtype=bool)
-    for _ in range(3):
-        if hasattr(col, "unmasked"):
-            col = col.unmasked
-        if hasattr(col, "value"):
-            col = col.value
-    arr = np.array(col, dtype=np.float64, copy=True)
-    if mask is not None and mask.shape == arr.shape:
-        arr[mask] = np.nan
-    return arr
 
 
 def safe_float(val, default: float) -> float:
@@ -97,43 +157,6 @@ def fetch_csv_no_ssl(url: str) -> pd.DataFrame:
     return pd.read_csv(io.StringIO(resp.text), comment="#", on_bad_lines="skip")
 
 
-def calc_max_keplerian_duration_hours(p_days: float, r_star_sun: float, m_star_sun: float, rp_rs: float) -> float:
-    G = 6.67430e-11
-    M_sun = 1.98847e30
-    R_sun = 6.957e8
-    
-    p_sec = p_days * 86400.0
-    m_kg = max(0.08, m_star_sun) * M_sun
-    r_m = max(0.10, r_star_sun) * R_sun
-    
-    a_m = (G * m_kg * (p_sec ** 2) / (4.0 * np.pi ** 2)) ** (1.0 / 3.0)
-    ratio = (r_m * (1.0 + rp_rs)) / a_m
-    if ratio >= 1.0:
-        return p_days * 24.0 * 0.25
-    t14_sec = (p_sec / np.pi) * np.arcsin(ratio)
-    return float(t14_sec / 3600.0)
-
-
-def compute_keplerian_duration_bounds_hours(
-    p_days: float, r_star: float, e_r_star: float, m_star: float, e_m_star: float, rp_rs: float
-) -> tuple[float, float, float]:
-    """
-    Returns (nominal_circular_max_hr, strict_lower_bound_hr, eccentric_upper_bound_hr)
-    accounting for 1-sigma TIC stellar uncertainties (e_rad, e_mass) and e <= 0.30 eccentricity.
-    """
-    nom_max_hr = calc_max_keplerian_duration_hours(p_days, r_star, m_star, rp_rs)
-    
-    r_upper = r_star + max(e_r_star, 0.08 * r_star)
-    m_lower = max(0.08, m_star - max(e_m_star, 0.10 * m_star))
-    upper_circ_hr = calc_max_keplerian_duration_hours(p_days, r_upper, m_lower, rp_rs)
-    
-    r_lower = max(0.08, r_star - max(e_r_star, 0.08 * r_star))
-    m_upper = m_star + max(e_m_star, 0.10 * m_star)
-    lower_circ_hr = calc_max_keplerian_duration_hours(p_days, r_lower, m_upper, rp_rs)
-    
-    return nom_max_hr, 0.35 * lower_circ_hr, 1.38 * upper_circ_hr
-
-
 def scan_full_orbit_secondary_eclipse(
     t: np.ndarray,
     flat_f: np.ndarray,
@@ -148,7 +171,7 @@ def scan_full_orbit_secondary_eclipse(
     Applies Sidak-Bonferroni trials-factor correction for alpha = 0.001 false-alarm rate.
     Returns: (is_eb_flag, max_sec_snr, max_sec_depth_ppm, best_sec_phase, z_crit_threshold)
     """
-    phase_0to1 = ((t - t0) % period) / period
+    phase_0to1 = fold_phase_0to1(t, t0, period)
     dur_phase = dur / period
     min_phi = max(0.06, 1.6 * dur_phase)
     
@@ -198,10 +221,61 @@ def scan_full_orbit_secondary_eclipse(
     return is_eb, max_snr, max_depth_ppm, best_phi, z_crit
 
 
+# C8 / SCI-69, ARGON_DECISIONS item 31.1: the accepted Cp full-orbit rule is the only Pleiades
+# EB decision. scan_full_orbit_secondary_eclipse above is kept as a diagnostic (raw depth,
+# d_sec/d_prim, SNR, phase); its flag decides nothing.
+SEC_EB_DECISION_RULE = "cp_full_orbit_item_31.1"
+CP_DISCOVERY_PATH_MARKER = "ODD_EVEN_V2_EXPERIMENTAL"  # aldebaran.py candidate rows from the v2 (Cp) path
+SEC_DIAGNOSTIC_FIELDS = (
+    "sec_eb_decision_rule", "sec_cp_is_eb", "sec_cp_snr_sigma", "sec_cp_depth_ppm", "sec_cp_phase",
+    "sec_cp_z_crit", "sec_raw_depth_ppm", "sec_raw_depth_ratio", "sec_raw_rule_is_eb",
+    "sec_discovery_is_eb", "sec_discovery_decision_source", "sec_stage_disagreement",
+)
+
+
+def cp_secondary_scan():
+    """Return the detector's Cp scan, so both stages run one copy of the rule.
+
+    Imported on first use: importing pleiades must not run aldebaran's import-time setup.
+    """
+    from aldebaran import _scan_full_orbit_secondary_eclipse_cp
+    return _scan_full_orbit_secondary_eclipse_cp
+
+
+def _parse_bool_field(value):
+    if isinstance(value, (bool, np.bool_)):
+        return bool(value)
+    if isinstance(value, str) and value.strip().lower() in ("true", "false"):
+        return value.strip().lower() == "true"
+    return None
+
+
+def discovery_secondary_decision(cand_row: dict) -> tuple:
+    """Discovery-stage Cp secondary EB decision for sec_stage_disagreement, with its source.
+
+    Returns (True/False, source) only when the row proves a Cp decision:
+    - an explicit boolean `discovery_sec_cp_eb` is used as given;
+    - a Tier-1 report row with odd_even_method ODD_EVEN_V2_EXPERIMENTAL was vetted on the
+      detector's Cp path (that path, and only it, uses the Cp secondary scan), and a positive
+      secondary decision ends the peak before any candidate is written, so it is not EB.
+    Otherwise (legacy or unproven provenance) the discovery Cp decision is unknown: (None, source).
+    Passing the legacy secondary gate does not prove passing the Cp rule.
+    """
+    explicit = _parse_bool_field(cand_row.get("discovery_sec_cp_eb"))
+    if explicit is not None:
+        return explicit, "row_field_discovery_sec_cp_eb"
+    if str(cand_row.get("odd_even_method", "")).strip() == CP_DISCOVERY_PATH_MARKER:
+        return False, "cp_path_report_candidate"
+    return None, "unknown_discovery_cp_decision"
+
+
 def check_binary_catalogs(ra: float, dec: float) -> dict:
     """
     Cross-matches target against VizieR TESS Eclipsing Binary Catalogue (Prša et al. 2022)
     and Gaia DR3 Non-Single Star (NSS) Two-Body Orbit Table.
+
+    C1f (item 29): a query that raised is listed in "catalog_check_failures" as not evaluated;
+    its flag keeps the default only as a placeholder and must not be read as "no match".
     """
     res = {
         "is_tess_eb": False,
@@ -209,7 +283,8 @@ def check_binary_catalogs(ra: float, dec: float) -> dict:
         "tess_eb_period": None,
         "is_gaia_nss": False,
         "gaia_nss_type": None,
-        "gaia_nss_period": None
+        "gaia_nss_period": None,
+        "catalog_check_failures": [],
     }
     # 1. VizieR TESS Eclipsing Binary Catalogue (Prša et al. 2022, ApJS, 258, 16)
     try:
@@ -220,8 +295,8 @@ def check_binary_catalogs(ra: float, dec: float) -> dict:
             res["is_tess_eb"] = True
             res["tess_eb_tic"] = str(v_res[0]["TIC"][0])
             res["tess_eb_period"] = safe_float(v_res[0]["Per"][0], None)
-    except Exception:
-        pass
+    except Exception as exc:
+        res["catalog_check_failures"].append(_catalog_failure("TESS_EB_QUERY", exc))
 
     # 2. Gaia DR3 Non-Single Star (NSS) Two-Body Orbit Table
     try:
@@ -241,9 +316,16 @@ def check_binary_catalogs(ra: float, dec: float) -> dict:
                 res["is_gaia_nss"] = True
                 res["gaia_nss_type"] = sol
                 res["gaia_nss_period"] = safe_float(df_nss["period"].iloc[0], None)
-    except Exception:
-        pass
+    except (requests.exceptions.SSLError, ssl.SSLError):
+        raise
+    except Exception as exc:
+        res["catalog_check_failures"].append(_catalog_failure("GAIA_NSS_QUERY", exc))
     return res
+
+
+def _catalog_failure(check: str, exc: BaseException) -> str:
+    """One not-evaluated catalog check, as recorded in the vetting record (C1f)."""
+    return f"{check}: {type(exc).__name__}: {str(exc)}"[:200]
 
 
 def tukey_biweight_detrend(t: np.ndarray, f: np.ndarray, window_days: float = 0.75, mask: np.ndarray = None) -> np.ndarray:
@@ -346,8 +428,12 @@ def query_gaia_contamination(tic_id: str, depth_ppm: float) -> dict:
     info = {
         "n_neighbors": 0, "contamination_ratio": 0.0, "neb_capable_stars": 0, "target_gmag": np.nan, "ruwe": np.nan,
         "is_tess_eb": False, "tess_eb_tic": None, "tess_eb_period": None,
-        "is_gaia_nss": False, "gaia_nss_type": None, "gaia_nss_period": None
+        "is_gaia_nss": False, "gaia_nss_type": None, "gaia_nss_period": None,
+        "catalog_check_failures": [],
     }
+    # C1f (item 29): an exception is recorded as a not-evaluated check, never read as a clean result.
+    # A query that succeeds with no row keeps the defaults, as before.
+    stage = "TIC_QUERY"
     try:
         tic_data = Catalogs.query_criteria(catalog="Tic", ID=int(tic_id))
         if len(tic_data) == 0:
@@ -355,11 +441,14 @@ def query_gaia_contamination(tic_id: str, depth_ppm: float) -> dict:
         row = tic_data[0]
         ra = float(to_numpy(row["ra"]))
         dec = float(to_numpy(row["dec"]))
-        
+
         # Cross-match against VizieR TESS EB & Gaia DR3 NSS binary tables
         bin_cats = check_binary_catalogs(ra, dec)
+        bin_failures = bin_cats.pop("catalog_check_failures", [])
         info.update(bin_cats)
-        
+        info["catalog_check_failures"].extend(bin_failures)
+        stage = "GAIA_NEIGHBOUR_QUERY"
+
         adql = (
             f"SELECT TOP 100 ra, dec, phot_g_mean_mag, ruwe, "
             f"DISTANCE(POINT('ICRS', ra, dec), POINT('ICRS', {ra}, {dec}))*3600.0 AS sep_arcsec "
@@ -401,9 +490,64 @@ def query_gaia_contamination(tic_id: str, depth_ppm: float) -> dict:
                 
         info["contamination_ratio"] = rel_flux_total
         info["neb_capable_stars"] = neb_capable
-    except Exception:
-        pass
+    except (requests.exceptions.SSLError, ssl.SSLError):
+        raise
+    except Exception as exc:
+        skipped = (" (TESS EB, Gaia NSS and Gaia neighbour checks not run)"
+                   if stage == "TIC_QUERY" else "")
+        info["catalog_check_failures"].append(_catalog_failure(stage, exc) + skipped)
     return info
+
+
+def _parse_known_transit_masks(cand_row: dict) -> list:
+    """SCI-09: extract known-transit mask list from cand_row ('known_transits' or 'known_transit_masks_json')."""
+    raw = cand_row.get("known_transits")
+    if isinstance(raw, list):
+        return raw
+    raw_json = cand_row.get("known_transit_masks_json")
+    if isinstance(raw_json, str) and raw_json.strip():
+        try:
+            parsed = json.loads(raw_json)
+            if isinstance(parsed, list):
+                return parsed
+        except Exception:
+            pass
+    return []
+
+
+def _is_commensurate_period(p1: float, p2: float, tol: float = 0.02) -> bool:
+    """ARGON_DECISIONS item 28.3: return True if p1 and p2 are commensurate (k:1 or 1:k for any integer k >= 1)."""
+    if not (np.isfinite(p1) and np.isfinite(p2) and p1 > 0 and p2 > 0):
+        return True
+    ratio = max(float(p1), float(p2)) / min(float(p1), float(p2))
+    k = int(round(ratio))
+    return k >= 1 and abs(ratio - k) / k <= tol
+
+
+def _compute_known_transit_mask(
+    times: np.ndarray,
+    known_transits: list,
+    candidate_period: float = None,
+) -> np.ndarray:
+    """SCI-09 & item 28.3: compute boolean mask (|phase| <= 1.0 * duration) for non-commensurate known transits."""
+    t_arr = np.asarray(times, dtype=float)
+    mask = np.zeros(len(t_arr), dtype=bool)
+    if not known_transits or len(t_arr) == 0:
+        return mask
+    for kp in known_transits:
+        try:
+            pk = float(kp["period"])
+            t0k = float(kp["t0"])
+            durk = float(kp["duration"])
+        except Exception:
+            continue
+        if not (np.isfinite(pk) and pk > 0 and np.isfinite(t0k) and np.isfinite(durk) and durk > 0):
+            continue
+        if candidate_period is not None and _is_commensurate_period(float(candidate_period), pk):
+            continue
+        phk = ((t_arr - t0k + 0.5 * pk) % pk) - 0.5 * pk
+        mask |= (np.abs(phk) <= (1.0 * durk))
+    return mask
 
 
 def deep_vet_target(cand_row: dict, vet_dir: str = None) -> dict | None:
@@ -412,11 +556,13 @@ def deep_vet_target(cand_row: dict, vet_dir: str = None) -> dict | None:
     tic_id = str(int(cand_row["tic_id"]))
     p_init = safe_float(cand_row.get("period_days"), 5.0)
     t0_init = safe_float(cand_row.get("t0_btjd"), 3500.0)
-    dur_init = safe_float(cand_row.get("duration_hours"), 2.5) / 24.0
+    dur_init = hours_to_days(safe_float(cand_row.get("duration_hours"), 2.5))
     r_star = safe_float(cand_row.get("r_star_sun"), 1.0)
     m_star = safe_float(cand_row.get("m_star_sun"), r_star ** 1.1)
     teff = safe_float(cand_row.get("teff_k"), 5500.0)
-    depth_init_ppm = safe_float(cand_row.get("depth_ppm"), 1000.0)
+    depth_init_ppm = number(cand_row.get("depth_ppm"))
+    if not depth_init_ppm > 0:
+        raise ValueError("Missing positive Tier-1 photometric depth; no 1000ppm default")
     
     print(f"\n======================================================================")
     print(f"PLEIADES DEEP SCIENTIFIC VETTING {PIPELINE_VERSION}: TIC {tic_id} (Initial P = {p_init:.5f} d)")
@@ -431,9 +577,14 @@ def deep_vet_target(cand_row: dict, vet_dir: str = None) -> dict | None:
     sectors_used = [int(str(s).split()[-1]) for s in use_search.mission]
     print(f"[1/4] Downloading & stitching Sectors {sectors_used} with Tukey Biweight detrender...")
     
+    known_transits = [
+        kp for kp in _parse_known_transit_masks(cand_row)
+        if kp.get("period") is not None and not _is_commensurate_period(p_init, float(kp["period"]))
+    ]
     t_all, f_all = [], []
     for s_item in use_search:
         lc = s_item.download()
+        _record_pleiades_mast_product(lc, tic_id, vet_dir)
         t_sec = to_numpy(lc.time)
         f_sec = to_numpy(lc.flux)
         qual = np.asarray(lc.quality, dtype=int) if (hasattr(lc, "quality") and lc.quality is not None) else np.zeros_like(t_sec, dtype=int)
@@ -441,9 +592,14 @@ def deep_vet_target(cand_row: dict, vet_dir: str = None) -> dict | None:
         t_sec, f_sec = t_sec[valid], f_sec[valid]
         f_sec = f_sec / np.nanmedian(f_sec)
         
-        phase_sec = ((t_sec - t0_init + 0.5 * p_init) % p_init) - 0.5 * p_init
-        tr_mask = np.abs(phase_sec) < (0.65 * dur_init)
+        phase_sec = fold_phase_centered(t_sec, t0_init, p_init, in_days=True)
+        in_known_sec = _compute_known_transit_mask(t_sec, known_transits, candidate_period=p_init)
+        tr_mask = (np.abs(phase_sec) < (0.65 * dur_init)) | in_known_sec
         f_flat = tukey_biweight_detrend(t_sec, f_sec, window_days=0.75, mask=tr_mask)
+
+        if np.any(in_known_sec) and np.any(~in_known_sec):
+            t_sec = t_sec[~in_known_sec]
+            f_flat = f_flat[~in_known_sec]
         
         t_all.append(t_sec)
         f_all.append(f_flat)
@@ -467,7 +623,7 @@ def deep_vet_target(cand_row: dict, vet_dir: str = None) -> dict | None:
     t0_ref = float(bls_res.transit_time[best_idx])
     dur_ref = float(bls_res.duration[best_idx])
     
-    phase = ((t - t0_ref + 0.5 * p_ref) % p_ref) - 0.5 * p_ref
+    phase = fold_phase_centered(t, t0_ref, p_ref, in_days=True)
     
     print(f"[2/4] Fitting 300-Ring Annular Limb-Darkened Transit Model (Teff={teff:.0f} K, R*={r_star:.2f} R_Sun)...")
     u1_est = float(np.clip(0.45 - 0.00008 * (teff - 5500.0), 0.15, 0.70))
@@ -483,12 +639,13 @@ def deep_vet_target(cand_row: dict, vet_dir: str = None) -> dict | None:
     nom_max_dur_hr, min_kepler_dur_hr, max_kepler_dur_hr = compute_keplerian_duration_bounds_hours(
         p_ref, r_star, e_r_star, m_star, e_m_star, rp_rs_guess
     )
-    upper_dur_bound = max(dur_ref * 0.7, min(dur_ref * 1.6, max_kepler_dur_hr / 24.0))
-    lower_dur_bound = max(0.005, min(dur_ref * 0.5, min_kepler_dur_hr / 24.0))
+    upper_dur_bound = max(dur_ref * 0.7, min(dur_ref * 1.6, hours_to_days(max_kepler_dur_hr)))
+    lower_dur_bound = max(0.005, min(dur_ref * 0.5, hours_to_days(min_kepler_dur_hr)))
     
     def model_to_fit(ph, rp_rs, b, dur_t):
         return exact_annulus_transit_model(ph, rp_rs, b, dur_t, u1_est, u2_est)
         
+    fit_converged, fit_error = False, ""
     try:
         p0_dur = np.clip(dur_ref, lower_dur_bound * 1.05, upper_dur_bound * 0.98)
         popt, _ = curve_fit(
@@ -500,17 +657,38 @@ def deep_vet_target(cand_row: dict, vet_dir: str = None) -> dict | None:
             maxfev=6000
         )
         rp_rs_fit, b_fit, dur_fit = float(popt[0]), float(popt[1]), float(popt[2])
-    except Exception:
+        if not np.all(np.isfinite(popt)) or rp_rs_fit <= 0 or dur_fit <= 0:
+            raise ValueError("Nonfinite or nonphysical fitted parameters")
+        fit_converged = True
+    except Exception as exc:
+        fit_error = type(exc).__name__ + ": " + str(exc)
         rp_rs_fit, b_fit, dur_fit = rp_rs_guess, 0.5, dur_ref
+    # Legacy fallback is retained for diagnostics/unchanged vetting, never labelled a fit.
+    depth_fields = fit_depth_fields(
+        rp_rs_fit, model_to_fit(np.array([0.0]), rp_rs_fit, b_fit, dur_fit)[0],
+        depth_init_ppm, fit_converged, fit_error)
+    depth_fields["stellar_parameter_provenance"] = (
+        "input_host_parameters" if all(number(cand_row.get(k)) > 0
+        for k in ("r_star_sun", "m_star_sun", "teff_k")) else "initial_model_assumptions_present")
         
     true_rp_earth = r_star * rp_rs_fit * 109.076
-    dur_ratio_kepler = (dur_fit * 24.0) / max(nom_max_dur_hr, 0.1)
+    dur_ratio_kepler = (days_to_hours(dur_fit)) / max(nom_max_dur_hr, 0.1)
     
     print(f"[3/4] Scanning Full-Orbit Secondary Eclipse across all out-of-transit phases...")
-    is_sec_eb, sec_snr, sec_depth_ppm, sec_phi, z_crit = scan_full_orbit_secondary_eclipse(
+    # Decision: Cp rule only (item 31.1). Same inputs as the diagnostic scan below.
+    cp_is_eb, cp_sec_snr, cp_sec_depth_ppm, cp_sec_phi, cp_z_crit = cp_secondary_scan()(
+        t, f, p_ref, t0_ref, dur_fit, depth_init_ppm
+    )
+    is_sec_eb = bool(cp_is_eb)
+    # Diagnostic only: raw single-maximum scan. Its SNR and phase still feed the VPS
+    # secondary-significance component unchanged; its flag is persisted but decides nothing.
+    raw_sec_is_eb, sec_snr, sec_depth_ppm, sec_phi, z_crit = scan_full_orbit_secondary_eclipse(
         t, f, p_ref, t0_ref, dur_fit, depth_init_ppm
     )
     sec_center_phi = sec_phi if np.isfinite(sec_phi) else 0.5
+    discovery_sec_is_eb, discovery_sec_source = discovery_secondary_decision(cand_row)
+    # Unknown discovery Cp decision -> unknown disagreement, never a definite flag.
+    sec_stage_disagreement = None if discovery_sec_is_eb is None else bool(is_sec_eb != discovery_sec_is_eb)
     
     print(f"[4/4] Querying Gaia DR3 neighborhood, NSS two-body & VizieR TESS EB catalogs...")
     gaia_contam = query_gaia_contamination(tic_id, depth_init_ppm)
@@ -553,11 +731,11 @@ def deep_vet_target(cand_row: dict, vet_dir: str = None) -> dict | None:
         and stitched_primary_snr >= 5.5
     )
     if gaia_contam.get("is_tess_eb"):
-        disposition = f"CATALOG MATCH: TESS EB (possible false-positive flag; TIC {gaia_contam.get('tess_eb_tic')})"
+        disposition = tess_eb_disposition(gaia_contam)
     elif is_sec_eb:
-        disposition = f"SECONDARY-ECLIPSE FLAG: possible eccentric EB (Phase {sec_center_phi:.2f}, {sec_snr:.1f} sigma)"
+        disposition = secondary_disposition(cp_sec_phi, cp_sec_snr)
     elif gaia_contam.get("is_gaia_nss"):
-        disposition = f"GAIA NSS MATCH / DUAL-STAR SYSTEM FLAG ({gaia_contam.get('gaia_nss_type')})"
+        disposition = nss_disposition(gaia_contam)
     elif dur_ratio_kepler < 0.35:
         disposition = "SUSPECT / UNPHYSICALLY NARROW TRANSIT"
     elif dur_ratio_kepler > 1.38:
@@ -566,21 +744,44 @@ def deep_vet_target(cand_row: dict, vet_dir: str = None) -> dict | None:
         disposition = "TIER-2 HEURISTIC SCREEN PASS (candidate; no calibrated FP-risk estimate)"
     else:
         disposition = "SUSPECT / GRAZING OR CONTAMINATED"
-    
-    print(f"      -> Fitted Radius: Rp = {true_rp_earth:.2f} R_Earth (Rp/R* = {rp_rs_fit:.4f})")
-    print(f"      -> Impact Parameter: b = {b_fit:.3f} | Duration / Nom_Kepler = {dur_ratio_kepler:.2f}")
+
+    # S3.10 (item 39.1, 39.2): a failed fit is not an operational error. Nothing built on the
+    # initial guesses is published; only a negative flag that does not need the fit is kept.
+    if not fit_converged:
+        depth_fields["fit_status"] = FIT_STATUS_FAILED
+        disposition = fit_failed_disposition(gaia_contam, is_sec_eb, cp_sec_phi, cp_sec_snr)
+    # C1f (item 29, item 39.3): a catalog query that did not run ends operational_status ERROR with no
+    # disposition and no VPS score; the VPS contract and merge_shards refuse it until it is rerun.
+    catalog_failures = list(gaia_contam.get("catalog_check_failures", []))
+    error_message = ""
+    if catalog_failures:
+        error_message = "NOT_EVALUATED: " + "; ".join(catalog_failures)
+        disposition = "ERROR (" + error_message + ")"
+    # S3.9 round 2: the console and the dossier show the same evaluated / not-evaluated state as the record.
+    not_shown = catalog_failures + ([f"TRANSIT_FIT: {fit_error}"[:200]] if not fit_converged else [])
+    ne = not_evaluated_checks(not_shown)
+    show = display_fields(gaia_contam, ne, vps_score, rp_rs_fit, true_rp_earth, b_fit)
+
+    print(f"      -> Radius (fit={fit_converged}, fallback explicitly flagged): Rp = {show['rp_console']} (Rp/R* = {show['rp_rs']})")
+    print(f"      -> Impact Parameter: b = {show['b']} | Duration / Nom_Kepler = {dur_ratio_kepler:.2f}")
     print(f"      -> Secondary Eclipse: Depth = {sec_depth_ppm:.0f} ppm at Phase {sec_center_phi:.2f} (SNR = {sec_snr:.2f} sigma)")
-    print(f"      -> Gaia DR3 Neighbors (120\"): {gaia_contam['n_neighbors']} stars | Contamination = {gaia_contam['contamination_ratio']*100:.2f}%")
+    print(f"      -> Cp EB decision: {is_sec_eb} (Phase {cp_sec_phi:.2f}, {cp_sec_snr:.2f} sigma, z_crit {cp_z_crit:.2f}); "
+          f"discovery {discovery_sec_is_eb} ({discovery_sec_source}); stage disagreement {sec_stage_disagreement}")
+    print(f"      -> Gaia DR3 Neighbors (120\"): {show['neighbours_console']}")
+    if ne["tess_eb"]:
+        print("      -> [!] VizieR TESS EB check: NOT_EVALUATED")
+    if ne["gaia_nss"]:
+        print("      -> [!] Gaia NSS check: NOT_EVALUATED")
     if gaia_contam.get("is_tess_eb"):
         print(f"      -> [!] VizieR TESS EB Match: TIC {gaia_contam.get('tess_eb_tic')} (P={gaia_contam.get('tess_eb_period')} d)")
     if gaia_contam.get("is_gaia_nss"):
         print(f"      -> [!] Gaia NSS Two-Body Orbit: {gaia_contam.get('gaia_nss_type')} (P={gaia_contam.get('gaia_nss_period')} d)")
-    print(f"      -> Vetting Penalty Score (VPS): {vps_score:.1f} (Pleiades Clean Criterion < {PLEIADES_CLEAN_VPS_THRESHOLD:.1f}) -> {disposition}")
+    print(f"      -> Vetting Penalty Score (VPS): {show['vps']} ({PLEIADES_CLEAN_GATE_LABEL}; heuristic points, not a probability) -> {disposition}")
     
     fig, axes = plt.subplots(2, 2, figsize=(15, 10))
     
     ph_grid = np.linspace(-2.2 * dur_fit, 2.2 * dur_fit, 500)
-    axes[0, 0].scatter(ph_fit * 24.0, f_fit, s=3, color="silver", alpha=0.35, label="Tukey Biweight Cadences")
+    axes[0, 0].scatter(days_to_hours(ph_fit), f_fit, s=3, color="silver", alpha=0.35, label="Tukey Biweight Cadences")
     bins = np.linspace(-2.2 * dur_fit, 2.2 * dur_fit, 35)
     b_means, b_edges, _ = stats.binned_statistic(ph_fit, f_fit, statistic="mean", bins=bins)
     b_std, _, _ = stats.binned_statistic(ph_fit, f_fit, statistic="std", bins=bins)
@@ -589,7 +790,7 @@ def deep_vet_target(cand_row: dict, vet_dir: str = None) -> dict | None:
     valid_b = b_cnt >= 3
     b_err = b_std[valid_b] / np.sqrt(b_cnt[valid_b])
     axes[0, 0].errorbar(
-        b_centers[valid_b] * 24.0,
+        days_to_hours(b_centers[valid_b]),
         b_means[valid_b],
         yerr=b_err,
         fmt="o",
@@ -601,12 +802,12 @@ def deep_vet_target(cand_row: dict, vet_dir: str = None) -> dict | None:
         label="Binned Photometry (±1σ)"
     )
     axes[0, 0].plot(
-        ph_grid * 24.0,
+        days_to_hours(ph_grid),
         model_to_fit(ph_grid, rp_rs_fit, b_fit, dur_fit),
         color="crimson",
         lw=2.5,
         zorder=5,
-        label=f"300-Ring Fit (b={b_fit:.2f}, Rp={true_rp_earth:.2f} R_E)"
+        label=f"300-Ring Model (fit={fit_converged}, {show['legend_fit']})"
     )
     # Focused Y-axis zoom on the transit feature to prevent noisy outliers from squishing the curve
     transit_depth = rp_rs_fit ** 2
@@ -623,10 +824,10 @@ def deep_vet_target(cand_row: dict, vet_dir: str = None) -> dict | None:
     axes[0, 0].set_title(f"TIC {tic_id}: Annular Limb-Darkened Transit Model (Sectors {sectors_used})")
     axes[0, 0].legend(loc="lower right")
     
-    phase_0to1 = ((t - t0_ref) % p_ref) / p_ref
-    sec_phase_diff = ((phase_0to1 - sec_center_phi + 0.5) % 1.0) - 0.5
+    phase_0to1 = fold_phase_0to1(t, t0_ref, p_ref)
+    sec_phase_diff = cyclic_orbital_distance(phase_0to1, sec_center_phi)
     sec_win = np.abs(sec_phase_diff) <= min(0.12, 3.0 * dur_fit / p_ref)
-    ph_sec_hrs = sec_phase_diff[sec_win] * p_ref * 24.0
+    ph_sec_hrs = days_to_hours(sec_phase_diff[sec_win] * p_ref)
     axes[0, 1].scatter(ph_sec_hrs, f[sec_win], s=3, color="silver", alpha=0.4)
     if len(ph_sec_hrs) > 20:
         s_bins = np.linspace(np.min(ph_sec_hrs), np.max(ph_sec_hrs), 25)
@@ -639,45 +840,48 @@ def deep_vet_target(cand_row: dict, vet_dir: str = None) -> dict | None:
     axes[0, 1].set_title(f"Secondary Eclipse Scan (Max Dip at Phase {sec_center_phi:.2f}: {sec_depth_ppm:.0f} ppm)")
     axes[0, 1].legend(loc="lower right")
     
-    orbit_nums = np.round((t - t0_ref) / p_ref).astype(int)
+    orbit_nums = compute_orbit_number(t, t0_ref, p_ref)
     in_tr_orbits = np.unique(orbit_nums[np.abs(phase) < (0.4 * dur_fit)])
     show_orbits = in_tr_orbits[:8]
     offset_step = max(0.003, 2.2 * (rp_rs_fit ** 2))
     for k, orb in enumerate(show_orbits):
         m_orb = (orbit_nums == orb) & (np.abs(phase) < (1.8 * dur_fit))
         if np.sum(m_orb) > 4:
-            axes[1, 0].plot(phase[m_orb] * 24.0, f[m_orb] - k * offset_step, "o-", ms=2.5, lw=1, alpha=0.8, label=f"Epoch #{orb}")
+            axes[1, 0].plot(days_to_hours(phase[m_orb]), f[m_orb] - k * offset_step, "o-", ms=2.5, lw=1, alpha=0.8, label=f"Epoch #{orb}")
     axes[1, 0].axvline(0.0, color="red", linestyle=":", alpha=0.6)
     axes[1, 0].set_xlabel("Time from Mid-Transit (hours)")
     axes[1, 0].set_ylabel("Flux + Vertical Offset")
     axes[1, 0].set_title(f"Individual Transit Consistency ({len(in_tr_orbits)} Total Transits)")
     
     axes[1, 1].axis("off")
-    ruwe_str = f"{gaia_contam['ruwe']:.3f}" if np.isfinite(gaia_contam["ruwe"]) else "N/A"
-    eb_match_str = f"TIC {gaia_contam.get('tess_eb_tic')} (P={gaia_contam.get('tess_eb_period', 'N/A')}d)" if gaia_contam.get("is_tess_eb") else "None"
-    nss_match_str = f"{gaia_contam.get('gaia_nss_type')} (P={gaia_contam.get('gaia_nss_period', 'N/A')}d)" if gaia_contam.get("is_gaia_nss") else "None"
     summary_text = (
         f"SCIENTIFIC VETTING DOSSIER: TIC {tic_id}\n"
         f"{'-'*48}\n"
         f"Disposition:       {disposition}\n"
-        f"Vetting Score VPS: {vps_score:.1f} / 100 (Pleiades Clean Criterion < {PLEIADES_CLEAN_VPS_THRESHOLD:.1f})\n\n"
+        f"Vetting Score VPS: {show['vps']} / 100 (uncalibrated heuristic)\n"
+        f"  Clean Gate:      Pleiades Clean Criterion < {PLEIADES_CLEAN_VPS_THRESHOLD:.1f}\n"
+        f"                   AND b < 0.82 AND sec_snr <= sec_snr_threshold AND not is_sec_eb\n"
+        f"                   AND not is_tess_eb AND not is_gaia_nss\n"
+        f"                   AND 0.35 <= dur_ratio <= 1.38 AND primary_snr >= 5.5\n\n"
         f"ORBITAL & PHYSICAL PARAMETERS (300-Ring Fit):\n"
         f"  Refined Period:  {p_ref:.6f} days\n"
         f"  Mid-Transit T0:  {t0_ref:.5f} BTJD\n"
-        f"  Transit Dur:     {dur_fit*24.0:.2f} h (Kepler Bounds: {min_kepler_dur_hr:.2f}h - {max_kepler_dur_hr:.2f}h)\n"
-        f"  Radius Ratio:    Rp/R* = {rp_rs_fit:.4f}\n"
-        f"  Planet Radius:   Rp = {true_rp_earth:.2f} R_Earth\n"
-        f"  Impact Param:    b = {b_fit:.3f} (0=central, >0.82=grazing)\n"
+        f"  Transit Dur:     {days_to_hours(dur_fit):.2f} h (Kepler Bounds: {min_kepler_dur_hr:.2f}h - {max_kepler_dur_hr:.2f}h)\n"
+        f"  Radius Ratio:    Rp/R* = {show['rp_rs']}\n"
+        f"  Fit converged:   {fit_converged} ({depth_fields['fit_status']})\n"
+        f"  Planet Radius:   Rp = {show['rp_dossier']}\n"
+        f"  Impact Param:    b = {show['b']} (0=central, >0.82=grazing)\n"
         f"  Limb Darkening:  u1 = {u1_est:.2f}, u2 = {u2_est:.2f} (Teff={teff:.0f} K)\n\n"
         f"FALSE POSITIVE FALSIFICATION TESTS:\n"
         f"  Secondary Ecl:   {sec_depth_ppm:.0f} ppm ({sec_snr:.2f} sigma at Phase {sec_center_phi:.2f})\n"
-        f"  TESS EB Match:   {eb_match_str}\n"
-        f"  Gaia NSS Orbit:  {nss_match_str}\n"
+        f"  Cp EB Decision:  {is_sec_eb} (stage disagreement: {sec_stage_disagreement})\n"
+        f"  TESS EB Match:   {show['eb_match']}\n"
+        f"  Gaia NSS Orbit:  {show['nss_match']}\n"
         f"  Odd/Even Diff:   {cand_row.get('odd_even_sigma', 'N/A')} sigma\n"
         f"  Centroid Shift:  {cand_row.get('centroid_shift_arcsec', 'N/A')} arcsec\n"
-        f"  Gaia DR3 RUWE:   {ruwe_str}\n"
-        f"  Gaia Neighbors:  {gaia_contam['n_neighbors']} within 120\" (Contam: {gaia_contam['contamination_ratio']*100:.2f}%)\n"
-        f"  NEB-Capable:     {gaia_contam['neb_capable_stars']} nearby stars"
+        f"  Gaia DR3 RUWE:   {show['ruwe']}\n"
+        f"  Gaia Neighbors:  {show['neighbours_dossier']}\n"
+        f"  NEB-Capable:     {show['neb']}"
     )
     axes[1, 1].text(0.03, 0.95, summary_text, transform=axes[1, 1].transAxes, fontsize=10.2,
                     verticalalignment="top", fontfamily="monospace",
@@ -689,9 +893,10 @@ def deep_vet_target(cand_row: dict, vet_dir: str = None) -> dict | None:
     plt.savefig(out_img, dpi=160)
     plt.close(fig)
     
-    return {
+    record = {
         "tic_id": tic_id,
         "operational_status": "SUCCESS",
+        **depth_fields,
         "disposition": disposition,
         "vps_version": VPS_SCHEMA_VERSION,
         "vps_producer": VPS_PRODUCER_NAME,
@@ -710,13 +915,25 @@ def deep_vet_target(cand_row: dict, vet_dir: str = None) -> dict | None:
         "refined_period_days": round(p_ref, 6),
         "refined_t0_btjd": round(t0_ref, 5),
         "fitted_depth_ppm": round((rp_rs_fit ** 2) * 1e6, 1),
-        "fitted_duration_hours": round(dur_fit * 24.0, 2),
+        "fitted_duration_hours": round(days_to_hours(dur_fit), 2),
         "fitted_rp_earth": round(true_rp_earth, 2),
         "impact_param_b": round(b_fit, 3),
         "dur_to_kepler_max": round(dur_ratio_kepler, 2),
         "stitched_primary_snr": round(stitched_primary_snr, 2),
         "secondary_snr_sigma": round(sec_snr, 2),
         "sec_eclipse_phase": round(sec_center_phi, 3),
+        "sec_eb_decision_rule": SEC_EB_DECISION_RULE,
+        "sec_cp_is_eb": is_sec_eb,
+        "sec_cp_snr_sigma": round(float(cp_sec_snr), 2),
+        "sec_cp_depth_ppm": round(float(cp_sec_depth_ppm), 1),
+        "sec_cp_phase": round(float(cp_sec_phi), 3),
+        "sec_cp_z_crit": round(float(cp_z_crit), 3),
+        "sec_raw_depth_ppm": round(float(sec_depth_ppm), 1),
+        "sec_raw_depth_ratio": round(float(sec_depth_ppm) / depth_init_ppm, 4),
+        "sec_raw_rule_is_eb": bool(raw_sec_is_eb),
+        "sec_discovery_is_eb": discovery_sec_is_eb,
+        "sec_discovery_decision_source": discovery_sec_source,
+        "sec_stage_disagreement": sec_stage_disagreement,
         "is_known_tess_eb": gaia_contam.get("is_tess_eb", False),
         "gaia_nss_type": gaia_contam.get("gaia_nss_type"),
         "flux_contam_percent": round(gaia_contam["contamination_ratio"] * 100, 2),
@@ -724,14 +941,223 @@ def deep_vet_target(cand_row: dict, vet_dir: str = None) -> dict | None:
         "sectors_stitched": ",".join(str(s) for s in sectors_used),
         "error_message": ""
     }
+    if not fit_converged:
+        mark_record_fit_failed(record)
+    if catalog_failures:
+        mark_record_not_evaluated(record, catalog_failures, error_message)
+    return record
+
+
+FIT_STATUS_FAILED = "FAILED"
+INCOMPLETE_FIT_FAILED = "INCOMPLETE_FIT_FAILED"
+# Columns computed from the transit fit; after a failed fit they would hold the initial guesses.
+FIT_DERIVED_FIELDS = ("fitted_depth_ppm", "fitted_duration_hours", "fitted_rp_earth",
+                      "impact_param_b", "dur_to_kepler_max")
+# ARGON_DECISIONS item 41 (option A), owner approved 2026-11-13: a VizieR TESS EB or Gaia NSS match
+# found by an answered query does not depend on the fit, so it stays the rejecting disposition after a
+# failed fit, in the order of the converged branch. False would keep the match only in
+# is_known_tess_eb / gaia_nss_type.
+FIT_FAILED_KEEPS_CATALOG_FLAGS = True
+
+
+def tess_eb_disposition(gaia_contam: dict) -> str:
+    return f"CATALOG MATCH: TESS EB (possible false-positive flag; TIC {gaia_contam.get('tess_eb_tic')})"
+
+
+def secondary_disposition(cp_sec_phi: float, cp_sec_snr: float) -> str:
+    cp_zone = "circular" if abs(cp_sec_phi - 0.50) <= 0.04 else "eccentric"
+    return f"SECONDARY-ECLIPSE FLAG: possible {cp_zone} EB (Phase {cp_sec_phi:.2f}, {cp_sec_snr:.1f} sigma)"
+
+
+def nss_disposition(gaia_contam: dict) -> str:
+    return f"GAIA NSS MATCH / DUAL-STAR SYSTEM FLAG ({gaia_contam.get('gaia_nss_type')})"
+
+
+def fit_failed_disposition(gaia_contam: dict, is_sec_eb: bool, cp_sec_phi: float, cp_sec_snr: float,
+                           keep_catalog_flags: bool = None) -> str:
+    """Disposition after a failed transit fit (item 39.1, 39.2), in the order of the converged branch.
+
+    The Cp secondary-eclipse flag stays the rejecting disposition. The duration flags, SUSPECT / GRAZING
+    and the heuristic pass are built on the initial guesses and are never published.
+    """
+    if keep_catalog_flags is None:
+        keep_catalog_flags = FIT_FAILED_KEEPS_CATALOG_FLAGS
+    if keep_catalog_flags and gaia_contam.get("is_tess_eb"):
+        return tess_eb_disposition(gaia_contam)
+    if is_sec_eb:
+        return secondary_disposition(cp_sec_phi, cp_sec_snr)
+    if keep_catalog_flags and gaia_contam.get("is_gaia_nss"):
+        return nss_disposition(gaia_contam)
+    return INCOMPLETE_FIT_FAILED
+
+
+def mark_record_fit_failed(record: dict) -> None:
+    """Failed fit (item 39.1): no VPS score and no guess-based fit column; fit_status FAILED is kept."""
+    record.update({
+        "vps_version": "", "vps_score": None, "fp_risk_percent": None,
+        "vps_unclipped_total": None, "vps_ledger_json": "", "vps_clean_criterion": "",
+    })
+    for key in FIT_DERIVED_FIELDS:
+        record[key] = float("nan")
+
+
+def mark_record_not_evaluated(record: dict, not_evaluated: list, error_message: str) -> None:
+    """Turn a vetting record whose checks did not all run into an explicit ERROR record (C1f, SCI-14).
+
+    No disposition and no VPS score are published, as for the CLI ERROR record. Fields whose check
+    did not run are blanked; measured fields (ephemeris, secondary scan, fit diagnostics) are kept.
+    """
+    record["operational_status"] = "ERROR"
+    record["disposition"] = None
+    record["error_message"] = error_message
+    record.update({
+        "vps_version": "", "vps_score": float("nan"), "fp_risk_percent": float("nan"),
+        "vps_unclipped_total": float("nan"), "vps_ledger_json": "", "vps_clean_criterion": "",
+    })
+    ne = not_evaluated_checks(not_evaluated)
+    if ne["tess_eb"]:
+        record["is_known_tess_eb"] = None
+    if ne["gaia_nss"]:
+        record["gaia_nss_type"] = None
+    if ne["neighbours"]:
+        record["flux_contam_percent"] = float("nan")
+        record["neb_capable_neighbors"] = float("nan")
+
+
+NOT_EVALUATED = "NOT_EVALUATED"
+
+
+def not_evaluated_checks(not_evaluated: list) -> dict:
+    """Which Pleiades checks did not run, from the NOT_EVALUATED list (a failed TIC query skips all three)."""
+    names = {item.split(":", 1)[0] for item in not_evaluated}
+    tic = "TIC_QUERY" in names
+    return {
+        "any": bool(names),
+        "tess_eb": tic or "TESS_EB_QUERY" in names,
+        "gaia_nss": tic or "GAIA_NSS_QUERY" in names,
+        "neighbours": tic or "GAIA_NEIGHBOUR_QUERY" in names,
+        "fit": "TRANSIT_FIT" in names,
+    }
+
+
+def display_fields(gaia_contam: dict, ne: dict, vps_score, rp_rs_fit, true_rp_earth, b_fit) -> dict:
+    """Console and dossier text of the score, catalog and fit fields (S3.9 round 2).
+
+    A check that ran shows its value exactly as before; a check that did not run, and the VPS score of
+    a record with any not-evaluated check, show NOT_EVALUATED. Fit fields of a failed fit name the guess.
+    """
+    show = {"vps": NOT_EVALUATED if ne["any"] else f"{vps_score:.1f}"}
+    if ne["tess_eb"]:
+        show["eb_match"] = NOT_EVALUATED
+    elif gaia_contam.get("is_tess_eb"):
+        show["eb_match"] = f"TIC {gaia_contam.get('tess_eb_tic')} (P={gaia_contam.get('tess_eb_period', 'N/A')}d)"
+    else:
+        show["eb_match"] = "None"
+    if ne["gaia_nss"]:
+        show["nss_match"] = NOT_EVALUATED
+    elif gaia_contam.get("is_gaia_nss"):
+        show["nss_match"] = f"{gaia_contam.get('gaia_nss_type')} (P={gaia_contam.get('gaia_nss_period', 'N/A')}d)"
+    else:
+        show["nss_match"] = "None"
+    if ne["neighbours"]:
+        for key in ("ruwe", "neighbours_console", "neighbours_dossier", "neb"):
+            show[key] = NOT_EVALUATED
+    else:
+        show["ruwe"] = f"{gaia_contam['ruwe']:.3f}" if np.isfinite(gaia_contam["ruwe"]) else "N/A"
+        show["neighbours_console"] = (f"{gaia_contam['n_neighbors']} stars | "
+                                      f"Contamination = {gaia_contam['contamination_ratio']*100:.2f}%")
+        show["neighbours_dossier"] = (f"{gaia_contam['n_neighbors']} within 120\" "
+                                      f"(Contam: {gaia_contam['contamination_ratio']*100:.2f}%)")
+        show["neb"] = f"{gaia_contam['neb_capable_stars']} nearby stars"
+    if ne["fit"]:
+        show["rp_rs"] = f"{NOT_EVALUATED} (initial guess {rp_rs_fit:.4f})"
+        show["rp_console"] = f"{NOT_EVALUATED} (initial guess {true_rp_earth:.2f} R_Earth)"
+        show["rp_dossier"] = show["rp_console"]
+        show["b"] = f"{NOT_EVALUATED} (initial guess {b_fit:.3f})"
+        show["legend_fit"] = f"initial guess b={b_fit:.2f}, Rp={true_rp_earth:.2f} R_E, {NOT_EVALUATED}"
+    else:
+        show["rp_rs"] = f"{rp_rs_fit:.4f}"
+        show["rp_console"] = f"{true_rp_earth:.2f} R_Earth"
+        show["rp_dossier"] = f"{true_rp_earth:.2f} R_Earth"
+        show["b"] = f"{b_fit:.3f}"
+        show["legend_fit"] = f"b={b_fit:.2f}, Rp={true_rp_earth:.2f} R_E"
+    return show
+
+
+# S2.5 (IMPROVE-QUICK 002): every scientific_dossier_summary.csv row and the empty file share one header,
+# in the column order of the record that deep_vet_target returns.
+DEPTH_RECORD_FIELDS = (*fit_depth_fields(1.0, 1.0, 1.0, True), "stellar_parameter_provenance")
+PLEIADES_SUMMARY_COLS = (
+    "tic_id", "operational_status", *DEPTH_RECORD_FIELDS, "disposition",
+    "vps_version", "vps_producer", "vps_score", "fp_risk_percent",
+    "vps_unclipped_total", "vps_ledger_json", "sec_eclipse_zone",
+    "sec_snr_threshold", "sec_penalty_applied", "vps_clean_criterion",
+    "input_period_days", "input_t0_btjd", "input_depth_ppm", "input_duration_hours",
+    "refined_period_days", "refined_t0_btjd", "fitted_depth_ppm",
+    "fitted_duration_hours", "fitted_rp_earth", "impact_param_b",
+    "dur_to_kepler_max", "stitched_primary_snr", "secondary_snr_sigma",
+    "sec_eclipse_phase", *SEC_DIAGNOSTIC_FIELDS, "is_known_tess_eb", "gaia_nss_type",
+    "flux_contam_percent", "neb_capable_neighbors", "sectors_stitched",
+    "error_message",
+)
+
+
+def cli_failure_record(row, tic_val: str, operational_status: str, error_message: str) -> dict:
+    """NO_LIGHTCURVE or ERROR summary row of the CLI: every summary column, nothing evaluated.
+
+    Values are those the CLI wrote before S2.5. The depth-contract columns are blank, as pandas already
+    wrote them for such a row in a batch that also held a SUCCESS row; no fit value is filled in.
+    """
+    record = dict.fromkeys(PLEIADES_SUMMARY_COLS)
+    record.update({
+        "tic_id": tic_val,
+        "operational_status": operational_status,
+        "disposition": None,
+        "vps_version": "",
+        "vps_producer": VPS_PRODUCER_NAME,
+        "vps_score": float("nan"),
+        "fp_risk_percent": float("nan"),
+        "vps_unclipped_total": float("nan"),
+        "vps_ledger_json": "",
+        "sec_eclipse_zone": "",
+        "sec_snr_threshold": float("nan"),
+        "sec_penalty_applied": None,
+        "vps_clean_criterion": "",
+        "input_period_days": float(row.get("period_days", float("nan"))),
+        "input_t0_btjd": float(row.get("t0_btjd", float("nan"))),
+        "input_depth_ppm": float(row.get("depth_ppm", float("nan"))),
+        "input_duration_hours": float(row.get("duration_hours", float("nan"))),
+        "refined_period_days": float("nan"),
+        "refined_t0_btjd": float("nan"),
+        "fitted_depth_ppm": float("nan"),
+        "fitted_duration_hours": float("nan"),
+        "fitted_rp_earth": float("nan"),
+        "impact_param_b": float("nan"),
+        "dur_to_kepler_max": float("nan"),
+        "stitched_primary_snr": float("nan"),
+        "secondary_snr_sigma": float("nan"),
+        "sec_eclipse_phase": float("nan"),
+        "is_known_tess_eb": None,
+        "gaia_nss_type": None,
+        "flux_contam_percent": float("nan"),
+        "neb_capable_neighbors": float("nan"),
+        "sectors_stitched": "",
+        "error_message": error_message,
+    })
+    return record
 
 
 if __name__ == "__main__":
     import argparse
+    import run_identity as ri
     from vps_contract import VPS_PRODUCER_NAME
+    # the CLI block must run in an isolated namespace (test_merge_shards C1)
+    import pleiades as _pleiades_mod
+    from pleiades import PLEIADES_SUMMARY_COLS, cli_failure_record, sync_pleiades_mast_products
     parser = argparse.ArgumentParser(description=f"Pleiades Tier-2 Deep Vetting {PIPELINE_VERSION}")
     parser.add_argument("--input-csv", type=str, default=INPUT_CSV, help="Input candidates CSV report")
     parser.add_argument("--output-dir", type=str, default=VET_DIR, help="Output directory for vetting dossiers")
+    parser.add_argument("--resume", action="store_true", help="Resume an interrupted Pleiades run only when identity matches")
     args = parser.parse_args()
 
     input_csv = args.input_csv
@@ -742,104 +1168,99 @@ if __name__ == "__main__":
         sys.exit(1)
     else:
         os.makedirs(vet_dir, exist_ok=True)
+        here_dir = os.path.dirname(os.path.abspath(ri.__file__))
+        has_prior_outputs = any(
+            fn.startswith("pleiades_record_TIC_") or fn == "scientific_dossier_summary.csv"
+            for fn in os.listdir(vet_dir)
+        )
+        bound_run = ri.BoundRun.open_or_resume(
+            os.path.join(vet_dir, "run_identity_pleiades.json"),
+            run_id="pleiades_cli",
+            runner="pleiades",
+            code_files=ri.discover_local_code_dependencies(here_dir, ("pleiades.py",)),
+            config={"pipeline_version": PIPELINE_VERSION},
+            input_paths=[input_csv],
+            repo_dir=here_dir,
+            resume=bool(args.resume),
+            require_existing=bool(args.resume or has_prior_outputs),
+            resume_reason="pleiades_resume" if args.resume else "fresh_start",
+        )
+        sync_pleiades_mast_products(bound_run, vet_dir)
         df_cands = pd.read_csv(input_csv, dtype={"tic_id": str})
         print(f"Loaded {len(df_cands)} candidates from '{input_csv}' for Pleiades Tier-2 Deep Vetting {PIPELINE_VERSION}.")
         vet_results = []
-        for _, row in df_cands.iterrows():
-            tic_val = str(row["tic_id"]).split(".")[0].strip() if pd.notna(row.get("tic_id")) else ""
-            try:
-                res = deep_vet_target(row.to_dict(), vet_dir=vet_dir)
-                if res is not None:
-                    vet_results.append(res)
-                else:
-                    vet_results.append({
-                        "tic_id": tic_val,
-                        "operational_status": "NO_LIGHTCURVE",
-                        "disposition": None,
-                        "vps_version": "",
-                        "vps_producer": VPS_PRODUCER_NAME,
-                        "vps_score": float("nan"),
-                        "fp_risk_percent": float("nan"),
-                        "vps_unclipped_total": float("nan"),
-                        "vps_ledger_json": "",
-                        "sec_eclipse_zone": "",
-                        "sec_snr_threshold": float("nan"),
-                        "sec_penalty_applied": None,
-                        "vps_clean_criterion": "",
-                        "input_period_days": float(row.get("period_days", float("nan"))),
-                        "input_t0_btjd": float(row.get("t0_btjd", float("nan"))),
-                        "input_depth_ppm": float(row.get("depth_ppm", float("nan"))),
-                        "input_duration_hours": float(row.get("duration_hours", float("nan"))),
-                        "refined_period_days": float("nan"),
-                        "refined_t0_btjd": float("nan"),
-                        "fitted_depth_ppm": float("nan"),
-                        "fitted_duration_hours": float("nan"),
-                        "fitted_rp_earth": float("nan"),
-                        "impact_param_b": float("nan"),
-                        "dur_to_kepler_max": float("nan"),
-                        "stitched_primary_snr": float("nan"),
-                        "secondary_snr_sigma": float("nan"),
-                        "sec_eclipse_phase": float("nan"),
-                        "is_known_tess_eb": None,
-                        "gaia_nss_type": None,
-                        "flux_contam_percent": float("nan"),
-                        "neb_capable_neighbors": float("nan"),
-                        "sectors_stitched": "",
-                        "error_message": "No light curve found"
-                    })
-            except Exception as e:
-                print(f"[!] Error vetting TIC {tic_val}: {e}")
-                vet_results.append({
-                    "tic_id": tic_val,
-                    "operational_status": "ERROR",
-                    "disposition": None,
-                    "vps_version": "",
-                    "vps_producer": VPS_PRODUCER_NAME,
-                    "vps_score": float("nan"),
-                    "fp_risk_percent": float("nan"),
-                    "vps_unclipped_total": float("nan"),
-                    "vps_ledger_json": "",
-                    "sec_eclipse_zone": "",
-                    "sec_snr_threshold": float("nan"),
-                    "sec_penalty_applied": None,
-                    "vps_clean_criterion": "",
-                    "input_period_days": float(row.get("period_days", float("nan"))),
-                    "input_t0_btjd": float(row.get("t0_btjd", float("nan"))),
-                    "input_depth_ppm": float(row.get("depth_ppm", float("nan"))),
-                    "input_duration_hours": float(row.get("duration_hours", float("nan"))),
-                    "refined_period_days": float("nan"),
-                    "refined_t0_btjd": float("nan"),
-                    "fitted_depth_ppm": float("nan"),
-                    "fitted_duration_hours": float("nan"),
-                    "fitted_rp_earth": float("nan"),
-                    "impact_param_b": float("nan"),
-                    "dur_to_kepler_max": float("nan"),
-                    "stitched_primary_snr": float("nan"),
-                    "secondary_snr_sigma": float("nan"),
-                    "sec_eclipse_phase": float("nan"),
-                    "is_known_tess_eb": None,
-                    "gaia_nss_type": None,
-                    "flux_contam_percent": float("nan"),
-                    "neb_capable_neighbors": float("nan"),
-                    "sectors_stitched": "",
-                    "error_message": str(e)
-                })
+        _pleiades_mod._ACTIVE_BOUND_RUN = bound_run
+        try:
+            for _, row in df_cands.iterrows():
+                tic_val = str(row["tic_id"]).split(".")[0].strip() if pd.notna(row.get("tic_id")) else ""
+                item_path = os.path.join(vet_dir, f"pleiades_record_TIC_{tic_val}.json")
+                if args.resume and tic_val and os.path.exists(item_path):
+                    saved_item = bound_run.load_verified_item_record(
+                        item_path,
+                        required_keys=("run_id", "identity", "tic_id", "record", "has_dossier"),
+                    )
+                    rec_obj = saved_item.get("record")
+                    has_dossier = saved_item.get("has_dossier")
+                    if (
+                        str(saved_item.get("tic_id")) != tic_val
+                        or not isinstance(rec_obj, dict)
+                        or not isinstance(has_dossier, bool)
+                        or rec_obj.get("operational_status") not in ("SUCCESS", "NO_LIGHTCURVE", "ERROR")
+                        or any(col not in rec_obj for col in PLEIADES_SUMMARY_COLS)
+                    ):
+                        raise ri.RunIdentityError(
+                            f"PARTIAL_OR_CORRUPT_RECORD: Pleiades record '{item_path}' is incomplete"
+                        )
+                    if rec_obj.get("operational_status") == "SUCCESS":
+                        if not has_dossier:
+                            raise ri.RunIdentityError(
+                                f"PARTIAL_OR_CORRUPT_RECORD: Pleiades SUCCESS record '{item_path}' is missing dossier metadata"
+                            )
+                        dossier_path = saved_item.get("dossier_path")
+                        dossier_sha = saved_item.get("dossier_sha256")
+                        if (
+                            not isinstance(dossier_path, str)
+                            or not dossier_path.strip()
+                            or not isinstance(dossier_sha, str)
+                            or not dossier_sha.strip()
+                            or not os.path.isfile(dossier_path)
+                            or ri.sha256_file(dossier_path) != dossier_sha
+                        ):
+                            raise ri.RunIdentityError(
+                                f"PARTIAL_OR_CORRUPT_RECORD: Pleiades dossier missing or SHA256 mismatch for '{item_path}'"
+                            )
+                    vet_results.append(rec_obj)
+                    continue
+                res = None
+                try:
+                    res = deep_vet_target(row.to_dict(), vet_dir=vet_dir)
+                    if res is not None:
+                        vet_results.append(res)
+                    else:
+                        vet_results.append(cli_failure_record(row, tic_val, "NO_LIGHTCURVE", "No light curve found"))
+                except Exception as e:
+                    print(f"[!] Error vetting TIC {tic_val}: {e}")
+                    vet_results.append(cli_failure_record(row, tic_val, "ERROR", str(e)))
+                if tic_val:
+                    item_payload = {"tic_id": tic_val, "record": vet_results[-1], "has_dossier": False}
+                    if vet_results[-1].get("operational_status") == "SUCCESS":
+                        dossier_path = os.path.abspath(os.path.join(vet_dir, f"dossier_TIC_{tic_val}.png"))
+                        if os.path.isfile(dossier_path):
+                            item_payload["has_dossier"] = True
+                            item_payload["dossier_path"] = dossier_path
+                            item_payload["dossier_sha256"] = ri.sha256_file(dossier_path)
+                    bound_run.save_item_record(item_path, item_payload)
+        except KeyboardInterrupt:
+            bound_run.record_interruption("KeyboardInterrupt", completed_count=len(vet_results))
+            raise
+        finally:
+            _pleiades_mod._ACTIVE_BOUND_RUN = None
+        sync_pleiades_mast_products(bound_run, vet_dir)
         out_csv = os.path.join(vet_dir, "scientific_dossier_summary.csv")
         if vet_results:
-            pd.DataFrame(vet_results).to_csv(out_csv, index=False)
+            ri.atomic_write_csv(out_csv, pd.DataFrame(vet_results), index=False)
             print(f"\nPleiades deep vetting complete! Dossiers saved to '{vet_dir}'.")
         else:
-            pd.DataFrame(columns=[
-                "tic_id", "operational_status", "disposition",
-                "vps_version", "vps_producer", "vps_score", "fp_risk_percent",
-                "vps_unclipped_total", "vps_ledger_json", "sec_eclipse_zone",
-                "sec_snr_threshold", "sec_penalty_applied", "vps_clean_criterion",
-                "input_period_days", "input_t0_btjd", "input_depth_ppm", "input_duration_hours",
-                "refined_period_days", "refined_t0_btjd", "fitted_depth_ppm",
-                "fitted_duration_hours", "fitted_rp_earth", "impact_param_b",
-                "dur_to_kepler_max", "stitched_primary_snr", "secondary_snr_sigma",
-                "sec_eclipse_phase", "is_known_tess_eb", "gaia_nss_type",
-                "flux_contam_percent", "neb_capable_neighbors", "sectors_stitched",
-                "error_message"
-            ]).to_csv(out_csv, index=False)
+            ri.atomic_write_csv(out_csv, pd.DataFrame(columns=list(PLEIADES_SUMMARY_COLS)), index=False)
             print(f"\nPleiades deep vetting complete (0 survivors). Empty summary saved to '{out_csv}'.")
+        bound_run.record_completion("COMPLETE", extra={"n_results": len(vet_results)})

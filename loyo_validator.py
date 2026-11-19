@@ -18,6 +18,7 @@ import matplotlib.gridspec as gridspec
 from scipy.optimize import minimize
 from scipy.signal import savgol_filter
 import lightkurve as lk
+from ephemeris_contract import fold_phase_centered, days_to_hours, hours_to_days
 
 # Set matplotlib backend to Agg
 plt.switch_backend('Agg')
@@ -57,8 +58,8 @@ def robust_tukey_clean(time, flux, ferr, window_days=0.5):
 
 def box_transit_model(t, t0, period, depth, duration):
     """Simple box transit model for ephemeris evaluation."""
-    phase = ((t - t0) / period + 0.5) % 1.0 - 0.5
-    dt_hours = phase * period * 24.0
+    phase = fold_phase_centered(t, t0, period, in_days=False)
+    dt_hours = days_to_hours(phase * period)
     model = np.ones_like(t, dtype=float)
     in_transit = np.abs(dt_hours) <= (duration / 2.0)
     model[in_transit] = 1.0 - depth
@@ -66,14 +67,14 @@ def box_transit_model(t, t0, period, depth, duration):
 
 def fit_ephemeris(t_all, f_all, p_init, t0_init, dur_hours, depth_init):
     """Refine ephemeris (t0, period, depth) using least-squares on given cadences."""
-    dur_days = dur_hours / 24.0
+    dur_days = hours_to_days(dur_hours)
     
     def loss(params):
         t0, p, depth = params
         if depth <= 0 or p <= 0:
             return 1e9
-        phase = ((t_all - t0) / p + 0.5) % 1.0 - 0.5
-        dt_hrs = phase * p * 24.0
+        phase = fold_phase_centered(t_all, t0, p, in_days=False)
+        dt_hrs = days_to_hours(phase * p)
         in_tr = np.abs(dt_hrs) <= (dur_hours / 2.0)
         # Depth penalty / fit
         f_in = f_all[in_tr]
@@ -92,8 +93,8 @@ def fit_ephemeris(t_all, f_all, p_init, t0_init, dur_hours, depth_init):
 
 def evaluate_holdout_sector(t_hold, f_hold, e_hold, t0_pred, p_pred, dur_hours, depth_pred):
     """Blindly evaluate the holdout sector using only predicted ephemeris."""
-    phase_hold = ((t_hold - t0_pred) / p_pred + 0.5) % 1.0 - 0.5
-    dt_hrs = phase_hold * p_pred * 24.0
+    phase_hold = fold_phase_centered(t_hold, t0_pred, p_pred, in_days=False)
+    dt_hrs = days_to_hours(phase_hold * p_pred)
     
     in_tr = np.abs(dt_hrs) <= (dur_hours / 2.0)
     out_tr = (np.abs(dt_hrs) > (dur_hours / 2.0)) & (np.abs(dt_hrs) <= 2.5 * dur_hours)
@@ -277,24 +278,24 @@ def run_loyo_tic(tic_id=350190949, p_nom=0.926120, t0_nom=1325.61416, dur_nom_hr
             if np.min(t_s) <= t_expected <= np.max(t_s):
                 # We have observations!
                 # Slice local window
-                m_tr = np.abs(t_s - t_expected) <= (1.2 * dur_nom_hr / 24.0)
+                m_tr = np.abs(t_s - t_expected) <= (hours_to_days(1.2 * dur_nom_hr))
                 if np.sum(m_tr) >= 4:
                     # Measure local dip center
                     t_win = t_s[m_tr]
                     f_win = sector_data[sec]['flux'][m_tr]
                     # Template match
-                    shifts = np.linspace(-0.6 * dur_nom_hr, 0.6 * dur_nom_hr, 41) / 24.0
+                    shifts = hours_to_days(np.linspace(-0.6 * dur_nom_hr, 0.6 * dur_nom_hr, 41))
                     b_shift = 0.0
                     b_loss = 1e9
                     for s in shifts:
                         m_box = np.ones_like(t_win)
-                        m_box[np.abs(t_win - (t_expected + s)) <= (0.5 * dur_nom_hr / 24.0)] = 1.0 - depth_master
+                        m_box[np.abs(t_win - (t_expected + s)) <= (hours_to_days(0.5 * dur_nom_hr))] = 1.0 - depth_master
                         l = np.sum((f_win - m_box)**2)
                         if l < b_loss:
                             b_loss = l
                             b_shift = s
                     oc_epochs.append(k)
-                    oc_residuals_min.append(b_shift * 24.0 * 60.0)
+                    oc_residuals_min.append(days_to_hours(b_shift) * 60.0)
                     oc_sectors.append(sec)
                 break
 
@@ -350,7 +351,7 @@ def run_loyo_tic(tic_id=350190949, p_nom=0.926120, t0_nom=1325.61416, dur_nom_hr
     p_tr1 = fold_results[0]['p_train']
     
     ph_tr = ((t_train_p1 - t0_tr1) / p_tr1 + 0.5) % 1.0 - 0.5
-    dt_tr_hrs = ph_tr * p_tr1 * 24.0
+    dt_tr_hrs = days_to_hours(ph_tr * p_tr1)
     m_win_tr = np.abs(dt_tr_hrs) <= 2.0
     
     ax_b.scatter(dt_tr_hrs[m_win_tr], f_train_p1[m_win_tr], s=2, color='#8b949e', alpha=0.35, label='Training Cadences (S1, S104, S105)')
@@ -394,7 +395,7 @@ def run_loyo_tic(tic_id=350190949, p_nom=0.926120, t0_nom=1325.61416, dur_nom_hr
     t_h28 = sector_data[28]['time']
     f_h28 = sector_data[28]['flux']
     ph_h28 = ((t_h28 - t0_tr1) / p_tr1 + 0.5) % 1.0 - 0.5
-    dt_h28_hrs = ph_h28 * p_tr1 * 24.0
+    dt_h28_hrs = days_to_hours(ph_h28 * p_tr1)
     m_win_h28 = np.abs(dt_h28_hrs) <= 2.0
     
     ax_c.scatter(dt_h28_hrs[m_win_h28], f_h28[m_win_h28], s=4, color='#f0883e', alpha=0.45, label='Sector 28 Cadences (Year 2020 - Blind Holdout)')

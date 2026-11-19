@@ -33,6 +33,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 import aldebaran as ald
+import run_identity as ri
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("TOI_Companions")
@@ -100,6 +101,9 @@ CANDIDATE_COLUMNS = [
     "exofop_url"
 ]
 
+KNOWN_SIGNAL_COLUMNS = ["known_transit_masks_json", "known_signal_cache_state"]
+CANDIDATE_OUTPUT_COLUMNS = CANDIDATE_COLUMNS + KNOWN_SIGNAL_COLUMNS
+
 AUDIT_COLUMNS = [
     "run_id",
     "timestamp",
@@ -156,12 +160,6 @@ def query_sector_toi_hosts(sector: int, toi_hosts_set: set) -> tuple[list, str |
         err_msg = f"Error querying MAST for sector {sector}: {e}"
         logger.warning(err_msg)
         return [], err_msg
-
-
-def get_toi_hosts_in_sector(sector: int, toi_hosts_set: set) -> list:
-    """Legacy compatibility wrapper."""
-    matched, _ = query_sector_toi_hosts(sector, toi_hosts_set)
-    return matched
 
 
 def process_toi_host(tic_id: str, sector: int, run_id: str = "run_default", attempt_id: str = None) -> dict:
@@ -308,22 +306,7 @@ def process_toi_host(tic_id: str, sector: int, run_id: str = "run_default", atte
 
 def atomic_write_json(file_path: str, data: dict):
     """Atomically writes JSON to file_path using a temporary file in the same directory."""
-    dir_name = os.path.dirname(os.path.abspath(file_path))
-    os.makedirs(dir_name, exist_ok=True)
-    tmp_path = os.path.join(dir_name, f".tmp_{os.path.basename(file_path)}.{os.getpid()}")
-    try:
-        with open(tmp_path, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2)
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp_path, file_path)
-    except Exception:
-        if os.path.exists(tmp_path):
-            try:
-                os.remove(tmp_path)
-            except Exception:
-                pass
-        raise
+    ri.atomic_write_json(file_path, data)
 
 
 def atomic_write_csv(csv_path: str, df: pd.DataFrame, index: bool = False, header: bool = True):
@@ -331,22 +314,7 @@ def atomic_write_csv(csv_path: str, df: pd.DataFrame, index: bool = False, heade
     Atomically writes a DataFrame to csv_path using a temporary file in the same directory.
     Guarantees that on failure, the existing file is preserved intact.
     """
-    dir_name = os.path.dirname(os.path.abspath(csv_path))
-    os.makedirs(dir_name, exist_ok=True)
-    tmp_path = os.path.join(dir_name, f".tmp_{os.path.basename(csv_path)}.{os.getpid()}")
-    try:
-        df.to_csv(tmp_path, index=index, header=header)
-        with open(tmp_path, "a", encoding="utf-8") as f:
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp_path, csv_path)
-    except Exception:
-        if os.path.exists(tmp_path):
-            try:
-                os.remove(tmp_path)
-            except Exception:
-                pass
-        raise
+    ri.atomic_write_csv(csv_path, df, index=index, header=header)
 
 
 def initialize_output_artifacts(output_dir: str, run_id: str, append_mode: bool = False):
@@ -382,7 +350,7 @@ def initialize_output_artifacts(output_dir: str, run_id: str, append_mode: bool 
             )
 
         # Fresh run: initialize dedicated per-run files
-        df_empty_report = pd.DataFrame(columns=CANDIDATE_COLUMNS)
+        df_empty_report = pd.DataFrame(columns=CANDIDATE_OUTPUT_COLUMNS)
         atomic_write_csv(run_report_file, df_empty_report, index=False)
 
         df_empty_audit = pd.DataFrame(columns=AUDIT_COLUMNS)
@@ -397,10 +365,10 @@ def initialize_output_artifacts(output_dir: str, run_id: str, append_mode: bool 
             if os.path.exists(target_csv) and os.path.getsize(target_csv) > 0:
                 try:
                     df_check = pd.read_csv(target_csv, nrows=0)
-                    if list(df_check.columns) != CANDIDATE_COLUMNS:
+                    if list(df_check.columns) != CANDIDATE_OUTPUT_COLUMNS:
                         raise RuntimeError(
                             f"Incompatible candidate CSV schema in '{target_csv}'. "
-                            f"Existing columns do not match schema {CANDIDATE_SCHEMA_VERSION} ({len(CANDIDATE_COLUMNS)} cols). "
+                            f"Existing columns do not match schema {CANDIDATE_SCHEMA_VERSION} ({len(CANDIDATE_OUTPUT_COLUMNS)} cols). "
                             f"Refusing to append to incompatible historical file to prevent corrupting historical artifacts."
                         )
                 except RuntimeError:
@@ -409,7 +377,7 @@ def initialize_output_artifacts(output_dir: str, run_id: str, append_mode: bool 
                     raise RuntimeError(f"Failed to inspect candidate CSV '{target_csv}' for append mode: {e}")
 
         if not os.path.exists(run_report_file):
-            df_empty_report = pd.DataFrame(columns=CANDIDATE_COLUMNS)
+            df_empty_report = pd.DataFrame(columns=CANDIDATE_OUTPUT_COLUMNS)
             atomic_write_csv(run_report_file, df_empty_report, index=False)
 
         if not os.path.exists(run_audit_file):
@@ -417,7 +385,7 @@ def initialize_output_artifacts(output_dir: str, run_id: str, append_mode: bool 
             atomic_write_csv(run_audit_file, df_empty_audit, index=False)
 
         if not os.path.exists(report_file):
-            df_empty_report = pd.DataFrame(columns=CANDIDATE_COLUMNS)
+            df_empty_report = pd.DataFrame(columns=CANDIDATE_OUTPUT_COLUMNS)
             atomic_write_csv(report_file, df_empty_report, index=False)
 
         if not os.path.exists(audit_file):
@@ -501,6 +469,237 @@ def _remove_candidate_row(csv_path: str, tic, sector, run_id: str):
         atomic_write_csv(csv_path, df_cleaned, index=False)
 
 
+def _has_prior_run_outputs(run_id: str, csv_paths: list[str]) -> bool:
+    """Return True if any readable audit/report CSV already holds rows for run_id."""
+    for p in csv_paths:
+        if not os.path.isfile(p) or os.path.getsize(p) == 0:
+            continue
+        try:
+            df = pd.read_csv(p, usecols=lambda c: c == "run_id")
+        except Exception:
+            continue
+        if "run_id" in df.columns and (df["run_id"].astype(str) == str(run_id)).any():
+            return True
+    return False
+
+
+def _load_resume_state(args, run_id, report_file, audit_file, run_report_file, run_audit_file,
+                       completed_in_this_run, total_candidates):
+    """R2a/R2b append-mode resume: fills completed_in_this_run and total_candidates from this run_id's audit and
+    candidate reports, or raises RuntimeError. Moved unchanged from run_search (C11)."""
+    # 1. Load and validate audit records for this run_id
+    target_audit_file = run_audit_file if os.path.exists(run_audit_file) else audit_file
+    latest_audits = {}
+    if os.path.exists(target_audit_file) and os.path.getsize(target_audit_file) > 0:
+        try:
+            df_aud = pd.read_csv(target_audit_file)
+        except Exception as e:
+            raise RuntimeError(f"Cannot resume run '{run_id}': failed to read audit file '{target_audit_file}': {e}")
+        required_audit_cols = {"run_id", "tic_id", "sector", "status"}
+        if not required_audit_cols.issubset(df_aud.columns):
+            raise RuntimeError(
+                f"Cannot resume run '{run_id}': audit file '{target_audit_file}' missing required columns {required_audit_cols - set(df_aud.columns)}"
+            )
+        df_this = df_aud[df_aud["run_id"].astype(str) == str(run_id)]
+        for _, r in df_this.iterrows():
+            key = (str(r.get("tic_id")).lstrip("0"), int(r.get("sector")))
+            latest_audits[key] = (str(r.get("status", "")).strip(), r)
+
+    # 2. Load and validate candidate records for this run_id from both per-run and cumulative reports
+    per_run_cands = {}
+    if os.path.exists(run_report_file) and os.path.getsize(run_report_file) > 0:
+        try:
+            df_rep = pd.read_csv(run_report_file)
+        except Exception as e:
+            raise RuntimeError(f"Cannot resume run '{run_id}': failed to read candidate report '{run_report_file}': {e}")
+        required_cand_cols = {"run_id", "tic_id", "sector"}
+        if not required_cand_cols.issubset(df_rep.columns):
+            raise RuntimeError(
+                f"Cannot resume run '{run_id}': candidate report '{run_report_file}' missing required columns {required_cand_cols - set(df_rep.columns)}"
+            )
+        df_cands_this = df_rep[df_rep["run_id"].astype(str) == str(run_id)]
+        for _, r in df_cands_this.iterrows():
+            key = (str(r.get("tic_id")).lstrip("0"), int(r.get("sector")))
+            per_run_cands[key] = r.to_dict()
+
+    cum_cands = {}
+    if os.path.exists(report_file) and os.path.getsize(report_file) > 0:
+        try:
+            df_cum = pd.read_csv(report_file)
+        except Exception as e:
+            raise RuntimeError(f"Cannot resume run '{run_id}': failed to read cumulative candidate report '{report_file}': {e}")
+        required_cand_cols = {"run_id", "tic_id", "sector"}
+        if not required_cand_cols.issubset(df_cum.columns):
+            raise RuntimeError(
+                f"Cannot resume run '{run_id}': cumulative candidate report '{report_file}' missing required columns {required_cand_cols - set(df_cum.columns)}"
+            )
+        df_cands_cum = df_cum[df_cum["run_id"].astype(str) == str(run_id)]
+        for _, r in df_cands_cum.iterrows():
+            key = (str(r.get("tic_id")).lstrip("0"), int(r.get("sector")))
+            cum_cands[key] = r.to_dict()
+
+    # 3. Reconcile active candidate tables against latest audit state
+    all_active_cand_keys = set(per_run_cands.keys()) | set(cum_cands.keys())
+    for key in list(all_active_cand_keys):
+        latest_st, _ = latest_audits.get(key, (None, None))
+        # If the latest terminal audit is a non-candidate (REJECT, EMPTY, SKIP, ERROR)
+        # or if there is no audit record at all, any active candidate row is stale
+        # (e.g. from an interrupted invalidation on retry) and must be purged.
+        if latest_st in ("REJECT", "EMPTY", "SKIP", "ERROR") or latest_st is None:
+            logger.warning(
+                "Target TIC %s (Sector %d) has active candidate row in run %s, but latest audit status is '%s'. Purging stale candidate row.",
+                key[0], key[1], run_id, latest_st
+            )
+            _remove_candidate_row(run_report_file, key[0], key[1], run_id)
+            _remove_candidate_row(report_file, key[0], key[1], run_id)
+            per_run_cands.pop(key, None)
+            cum_cands.pop(key, None)
+
+    # 4. Populate completed_in_this_run and total_candidates from reconciled state
+    for key, (st_val, r_aud) in latest_audits.items():
+        if st_val in ("REJECT", "EMPTY", "SKIP"):
+            if key in per_run_cands or key in cum_cands:
+                raise RuntimeError(
+                    f"Cannot resume run '{run_id}': target TIC {key[0]} (Sector {key[1]}) has terminal audit '{st_val}' "
+                    f"but candidate row still present in candidate tables."
+                )
+            completed_in_this_run[key] = st_val
+        elif st_val == "CANDIDATE":
+            cand_dict = per_run_cands.get(key) or cum_cands.get(key)
+            rel_plot = str(cand_dict.get("plot_path", "")).strip() if cand_dict else ""
+            plot_full = os.path.join(args.output_dir, rel_plot) if not os.path.isabs(rel_plot) else rel_plot
+            has_valid_plot = bool(rel_plot and os.path.exists(plot_full) and os.path.getsize(plot_full) > 0)
+            is_in_both = (key in per_run_cands) and (key in cum_cands)
+            if has_valid_plot and is_in_both:
+                completed_in_this_run[key] = "CANDIDATE"
+                total_candidates.append(cand_dict)
+            else:
+                if not has_valid_plot:
+                    logger.warning(
+                        "Target TIC %s (Sector %d) audited as CANDIDATE in run %s, but plot file '%s' is missing or empty. Re-queueing for reprocessing.",
+                        key[0], key[1], run_id, rel_plot
+                    )
+                else:
+                    logger.warning(
+                        "Target TIC %s (Sector %d) audited as CANDIDATE in run %s, but candidate row is missing from cumulative report (interrupted commit). Re-queueing for reprocessing.",
+                        key[0], key[1], run_id
+                    )
+        elif st_val == "ERROR":
+            logger.info(
+                "Target TIC %s (Sector %d) previously had ERROR in run %s. Re-queueing for retry.",
+                key[0], key[1], run_id
+            )
+
+
+def _finish_run(args, run_id, start_time, end_time, bound_run, counts, total_candidates, total_queued, total_processed,
+                sector_query_errors, report_file, audit_file, run_report_file, run_audit_file, summary_json_path,
+                per_run_manifest_path):
+    """Run outcome, status and exit code (R1 rules), the final summary files and log. Moved unchanged from
+    run_search (C11). Returns (exit_code, run_summary)."""
+    # Determine overall run outcome status and exit code according to R1 rules
+    has_candidates = counts["CANDIDATE"] > 0
+    has_worker_errors = counts["ERROR"] > 0
+    has_query_errors = sector_query_errors > 0
+    has_any_errors = has_worker_errors or has_query_errors
+
+    if total_queued == 0:
+        if has_query_errors:
+            run_status = "FAILED_QUERY"
+            exit_code = 1
+        else:
+            run_status = "ZERO_HOSTS"
+            exit_code = 0
+    elif has_any_errors:
+        if has_candidates:
+            # Candidates were discovered but some targets or queries failed
+            run_status = "CANDIDATES_FOUND_WITH_ERRORS"
+            exit_code = 1
+        elif total_processed > 0 and counts["ERROR"] == total_processed and not has_query_errors:
+            run_status = "ALL_ERRORS"
+            exit_code = 1
+        elif total_processed == 0 and has_query_errors:
+            run_status = "FAILED_QUERY"
+            exit_code = 1
+        else:
+            # Partial failure (e.g. some targets rejected, but query error or worker error occurred)
+            run_status = "PARTIAL_ERROR"
+            exit_code = 1
+    else:
+        # Fully error-free run
+        if has_candidates:
+            run_status = "CANDIDATES_FOUND"
+            exit_code = 0
+        else:
+            run_status = "ALL_REJECTED"
+            exit_code = 0
+
+    run_candidates_count = len(total_candidates)
+
+    cumulative_candidates_count = run_candidates_count
+    if os.path.exists(report_file):
+        try:
+            df_all_cand = pd.read_csv(report_file)
+            cumulative_candidates_count = len(df_all_cand)
+        except Exception:
+            pass
+
+    ald.sync_aldebaran_mast_products(bound_run, args.output_dir, run_id)
+
+    run_summary = {
+        "run_id": run_id,
+        "run_status": run_status,
+        "exit_code": exit_code,
+        "start_time_utc": start_time.isoformat(),
+        "end_time_utc": end_time.isoformat(),
+        "sectors": args.sectors,
+        "workers": args.workers,
+        "limit_per_sector": args.limit_per_sector,
+        "total_queued": total_queued,
+        "total_processed": total_processed,
+        "counts": counts,
+        "sector_query_errors": sector_query_errors,
+        "candidates_count": run_candidates_count,
+        "cumulative_candidates_count": cumulative_candidates_count,
+        "summary_csv": os.path.basename(run_report_file),
+        "audit_csv": os.path.basename(run_audit_file),
+        "cumulative_summary_csv": os.path.basename(report_file),
+        "cumulative_audit_csv": os.path.basename(audit_file),
+        "per_run_manifest": os.path.basename(per_run_manifest_path),
+        "identity": bound_run.identity,
+        "environment": bound_run.environment,
+        "mast_products": bound_run.data.get("mast_products", {}),
+    }
+
+    bound_run.record_completion(
+        status=run_status,
+        extra={
+            "exit_code": exit_code,
+            "total_queued": total_queued,
+            "total_processed": total_processed,
+            "counts": counts,
+        },
+    )
+
+    # Save final run summary atomically to both latest JSON and per-run manifest
+    atomic_write_json(summary_json_path, run_summary)
+    atomic_write_json(per_run_manifest_path, run_summary)
+
+    logger.info("======================================================================")
+    logger.info("TOI COMPANION SEARCH FINISHED")
+    logger.info("Run ID: %s | Status: %s (Exit code: %d)", run_id, run_status, exit_code)
+    logger.info("Targets: Queued=%d, Processed=%d", total_queued, total_processed)
+    logger.info("Breakdown: %s", json.dumps(counts))
+    logger.info("Run Candidates Discovered: %d (Cumulative: %d)", run_candidates_count, cumulative_candidates_count)
+    logger.info("Artifacts:")
+    logger.info("  Candidate Summary CSV: %s", report_file)
+    logger.info("  Per-Target Audit CSV:  %s", audit_file)
+    logger.info("  Latest Summary JSON:   %s", summary_json_path)
+    logger.info("  Per-Run Manifest JSON: %s", per_run_manifest_path)
+    logger.info("======================================================================")
+
+    return exit_code, run_summary
+
+
 def run_search(args) -> tuple[int, dict]:
     """
     Core execution logic for TOI companion search.
@@ -515,6 +714,47 @@ def run_search(args) -> tuple[int, dict]:
     report_file, audit_file, run_report_file, run_audit_file = initialize_output_artifacts(
         args.output_dir, run_id, append_mode=args.append
     )
+
+    here_dir = os.path.dirname(os.path.abspath(__file__))
+    identity_record_path = os.path.join(args.output_dir, f"run_identity_{run_id}.json")
+    target_file = getattr(args, "target_file", None)
+    has_prior_outputs = _has_prior_run_outputs(
+        run_id, [run_audit_file, audit_file, run_report_file, report_file]
+    )
+    bound_run = ri.BoundRun.open_or_resume(
+        identity_record_path,
+        run_id=run_id,
+        runner="search_toi_companions",
+        code_files=ri.resolve_code_files(
+            here_dir,
+            (
+                "search_toi_companions.py",
+                "aldebaran.py",
+                "lightcurve_helpers.py",
+                "stellar_metrics.py",
+                "known_signals.py",
+                "ephemeris_contract.py",
+                "depth_contract.py",
+                "vps_contract.py",
+                "decision_ledger.py",
+            ),
+        ),
+        config={
+            "sectors": list(args.sectors),
+            "workers": int(args.workers),
+            "limit_per_sector": args.limit_per_sector,
+            "target_file": target_file,
+            "schema_version": CANDIDATE_SCHEMA_VERSION,
+        },
+        input_paths=[target_file] if target_file else (),
+        input_spec={"sectors": list(args.sectors), "target_file": target_file},
+        repo_dir=here_dir,
+        resume=bool(args.append),
+        require_existing=bool(has_prior_outputs),
+        resume_reason="append_resume" if args.append else "fresh_start",
+        logger=logger,
+    )
+    ald.sync_aldebaran_mast_products(bound_run, args.output_dir, run_id)
 
     summary_json_path = os.path.join(args.output_dir, "run_summary.json")
     per_run_manifest_path = os.path.join(args.output_dir, f"run_summary_{run_id}.json")
@@ -544,7 +784,10 @@ def run_search(args) -> tuple[int, dict]:
         "audit_csv": os.path.basename(run_audit_file),
         "cumulative_summary_csv": os.path.basename(report_file),
         "cumulative_audit_csv": os.path.basename(audit_file),
-        "per_run_manifest": os.path.basename(per_run_manifest_path)
+        "per_run_manifest": os.path.basename(per_run_manifest_path),
+        "identity": bound_run.identity,
+        "environment": bound_run.environment,
+        "mast_products": bound_run.data.get("mast_products", {}),
     }
     atomic_write_json(summary_json_path, initial_summary)
     atomic_write_json(per_run_manifest_path, initial_summary)
@@ -595,108 +838,8 @@ def run_search(args) -> tuple[int, dict]:
     # R2a/R2b: Check for already completed targets when in append mode (idempotent resume for this run_id)
     completed_in_this_run = {}
     if args.append:
-        # 1. Load and validate audit records for this run_id
-        target_audit_file = run_audit_file if os.path.exists(run_audit_file) else audit_file
-        latest_audits = {}
-        if os.path.exists(target_audit_file) and os.path.getsize(target_audit_file) > 0:
-            try:
-                df_aud = pd.read_csv(target_audit_file)
-            except Exception as e:
-                raise RuntimeError(f"Cannot resume run '{run_id}': failed to read audit file '{target_audit_file}': {e}")
-            required_audit_cols = {"run_id", "tic_id", "sector", "status"}
-            if not required_audit_cols.issubset(df_aud.columns):
-                raise RuntimeError(
-                    f"Cannot resume run '{run_id}': audit file '{target_audit_file}' missing required columns {required_audit_cols - set(df_aud.columns)}"
-                )
-            df_this = df_aud[df_aud["run_id"].astype(str) == str(run_id)]
-            for _, r in df_this.iterrows():
-                key = (str(r.get("tic_id")).lstrip("0"), int(r.get("sector")))
-                latest_audits[key] = (str(r.get("status", "")).strip(), r)
-
-        # 2. Load and validate candidate records for this run_id from both per-run and cumulative reports
-        per_run_cands = {}
-        if os.path.exists(run_report_file) and os.path.getsize(run_report_file) > 0:
-            try:
-                df_rep = pd.read_csv(run_report_file)
-            except Exception as e:
-                raise RuntimeError(f"Cannot resume run '{run_id}': failed to read candidate report '{run_report_file}': {e}")
-            required_cand_cols = {"run_id", "tic_id", "sector"}
-            if not required_cand_cols.issubset(df_rep.columns):
-                raise RuntimeError(
-                    f"Cannot resume run '{run_id}': candidate report '{run_report_file}' missing required columns {required_cand_cols - set(df_rep.columns)}"
-                )
-            df_cands_this = df_rep[df_rep["run_id"].astype(str) == str(run_id)]
-            for _, r in df_cands_this.iterrows():
-                key = (str(r.get("tic_id")).lstrip("0"), int(r.get("sector")))
-                per_run_cands[key] = r.to_dict()
-
-        cum_cands = {}
-        if os.path.exists(report_file) and os.path.getsize(report_file) > 0:
-            try:
-                df_cum = pd.read_csv(report_file)
-            except Exception as e:
-                raise RuntimeError(f"Cannot resume run '{run_id}': failed to read cumulative candidate report '{report_file}': {e}")
-            required_cand_cols = {"run_id", "tic_id", "sector"}
-            if not required_cand_cols.issubset(df_cum.columns):
-                raise RuntimeError(
-                    f"Cannot resume run '{run_id}': cumulative candidate report '{report_file}' missing required columns {required_cand_cols - set(df_cum.columns)}"
-                )
-            df_cands_cum = df_cum[df_cum["run_id"].astype(str) == str(run_id)]
-            for _, r in df_cands_cum.iterrows():
-                key = (str(r.get("tic_id")).lstrip("0"), int(r.get("sector")))
-                cum_cands[key] = r.to_dict()
-
-        # 3. Reconcile active candidate tables against latest audit state
-        all_active_cand_keys = set(per_run_cands.keys()) | set(cum_cands.keys())
-        for key in list(all_active_cand_keys):
-            latest_st, _ = latest_audits.get(key, (None, None))
-            # If the latest terminal audit is a non-candidate (REJECT, EMPTY, SKIP, ERROR)
-            # or if there is no audit record at all, any active candidate row is stale
-            # (e.g. from an interrupted invalidation on retry) and must be purged.
-            if latest_st in ("REJECT", "EMPTY", "SKIP", "ERROR") or latest_st is None:
-                logger.warning(
-                    "Target TIC %s (Sector %d) has active candidate row in run %s, but latest audit status is '%s'. Purging stale candidate row.",
-                    key[0], key[1], run_id, latest_st
-                )
-                _remove_candidate_row(run_report_file, key[0], key[1], run_id)
-                _remove_candidate_row(report_file, key[0], key[1], run_id)
-                per_run_cands.pop(key, None)
-                cum_cands.pop(key, None)
-
-        # 4. Populate completed_in_this_run and total_candidates from reconciled state
-        for key, (st_val, r_aud) in latest_audits.items():
-            if st_val in ("REJECT", "EMPTY", "SKIP"):
-                if key in per_run_cands or key in cum_cands:
-                    raise RuntimeError(
-                        f"Cannot resume run '{run_id}': target TIC {key[0]} (Sector {key[1]}) has terminal audit '{st_val}' "
-                        f"but candidate row still present in candidate tables."
-                    )
-                completed_in_this_run[key] = st_val
-            elif st_val == "CANDIDATE":
-                cand_dict = per_run_cands.get(key) or cum_cands.get(key)
-                rel_plot = str(cand_dict.get("plot_path", "")).strip() if cand_dict else ""
-                plot_full = os.path.join(args.output_dir, rel_plot) if not os.path.isabs(rel_plot) else rel_plot
-                has_valid_plot = bool(rel_plot and os.path.exists(plot_full) and os.path.getsize(plot_full) > 0)
-                is_in_both = (key in per_run_cands) and (key in cum_cands)
-                if has_valid_plot and is_in_both:
-                    completed_in_this_run[key] = "CANDIDATE"
-                    total_candidates.append(cand_dict)
-                else:
-                    if not has_valid_plot:
-                        logger.warning(
-                            "Target TIC %s (Sector %d) audited as CANDIDATE in run %s, but plot file '%s' is missing or empty. Re-queueing for reprocessing.",
-                            key[0], key[1], run_id, rel_plot
-                        )
-                    else:
-                        logger.warning(
-                            "Target TIC %s (Sector %d) audited as CANDIDATE in run %s, but candidate row is missing from cumulative report (interrupted commit). Re-queueing for reprocessing.",
-                            key[0], key[1], run_id
-                        )
-            elif st_val == "ERROR":
-                logger.info(
-                    "Target TIC %s (Sector %d) previously had ERROR in run %s. Re-queueing for retry.",
-                    key[0], key[1], run_id
-                )
+        _load_resume_state(args, run_id, report_file, audit_file, run_report_file, run_audit_file,
+                           completed_in_this_run, total_candidates)
 
     for sec in args.sectors:
         logger.info("----------------------------------------------------------------------")
@@ -789,8 +932,8 @@ def run_search(args) -> tuple[int, dict]:
                     cand["depth_units"] = "ppm"
                 if "covariance_p_t0" not in cand:
                     cand["covariance_p_t0"] = np.nan
-                row_dict = {col: cand.get(col, "") for col in CANDIDATE_COLUMNS}
-                df_cand = pd.DataFrame([row_dict], columns=CANDIDATE_COLUMNS)
+                row_dict = {col: cand.get(col, "") for col in CANDIDATE_OUTPUT_COLUMNS}
+                df_cand = pd.DataFrame([row_dict], columns=CANDIDATE_OUTPUT_COLUMNS)
 
                 # Commit to cumulative report_file (mode="a")
                 _append_candidate_dedup(report_file, df_cand, tic, sector, run_id)
@@ -859,93 +1002,9 @@ def run_search(args) -> tuple[int, dict]:
 
     end_time = datetime.now(timezone.utc)
 
-    # Determine overall run outcome status and exit code according to R1 rules
-    has_candidates = counts["CANDIDATE"] > 0
-    has_worker_errors = counts["ERROR"] > 0
-    has_query_errors = sector_query_errors > 0
-    has_any_errors = has_worker_errors or has_query_errors
-
-    if total_queued == 0:
-        if has_query_errors:
-            run_status = "FAILED_QUERY"
-            exit_code = 1
-        else:
-            run_status = "ZERO_HOSTS"
-            exit_code = 0
-    elif has_any_errors:
-        if has_candidates:
-            # Candidates were discovered but some targets or queries failed
-            run_status = "CANDIDATES_FOUND_WITH_ERRORS"
-            exit_code = 1
-        elif total_processed > 0 and counts["ERROR"] == total_processed and not has_query_errors:
-            run_status = "ALL_ERRORS"
-            exit_code = 1
-        elif total_processed == 0 and has_query_errors:
-            run_status = "FAILED_QUERY"
-            exit_code = 1
-        else:
-            # Partial failure (e.g. some targets rejected, but query error or worker error occurred)
-            run_status = "PARTIAL_ERROR"
-            exit_code = 1
-    else:
-        # Fully error-free run
-        if has_candidates:
-            run_status = "CANDIDATES_FOUND"
-            exit_code = 0
-        else:
-            run_status = "ALL_REJECTED"
-            exit_code = 0
-
-    run_candidates_count = len(total_candidates)
-
-    cumulative_candidates_count = run_candidates_count
-    if os.path.exists(report_file):
-        try:
-            df_all_cand = pd.read_csv(report_file)
-            cumulative_candidates_count = len(df_all_cand)
-        except Exception:
-            pass
-
-    run_summary = {
-        "run_id": run_id,
-        "run_status": run_status,
-        "exit_code": exit_code,
-        "start_time_utc": start_time.isoformat(),
-        "end_time_utc": end_time.isoformat(),
-        "sectors": args.sectors,
-        "workers": args.workers,
-        "limit_per_sector": args.limit_per_sector,
-        "total_queued": total_queued,
-        "total_processed": total_processed,
-        "counts": counts,
-        "sector_query_errors": sector_query_errors,
-        "candidates_count": run_candidates_count,
-        "cumulative_candidates_count": cumulative_candidates_count,
-        "summary_csv": os.path.basename(run_report_file),
-        "audit_csv": os.path.basename(run_audit_file),
-        "cumulative_summary_csv": os.path.basename(report_file),
-        "cumulative_audit_csv": os.path.basename(audit_file),
-        "per_run_manifest": os.path.basename(per_run_manifest_path)
-    }
-
-    # Save final run summary atomically to both latest JSON and per-run manifest
-    atomic_write_json(summary_json_path, run_summary)
-    atomic_write_json(per_run_manifest_path, run_summary)
-
-    logger.info("======================================================================")
-    logger.info("TOI COMPANION SEARCH FINISHED")
-    logger.info("Run ID: %s | Status: %s (Exit code: %d)", run_id, run_status, exit_code)
-    logger.info("Targets: Queued=%d, Processed=%d", total_queued, total_processed)
-    logger.info("Breakdown: %s", json.dumps(counts))
-    logger.info("Run Candidates Discovered: %d (Cumulative: %d)", run_candidates_count, cumulative_candidates_count)
-    logger.info("Artifacts:")
-    logger.info("  Candidate Summary CSV: %s", report_file)
-    logger.info("  Per-Target Audit CSV:  %s", audit_file)
-    logger.info("  Latest Summary JSON:   %s", summary_json_path)
-    logger.info("  Per-Run Manifest JSON: %s", per_run_manifest_path)
-    logger.info("======================================================================")
-
-    return exit_code, run_summary
+    return _finish_run(args, run_id, start_time, end_time, bound_run, counts, total_candidates, total_queued, total_processed,
+                       sector_query_errors, report_file, audit_file, run_report_file, run_audit_file, summary_json_path,
+                       per_run_manifest_path)
 
 
 def main():

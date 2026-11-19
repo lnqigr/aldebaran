@@ -13,6 +13,7 @@ Architecture:
 """
 
 import os
+from depth_contract import photometric_depth, geometric_radius, validate_observables, check_output_schema, DEPTH_SCHEMA
 import sys
 import ssl
 import glob
@@ -26,6 +27,7 @@ import logging
 import json
 import math
 import certifi
+from ephemeris_contract import BTJD_OFFSET, btjd_to_bjd, btjd_to_year, fold_phase_centered, compute_orbit_number, days_to_hours, hours_to_days
 
 logger = logging.getLogger(__name__)
 
@@ -54,19 +56,18 @@ from scipy.signal import savgol_filter
 from astropy.io import fits
 import lightkurve as lk
 from astroquery.mast import Catalogs
+from lightcurve_helpers import (  # C9: shared copies, see lightcurve_helpers.py
+    to_numpy, extract_multi_author_lc, hybrid_tukey_savgol_detrend, _GL5_NODES, _GL5_WEIGHTS,
+    light_curve_product_failure, EXTRACTION_TOO_FEW_POINTS,
+    annulus_300_transit_model, refine_multi_year_ephemeris, compute_transit_metrics,
+)
+from stellar_metrics import (  # C9: shared copies, see stellar_metrics.py
+    G_SI, M_SUN, R_SUN, T_SUN, AU_M, M_EARTH, R_EARTH, H_PLANCK, C_LIGHT, K_BOLTZ,
+    to_clean_float, estimate_missing_photometry, batch_query_tic_photometry,
+    extract_camera_ccd_from_cache, planck_spectral_radiance, compute_astrophysical_metrics,
+)
 
-# Physical & Astronomical Constants (SI / IAU 2015 Nominal)
-G_SI = 6.67430e-11
-M_SUN = 1.98847e30
-R_SUN = 6.957e8
-T_SUN = 5772.0
-AU_M = 1.495978707e11
-M_EARTH = 5.97217e24
-R_EARTH = 6.371e6
-H_PLANCK = 6.62607015e-34
-C_LIGHT = 2.99792458e8
-K_BOLTZ = 1.380649e-23
-BTJD_OFFSET = 2457000.0
+# BTJD_OFFSET imported from ephemeris_contract
 
 # Pipeline Author priority and diagnostic colors
 AUTHOR_PRIORITY = {"SPOC": 1, "TESS-SPOC": 2, "TGLC": 3, "QLP": 4}
@@ -78,285 +79,7 @@ DEFAULT_RESULTS_DIR = "tess_results"
 # ==============================================================================
 # UTILITY FUNCTIONS & PHOTOMETRIC CONVERSIONS
 # ==============================================================================
-
-def to_clean_float(val, default: float = np.nan) -> float:
-    try:
-        if pd.isna(val) or str(val).strip().upper() in ("", "N/A", "NAN", "NONE", "NULL"):
-            return default
-        f_val = float(val)
-        return f_val if np.isfinite(f_val) else default
-    except Exception:
-        return default
-
-
-def to_numpy(col) -> np.ndarray:
-    mask = None
-    if hasattr(col, "mask") and col.mask is not None:
-        mask = np.asarray(col.mask, dtype=bool)
-    for _ in range(3):
-        if hasattr(col, "unmasked"):
-            col = col.unmasked
-        if hasattr(col, "value"):
-            col = col.value
-    arr = np.array(col, dtype=np.float64, copy=True)
-    if mask is not None and mask.shape == arr.shape:
-        arr[mask] = np.nan
-    return arr
-
-
-def btjd_to_year(btjd_val: float) -> int:
-    base_dt = datetime(2014, 12, 8, 12, 0, 0)
-    target_dt = base_dt + timedelta(days=float(btjd_val))
-    return int(target_dt.year)
-
-
-def estimate_missing_photometry(tmag: float, vmag: float, gmag: float, jmag: float, hmag: float, kmag: float, teff: float) -> dict:
-    """
-    Reconstructs missing optical/NIR magnitudes using empirical main-sequence dwarf
-    color-temperature relations (Pecaut & Mamajek 2013; Stassun et al. 2019).
-    """
-    teff_clamped = float(np.clip(teff if np.isfinite(teff) else 5500.0, 2800.0, 10000.0))
-    
-    teff_grid = np.array([3000.0, 3500.0, 4000.0, 4500.0, 5000.0, 5770.0, 6500.0, 7500.0, 9500.0])
-    vg_grid   = np.array([1.45,   0.95,   0.55,   0.35,   0.22,   0.12,   0.06,   0.02,   0.00])
-    gt_grid   = np.array([1.35,   1.05,   0.78,   0.60,   0.46,   0.33,   0.22,   0.10,   0.00])
-    tj_grid   = np.array([1.55,   1.32,   1.12,   0.92,   0.75,   0.58,   0.42,   0.25,   0.05])
-    jh_grid   = np.array([0.60,   0.62,   0.64,   0.56,   0.46,   0.33,   0.23,   0.12,   0.02])
-    hk_grid   = np.array([0.26,   0.23,   0.19,   0.14,   0.10,   0.07,   0.05,   0.03,   0.01])
-    
-    vg = float(np.interp(teff_clamped, teff_grid, vg_grid))
-    gt = float(np.interp(teff_clamped, teff_grid, gt_grid))
-    tj = float(np.interp(teff_clamped, teff_grid, tj_grid))
-    jh = float(np.interp(teff_clamped, teff_grid, jh_grid))
-    hk = float(np.interp(teff_clamped, teff_grid, hk_grid))
-    
-    if not np.isfinite(tmag):
-        if np.isfinite(gmag):
-            tmag = gmag - gt
-        elif np.isfinite(vmag):
-            tmag = vmag - vg - gt
-        elif np.isfinite(jmag):
-            tmag = jmag + tj
-        else:
-            tmag = 12.5
-            
-    if not np.isfinite(gmag):
-        gmag = tmag + gt
-    if not np.isfinite(vmag):
-        vmag = gmag + vg
-        
-    j_fallback = False
-    if not np.isfinite(jmag):
-        jmag = tmag - tj
-        j_fallback = True
-    if not np.isfinite(hmag):
-        hmag = jmag - jh
-    if not np.isfinite(kmag):
-        kmag = hmag - hk
-        
-    return {
-        "Tmag": round(float(tmag), 3),
-        "Vmag": round(float(vmag), 3),
-        "Gmag": round(float(gmag), 3),
-        "Jmag": round(float(jmag), 3),
-        "Hmag": round(float(hmag), 3),
-        "Kmag": round(float(kmag), 3),
-        "nir_estimated": j_fallback
-    }
-
-
-def batch_query_tic_photometry(tic_ids: list[str]) -> dict:
-    catalog_map = {}
-    int_ids = [int(t) for t in tic_ids if str(t).isdigit()]
-    if not int_ids:
-        return catalog_map
-        
-    print(f"[TIC Query] Querying MAST TIC v8.2 catalog for {len(int_ids)} targets...")
-    try:
-        tic_table = Catalogs.query_criteria(catalog="Tic", ID=int_ids)
-        for row in tic_table:
-            tid = str(int(row["ID"]))
-            catalog_map[tid] = {
-                "ra": to_clean_float(row["ra"]),
-                "dec": to_clean_float(row["dec"]),
-                "Tmag": to_clean_float(row["Tmag"]),
-                "Vmag": to_clean_float(row["Vmag"]),
-                "Gmag": to_clean_float(row["GAIAmag"]),
-                "Jmag": to_clean_float(row["Jmag"]),
-                "Hmag": to_clean_float(row["Hmag"]),
-                "Kmag": to_clean_float(row["Kmag"]),
-                "r_star": to_clean_float(row["rad"]),
-                "e_r_star": to_clean_float(row["e_rad"]) if "e_rad" in row.colnames else np.nan,
-                "m_star": to_clean_float(row["mass"]),
-                "e_m_star": to_clean_float(row["e_mass"]) if "e_mass" in row.colnames else np.nan,
-                "teff": to_clean_float(row["Teff"]),
-                "e_teff": to_clean_float(row["e_Teff"]) if "e_Teff" in row.colnames else np.nan,
-            }
-    except Exception as e:
-        print(f"      [!] Batch TIC query warning ({e}), falling back to individual lookups...")
-        for tid in int_ids:
-            try:
-                sub = Catalogs.query_criteria(catalog="Tic", ID=tid)
-                if len(sub) > 0:
-                    row = sub[0]
-                    catalog_map[str(tid)] = {
-                        "ra": to_clean_float(row["ra"]),
-                        "dec": to_clean_float(row["dec"]),
-                        "Tmag": to_clean_float(row["Tmag"]),
-                        "Vmag": to_clean_float(row["Vmag"]),
-                        "Gmag": to_clean_float(row["GAIAmag"]),
-                        "Jmag": to_clean_float(row["Jmag"]),
-                        "Hmag": to_clean_float(row["Hmag"]),
-                        "Kmag": to_clean_float(row["Kmag"]),
-                        "r_star": to_clean_float(row["rad"]),
-                        "e_r_star": to_clean_float(row["e_rad"]) if "e_rad" in row.colnames else np.nan,
-                        "m_star": to_clean_float(row["mass"]),
-                        "e_m_star": to_clean_float(row["e_mass"]) if "e_mass" in row.colnames else np.nan,
-                        "teff": to_clean_float(row["Teff"]),
-                        "e_teff": to_clean_float(row["e_Teff"]) if "e_Teff" in row.colnames else np.nan,
-                    }
-            except Exception:
-                continue
-    return catalog_map
-
-
-def extract_camera_ccd_from_cache(tic_id: str) -> tuple[str, str]:
-    cache_dirs = [
-        os.environ.get("LIGHTKURVE_CACHE_DIR", ""),
-        os.path.join(os.path.expanduser("~"), ".lightkurve", "cache"),
-        os.path.join(os.path.expanduser("~"), ".cache", "lightkurve")
-    ]
-    padded = str(tic_id).zfill(16)
-    for cdir in cache_dirs:
-        if not cdir or not os.path.exists(cdir):
-            continue
-        matches = glob.glob(os.path.join(cdir, "**", f"*{padded}*lc.fits"), recursive=True)
-        if matches:
-            try:
-                with fits.open(matches[-1], memmap=False) as hdul:
-                    hdr = hdul[0].header
-                    cam = str(hdr.get("CAMERA", "N/A"))
-                    ccd = str(hdr.get("CCD", "N/A"))
-                    return cam, ccd
-            except Exception:
-                pass
-    return "N/A", "N/A"
-
-
-def planck_spectral_radiance(wavelength_m: float, temp_k: float) -> float:
-    if temp_k <= 20.0:
-        return 0.0
-    exponent = (H_PLANCK * C_LIGHT) / (wavelength_m * K_BOLTZ * temp_k)
-    exponent = min(float(exponent), 500.0)
-    return float((2.0 * H_PLANCK * (C_LIGHT ** 2) / (wavelength_m ** 5)) / np.expm1(exponent))
-
-
-def compute_astrophysical_metrics(
-    rp_earth: float,
-    p_days: float,
-    b_impact: float,
-    r_star_sun: float,
-    m_star_sun: float,
-    teff_k: float,
-    jmag: float,
-    kmag: float,
-    v_or_tmag: float
-) -> dict:
-    rp_e = max(0.3, float(rp_earth))
-    p_d = max(0.1, float(p_days))
-    r_s = max(0.08, float(r_star_sun))
-    m_s = max(0.08, float(m_star_sun)) if (np.isfinite(m_star_sun) and m_star_sun > 0) else (r_s ** 1.1)
-    t_eff = max(2500.0, float(teff_k)) if (np.isfinite(teff_k) and teff_k > 0) else 5500.0
-    b_val = float(np.clip(b_impact if np.isfinite(b_impact) else 0.3, 0.0, 0.98))
-    
-    # 1. Planet Mass M_p (Chen & Kipping 2017 & Wolfgang et al. 2016)
-    if rp_e < 1.23:
-        mp_ck17 = (rp_e / 1.008) ** (1.0 / 0.279)
-    elif rp_e <= 14.26:
-        mp_ck17 = (rp_e / 0.8081) ** (1.0 / 0.589)
-    else:
-        mp_ck17 = 131.6 * ((rp_e / 14.26) ** 2.0)
-    mp_w16 = 2.7 * (rp_e ** 1.3)
-    
-    # 2. Bulk Density & Surface Gravity
-    rp_m = rp_e * R_EARTH
-    vol_cm3 = (4.0 / 3.0) * np.pi * ((rp_m * 100.0) ** 3)
-    rho_p_cgs = (mp_ck17 * M_EARTH * 1000.0) / vol_cm3
-    g_p_ms2 = (G_SI * mp_ck17 * M_EARTH) / (rp_m ** 2)
-    
-    # 3. Orbital Dynamics & Temperature
-    p_sec = p_d * 86400.0
-    m_star_kg = m_s * M_SUN
-    r_star_m = r_s * R_SUN
-    a_m = (G_SI * m_star_kg * (p_sec ** 2) / (4.0 * np.pi ** 2)) ** (1.0 / 3.0)
-    a_au = a_m / AU_M
-    a_over_rs = a_m / r_star_m
-    
-    l_star_sun = (r_s ** 2) * ((t_eff / T_SUN) ** 4)
-    insolation_earth = l_star_sun / (a_au ** 2)
-    teq_k = t_eff * np.sqrt(r_star_m / (2.0 * a_m))
-    t_day_k = 1.10 * teq_k
-    
-    # 4. Radial Velocity Semi-Amplitude K (m/s)
-    sin_i = np.sqrt(max(0.01, 1.0 - (b_val / max(a_over_rs, 1.1)) ** 2))
-    rv_prefactor = ((2.0 * np.pi * G_SI / p_sec) ** (1.0 / 3.0)) * sin_i / (m_star_kg ** (2.0 / 3.0))
-    k_rv_ck17 = float(rv_prefactor * (mp_ck17 * M_EARTH))
-    k_rv_w16 = float(rv_prefactor * (mp_w16 * M_EARTH))
-    
-    # 5. Transmission Spectroscopy Metric (TSM, Kempton et al. 2018)
-    if rp_e < 1.50:
-        tsm_scale, tsm_benchmark = 0.190, 10.0
-    elif rp_e < 2.75:
-        tsm_scale, tsm_benchmark = 1.26, 90.0
-    elif rp_e < 4.00:
-        tsm_scale, tsm_benchmark = 1.28, 90.0
-    elif rp_e <= 10.00:
-        tsm_scale, tsm_benchmark = 1.15, 90.0
-    else:
-        tsm_scale, tsm_benchmark = 1.00, 90.0
-        
-    tsm = float(tsm_scale * ((rp_e ** 3) * teq_k / (mp_ck17 * (r_s ** 2))) * (10.0 ** (-0.2 * jmag)))
-    
-    # 6. Emission Spectroscopy Metric (ESM, Kempton et al. 2018)
-    lam_75um = 7.5e-6
-    b_planet = planck_spectral_radiance(lam_75um, t_day_k)
-    b_star = max(1e-30, planck_spectral_radiance(lam_75um, t_eff))
-    rp_over_rs_phys = rp_m / r_star_m
-    esm = float(4.29e6 * (b_planet / b_star) * (rp_over_rs_phys ** 2) * (10.0 ** (-0.2 * kmag)))
-    
-    # 7. Follow-Up Prioritization Tiers
-    if k_rv_ck17 >= 3.0 and v_or_tmag <= 13.5:
-        rv_tier = "HIGH (Tier-1 ESPRESSO/HARPS-N/MAROON-X)"
-    elif k_rv_ck17 >= 1.5 and v_or_tmag <= 15.0:
-        rv_tier = "MEDIUM (Tier-2 MAROON-X/ESPRESSO)"
-    else:
-        rv_tier = "LOW (Faint host or K < 1.5 m/s)"
-        
-    if tsm >= tsm_benchmark or esm >= 7.5:
-        jwst_tier = "TOP-QUARTILE JWST TARGET (TSM/ESM Pass)"
-    elif tsm >= 0.5 * tsm_benchmark or esm >= 4.0:
-        jwst_tier = "MODERATE JWST TARGET"
-    else:
-        jwst_tier = "BASELINE PHOTOMETRIC TARGET"
-        
-    return {
-        "mp_ck17_earth": round(mp_ck17, 2),
-        "mp_w16_earth": round(mp_w16, 2),
-        "rho_p_gcm3": round(rho_p_cgs, 2),
-        "g_p_ms2": round(g_p_ms2, 2),
-        "a_au": round(a_au, 5),
-        "a_over_rstar": round(a_over_rs, 2),
-        "insolation_earth": round(insolation_earth, 1),
-        "teq_k": round(teq_k, 0),
-        "t_day_k": round(t_day_k, 0),
-        "rv_k_ck17_ms": round(k_rv_ck17, 2),
-        "rv_k_w16_ms": round(k_rv_w16, 2),
-        "tsm": round(tsm, 1),
-        "esm": round(esm, 2),
-        "rv_followup_priority": rv_tier,
-        "jwst_followup_priority": jwst_tier
-    }
-
+# Moved by C9 (S3.5) to lightcurve_helpers.py and stellar_metrics.py; imported above.
 
 # ==============================================================================
 # STAGE 3A: FAST PRE-FILTER GATE
@@ -368,6 +91,20 @@ def calc_sidak_corrected_risk(row: pd.Series) -> float:
     Legacy unsupported secondary-penalty subtraction has been removed per ALD-012 / SCI-16.
     """
     return validate_and_extract_vps_score(row)
+
+
+def pleiades_fit_failed(df: pd.DataFrame) -> pd.Series:
+    """SUCCESS Tier-2 rows whose Pleiades transit fit failed (S3.10, item 39.1). ERROR rows stay with the contract."""
+    if "fit_status" not in df.columns or "operational_status" not in df.columns:
+        return pd.Series(False, index=df.index)
+    fit = df["fit_status"].astype(str).str.strip().str.upper() == "FAILED"
+    ok = df["operational_status"].astype(str).str.strip().str.upper() == "SUCCESS"
+    return fit & ok
+
+
+def fit_failed_stage_3a_status(disposition) -> str:
+    """INCOMPLETE_FIT_FAILED stays incomplete; a negative flag kept after the failed fit is a reject."""
+    return "INCOMPLETE_FIT_FAILED" if str(disposition).strip() == "INCOMPLETE_FIT_FAILED" else "REJECT"
 
 
 def run_stage_3a_filter(
@@ -422,7 +159,14 @@ def run_stage_3a_filter(
     df_merged["period_d"] = _get_num_series("refined_period_days", "period_days")
     df_merged["t0_btjd"] = _get_num_series("refined_t0_btjd", "t0_btjd")
     df_merged["duration_hours"] = _get_num_series("fitted_duration_hours", "duration_hours")
-    df_merged["depth_ppm"] = _get_num_series("fitted_depth_ppm", "depth_ppm")
+    # Depth is descriptive here, not one of the five gate predicates below.
+    # Keep missing evidence missing; only packaging requires a positive observable.
+    def _box_value(row):
+        try:
+            return photometric_depth(row)[0]
+        except ValueError:
+            return np.nan
+    df_merged["depth_ppm"] = df_merged.apply(_box_value, axis=1)
     df_merged["rp_e"] = _get_num_series("fitted_rp_earth", "r_planet_earth")
     df_merged["dur_ratio"] = _get_num_series("dur_to_kepler_max")
     df_merged["sec_snr"] = _get_num_series("secondary_snr_sigma")
@@ -432,6 +176,22 @@ def run_stage_3a_filter(
         df_merged["sec_eclipse_phase"] = np.nan
     if "sectors_stitched" not in df_merged.columns:
         df_merged["sectors_stitched"] = ""
+
+    # S3.10 (item 39.1): a SUCCESS record whose Pleiades fit failed has no VPS score. It leaves Stage 3A
+    # here, before the score contract, is never drilled, and gets its own Stage 3 audit row.
+    fit_failed = pleiades_fit_failed(df_merged)
+    df_fit_failed = df_merged[fit_failed].copy().reset_index(drop=True)
+    df_fit_failed["stage_3a_status"] = [fit_failed_stage_3a_status(d) for d in df_fit_failed.get("disposition", [])]
+    df_fit_failed["stage_3a_reason"] = [f"Pleiades transit fit FAILED: {d}" for d in df_fit_failed.get("disposition", [])]
+    df_merged = df_merged[~fit_failed].copy()
+    if len(df_fit_failed):
+        print(f"[Stage 3A] {len(df_fit_failed)} Tier-2 record(s) with a failed Pleiades fit are not drilled: "
+              f"{', '.join(df_fit_failed['tic_id'])}")
+        if len(df_merged) == 0:
+            empty_survivors = pd.DataFrame(columns=[
+                "tic_id", "corr_risk", "period_d", "rp_e", "dur_ratio", "contam_pct", "neb_count", "sectors_stitched"
+            ])
+            return empty_survivors, df_fit_failed
 
     # Validates versioned VPS component accounting and extracts authoritative score (no subtraction)
     df_merged["corr_risk"] = df_merged.apply(calc_sidak_corrected_risk, axis=1)
@@ -601,16 +361,18 @@ def run_stage_3a_filter(
     # 4. Stellar environment: dilution & nearby EBs
     env_pass = (df_merged["neb_count"] <= max_neb_neighbors) & (df_merged["contam_pct"] <= max_flux_contam_pct)
 
-    # 5. Versioned VPS risk threshold (Gate <= max_corr_risk, default <= 25.0)
+    # 5. Uncalibrated heuristic VPS threshold (Gate <= max_corr_risk, default <= 25.0; not a probability)
     risk_pass = df_merged["corr_risk"] <= max_corr_risk
 
     gate_mask = (~is_gaia_nss) & (~is_known_eb) & sec_pass & dur_pass & env_pass & risk_pass
 
     df_survivors = df_merged[gate_mask].sort_values(by="corr_risk").reset_index(drop=True)
     df_rejected = df_merged[~gate_mask].copy().reset_index(drop=True)
+    if len(df_fit_failed):
+        df_rejected = pd.concat([df_rejected, df_fit_failed], ignore_index=True)
 
     print(f"[Stage 3A Result] Input: {len(df_merged)} -> Rejected: {len(df_rejected)} -> Passed Gate: {len(df_survivors)} targets")
-    print(f"[Stage 3A] Gate condition 5: VPS <= {max_corr_risk:.1f} (default <= {ANTARES_DEFAULT_MAX_CORR_RISK:.1f})")
+    print(f"[Stage 3A] Gate condition 5: VPS heuristic points <= {max_corr_risk:.1f} (default <= {ANTARES_DEFAULT_MAX_CORR_RISK:.1f}; uncalibrated, not a probability)")
     print(f"[Stage 3A] Compute runtime saving: {100.0 * (1.0 - len(df_survivors) / max(1, len(df_merged))):.1f}% reduction in MAST downloads.\n")
 
     disp_cols = ["tic_id", "corr_risk", "period_d", "rp_e", "dur_ratio", "contam_pct", "neb_count", "sectors_stitched"]
@@ -628,312 +390,101 @@ def run_stage_3a_filter(
 # STAGE 3B: DECOUPLED MULTI-YEAR ARCHIVAL DRILL (SPOC FIRST VS FFI BLEND TRACK)
 # ==============================================================================
 
-def extract_multi_author_lc(lc_obj, author: str, edge_trim_days: float = 0.08) -> tuple[np.ndarray, np.ndarray, np.ndarray, float] | None:
-    try:
-        t = to_numpy(lc_obj.time)
-        f = None
-        if author == "TGLC":
-            for col in ["cal_psf_flux", "psf_flux", "cal_aper_flux", "flux"]:
-                if hasattr(lc_obj, col) and getattr(lc_obj, col) is not None:
-                    f_try = to_numpy(getattr(lc_obj, col))
-                    if np.sum(np.isfinite(f_try)) > 100:
-                        f = f_try
-                        break
-        elif author == "QLP":
-            for col in ["kspsap_flux", "sap_flux", "flux"]:
-                if hasattr(lc_obj, col) and getattr(lc_obj, col) is not None:
-                    f_try = to_numpy(getattr(lc_obj, col))
-                    if np.sum(np.isfinite(f_try)) > 100:
-                        f = f_try
-                        break
-        if f is None:
-            f = to_numpy(lc_obj.flux)
+def assess_blend(author_stats: dict, contam_pct: float) -> tuple:
+    """Stage 3B blend check on finite depths only.
 
-        if hasattr(lc_obj, "quality") and lc_obj.quality is not None:
-            qual = np.asarray(lc_obj.quality, dtype=int)
-            q_valid = (qual == 0)
-        else:
-            q_valid = np.ones_like(t, dtype=bool)
-
-        valid = np.isfinite(t) & np.isfinite(f) & q_valid
-        if np.sum(valid) < 80:
-            return None
-        t, f = t[valid], f[valid]
-
-        med_f = float(np.nanmedian(f))
-        if med_f <= 0:
-            f = f - med_f + 1.0
-            med_f = 1.0
-        f = f / med_f
-
-        mad_f = float(1.4826 * np.nanmedian(np.abs(f - 1.0)) + 1e-12)
-        keep = (f > 0.5) & (f < (1.0 + 3.5 * mad_f))
-        if np.sum(keep) < 80:
-            return None
-        t, f = t[keep], f[keep]
-        sort_idx = np.argsort(t)
-        t, f = t[sort_idx], f[sort_idx]
-
-        dt_arr = np.diff(t)
-        cadence_days = float(np.nanmedian(dt_arr[dt_arr > 0])) if len(dt_arr) > 0 else (120.0 / 86400.0)
-
-        if edge_trim_days > 0 and (t[-1] - t[0]) > 5.0:
-            gap_idx = np.where(np.diff(t) > 0.08)[0]
-            edge_keep = (t >= (t[0] + edge_trim_days)) & (t <= (t[-1] - edge_trim_days))
-            for g_i in gap_idx:
-                edge_keep &= ~((t >= (t[g_i] - edge_trim_days)) & (t <= (t[g_i + 1] + edge_trim_days)))
-            if np.sum(edge_keep) >= 80:
-                t, f = t[edge_keep], f[edge_keep]
-
-        diff_mad = float(1.4826 * np.nanmedian(np.abs(np.diff(f))) / np.sqrt(2.0))
-        sigma_pt = max(diff_mad, 1e-5)
-        ferr = np.full_like(f, sigma_pt)
-
-        return t, f, ferr, cadence_days
-    except Exception:
-        return None
-
-
-def hybrid_tukey_savgol_detrend(
-    t: np.ndarray,
-    f: np.ndarray,
-    cadence_days: float,
-    window_days: float = 0.65,
-    transit_mask: np.ndarray = None
-) -> np.ndarray:
-    if transit_mask is None:
-        transit_mask = np.zeros_like(t, dtype=bool)
-    t_unmasked = t[~transit_mask]
-    f_unmasked = f[~transit_mask]
-    if len(t_unmasked) < 20:
-        return f / np.nanmedian(f)
-
-    f_interp = np.interp(t, t_unmasked, f_unmasked)
-    trend_sg = np.ones_like(f)
-    split_idx = np.where(np.diff(t) > 0.08)[0] + 1
-    segments = np.split(np.arange(len(t)), split_idx)
-    target_win_pts = max(15, int(round((window_days * 1.3) / max(cadence_days, 0.0005))))
-
-    for seg in segments:
-        if len(seg) < 15:
-            trend_sg[seg] = np.nanmedian(f_interp[seg]) if len(seg) > 0 else 1.0
-            continue
-        win = min(target_win_pts, (len(seg) // 2) * 2 - 1)
-        if win >= 7:
-            trend_sg[seg] = savgol_filter(f_interp[seg], window_length=win, polyorder=2)
-        else:
-            trend_sg[seg] = np.nanmedian(f_interp[seg])
-
-    f_sg = f / np.where(np.isfinite(trend_sg) & (trend_sg > 0.1), trend_sg, 1.0)
-    f_sg_unmasked = f_sg[~transit_mask]
-
-    half_win = 0.5 * window_days
-    c_tukey = 6.0
-    step = max(1, len(t) // 350)
-    t_grid = t[::step]
-    trend_grid = np.ones_like(t_grid)
-
-    idx_l = np.searchsorted(t_unmasked, t_grid - half_win, side="left")
-    idx_r = np.searchsorted(t_unmasked, t_grid + half_win, side="right")
-
-    for i, (l_i, r_i) in enumerate(zip(idx_l, idx_r)):
-        if r_i - l_i < 5:
-            trend_grid[i] = 1.0
-            continue
-        seg = f_sg_unmasked[l_i:r_i]
-        med = np.median(seg)
-        mad = np.median(np.abs(seg - med))
-        if mad < 1e-12:
-            trend_grid[i] = med
-            continue
-        for _ in range(2):
-            u = (seg - med) / (c_tukey * mad)
-            v = np.abs(u) < 1.0
-            if not np.any(v):
-                break
-            w = (1.0 - (u[v] ** 2)) ** 2
-            med = np.sum(w * seg[v]) / np.sum(w)
-        trend_grid[i] = med
-
-    trend_tb = np.interp(t, t_grid, trend_grid)
-    f_clean = f_sg / np.where(np.isfinite(trend_tb) & (trend_tb > 0.1), trend_tb, 1.0)
-    return f_clean / np.nanmedian(f_clean)
-
-
-# Pre-computed 5-point Gauss-Legendre quadrature on [-0.5, +0.5] for 300-ring sub-sampling
-_GL5_NODES, _GL5_WEIGHTS = np.polynomial.legendre.leggauss(5)
-_GL5_NODES = 0.5 * _GL5_NODES
-_GL5_WEIGHTS = 0.5 * _GL5_WEIGHTS
-
-
-def annulus_300_transit_model(
-    phase_days: np.ndarray,
-    rp_rs: float,
-    b: float,
-    dur_days: float,
-    u1: float,
-    u2: float,
-    exp_time_days: float = 0.0,
-    n_rings: int = 300
-) -> np.ndarray:
+    Returns (blended_suspect, blend_reason, blend_check) where blend_check is
+    "EVALUATED" or "NOT_EVALUATED". A check without a finite SPOC depth or
+    without at least one finite QLP/TGLC depth never rejects.
     """
-    Evaluates a quadratic limb-darkened transit light curve across 300 concentric stellar
-    annuli using 5-point Gauss-Legendre radial sub-quadrature (< 3.1 ppm max error vs
-    analytical Mandel & Agol 2002) and optional 7-point Kipping (2010) time integration.
-    """
-    rp_rs = float(np.clip(rp_rs, 0.001, 0.35))
-    b = float(np.clip(b, 0.0, 0.995))
-    dur_days = max(float(dur_days), 0.005)
-
-    r_edges = np.linspace(0.0, 1.0, n_rings + 1)
-    dr = 1.0 / n_rings
-    r_mid = 0.5 * (r_edges[:-1] + r_edges[1:])
-
-    r_sub = (r_mid[:, None] + _GL5_NODES[None, :] * dr).ravel()
-    w_sub = (2.0 * np.pi * r_sub * dr) * np.tile(_GL5_WEIGHTS, n_rings)
-    mu = np.sqrt(np.clip(1.0 - r_sub ** 2, 0.0, 1.0))
-    intensity = 1.0 - u1 * (1.0 - mu) - u2 * (1.0 - mu) ** 2
-    sub_flux = w_sub * intensity
-    total_flux = np.sum(sub_flux)
-
-    r_c = r_sub[None, :]
-    half_chord = np.sqrt(max(1e-6, (1.0 + rp_rs) ** 2 - b ** 2))
-
-    def eval_instantaneous(ph_arr: np.ndarray) -> np.ndarray:
-        x_proj = (ph_arr / (0.5 * dur_days)) * half_chord
-        z = np.hypot(b, x_proj)
-        fl = np.ones_like(ph_arr, dtype=np.float64)
-        in_d = z < (1.0 + rp_rs)
-        if not np.any(in_d):
-            return fl
-        z_in = z[in_d][:, None]
-        blocked = np.zeros((z_in.shape[0], len(r_sub)), dtype=np.float64)
-        full_c = (z_in + r_c) <= rp_rs
-        blocked[full_c] = 1.0
-        part_c = (~full_c) & (np.abs(z_in - r_c) < rp_rs) & (z_in > 0)
-        if np.any(part_c):
-            zp = np.broadcast_to(z_in, blocked.shape)[part_c]
-            rp = np.broadcast_to(r_c, blocked.shape)[part_c]
-            cos_a = (zp ** 2 + rp ** 2 - rp_rs ** 2) / (2.0 * zp * rp)
-            blocked[part_c] = np.arccos(np.clip(cos_a, -1.0, 1.0)) / np.pi
-        fl[in_d] = 1.0 - (np.sum(blocked * sub_flux[None, :], axis=1) / total_flux)
-        return fl
-
-    if exp_time_days <= 0.002:
-        return eval_instantaneous(phase_days)
-
-    offsets = np.linspace(-0.5 * exp_time_days, 0.5 * exp_time_days, 7)
-    acc = np.zeros_like(phase_days, dtype=np.float64)
-    for off in offsets:
-        acc += eval_instantaneous(phase_days + off)
-    return acc / 7.0
+    if "SPOC" not in author_stats or not ("QLP" in author_stats or "TGLC" in author_stats):
+        return False, "", "NOT_EVALUATED"
+    d_spoc = float(author_stats["SPOC"].get("depth_ppm", np.nan))
+    alt = [float(author_stats[a].get("depth_ppm", np.nan)) for a in ("QLP", "TGLC") if a in author_stats]
+    alt = [d for d in alt if np.isfinite(d)]
+    if not np.isfinite(d_spoc) or not alt:
+        return False, "", "NOT_EVALUATED"
+    d_alt = max(alt)
+    if d_spoc > 2.5 * max(d_alt, 1.0) and contam_pct > 5.0 and d_alt < 200.0:
+        return True, f"SPOC depth ({d_spoc:.0f} ppm) diluted > 2.5x in QLP/TGLC ({d_alt:.0f} ppm)", "EVALUATED"
+    return False, "", "EVALUATED"
 
 
-def refine_multi_year_ephemeris(
-    t_all: np.ndarray,
-    f_all: np.ndarray,
-    ferr_all: np.ndarray,
-    p_init: float,
-    t0_init: float,
-    dur_days: float
-) -> tuple[float, float, np.ndarray, np.ndarray]:
-    baseline_days = max(27.0, float(np.max(t_all) - np.min(t_all)))
-    n_cycles = max(10.0, baseline_days / p_init)
-
-    half_span_p = max(0.00015 * p_init, min(0.0012 * p_init, 3.5 * dur_days / max(n_cycles, 50.0)))
-    max_dp = (0.025 * dur_days) / n_cycles
-    n_grid = int(np.clip((2.0 * half_span_p) / max_dp, 1200, 8000))
-    trial_periods = np.linspace(p_init - half_span_p, p_init + half_span_p, n_grid)
-
-    weights = 1.0 / np.maximum(ferr_all ** 2, 1e-10)
-    deficit = 1.0 - f_all
-    half_tr = 0.45 * dur_days
-
-    snr_grid = np.zeros(n_grid, dtype=np.float64)
-    for i, p_try in enumerate(trial_periods):
-        ph = ((t_all - t0_init + 0.5 * p_try) % p_try) - 0.5 * p_try
-        in_m = np.abs(ph) < half_tr
-        if np.sum(in_m) < 8:
-            continue
-        w_in = weights[in_m]
-        w_sum = np.sum(w_in)
-        mean_def = np.sum(w_in * deficit[in_m]) / w_sum
-        snr_grid[i] = mean_def * np.sqrt(w_sum)
-
-    best_idx = int(np.nanargmax(snr_grid))
-    p_refined = float(trial_periods[best_idx])
-
-    t0_grid = np.linspace(t0_init - 0.35 * dur_days, t0_init + 0.35 * dur_days, 300)
-    t0_snr = np.zeros_like(t0_grid)
-    for j, t0_try in enumerate(t0_grid):
-        ph = ((t_all - t0_try + 0.5 * p_refined) % p_refined) - 0.5 * p_refined
-        in_m = np.abs(ph) < half_tr
-        if np.sum(in_m) >= 8:
-            w_in = weights[in_m]
-            w_sum = np.sum(w_in)
-            t0_snr[j] = (np.sum(w_in * deficit[in_m]) / w_sum) * np.sqrt(w_sum)
-
-    t0_refined = float(t0_grid[int(np.nanargmax(t0_snr))])
-    return p_refined, t0_refined, trial_periods, snr_grid
+# S3.13, ARGON_DECISIONS item 34.1 (Stage 3B part). The Filter 4 state travels in the candidate record
+# (`centroid_state`, written by aldebaran.py since S3.8). A CENTROID_NOT_EVALUATED peak may stay a candidate only
+# if a pixel-level spatial check evaluated it and passed: the TPF check, read only from the explicit record field
+# `tpf_spatial_pass` (written by aldebaran.py from S3.12 on), or the Stage 3B blend check. Otherwise it is capped
+# at REVIEW and not packaged. A legacy record without `centroid_state` is NOT_RECORDED and is not capped.
+CENTROID_EVALUATED = "EVALUATED"
+CENTROID_NOT_EVALUATED = "CENTROID_NOT_EVALUATED"
+CENTROID_NOT_RECORDED = "NOT_RECORDED"
+ARCHIVAL_REVIEW = "ARCHIVAL_REVIEW"
+SPATIAL_TPF_PASS = "TPF_PASS"
+SPATIAL_BLEND_PASS = "STAGE_3B_BLEND_PASS"
+SPATIAL_NONE = "NONE"
 
 
-def compute_transit_metrics(
-    t: np.ndarray,
-    f: np.ndarray,
-    ferr: np.ndarray,
-    p_val: float,
-    t0_val: float,
-    dur_days: float,
-    cadence_days: float = 0.0014
-) -> dict:
-    eff_dur = np.hypot(dur_days, cadence_days)
-    ph = ((t - t0_val + 0.5 * p_val) % p_val) - 0.5 * p_val
-    in_tr = np.abs(ph) < (0.45 * eff_dur)
-    out_tr = (np.abs(ph) > (0.70 * (dur_days + cadence_days))) & (np.abs(ph) < min(0.25 * p_val, 3.5 * dur_days))
+def _record_text(value) -> str:
+    if value is None or (isinstance(value, float) and not np.isfinite(value)):
+        return ""
+    return str(value).strip()
 
-    n_pts_in = int(np.sum(in_tr))
-    if n_pts_in < 3 or np.sum(out_tr) < 10:
-        return {"n_transits": 0, "n_cadences_in": n_pts_in, "depth_ppm": np.nan, "err_white_ppm": np.nan, "snr_white": 0.0, "snr_red": 0.0, "beta_red": 1.0}
 
-    orbit_nums = np.round((t - t0_val) / p_val).astype(int)
-    n_unique_transits = int(len(np.unique(orbit_nums[in_tr])))
+def candidate_centroid_state(candidate: dict) -> str:
+    """Filter 4 state carried by the candidate record; NOT_RECORDED when the record has none (legacy)."""
+    return _record_text(candidate.get("centroid_state")).upper() or CENTROID_NOT_RECORDED
 
-    w_in = 1.0 / np.maximum(ferr[in_tr] ** 2, 1e-10)
-    w_out = 1.0 / np.maximum(ferr[out_tr] ** 2, 1e-10)
-    base_val = float(np.sum(w_out * f[out_tr]) / np.sum(w_out))
-    in_val = float(np.sum(w_in * f[in_tr]) / np.sum(w_in))
 
-    depth_ppm = (base_val - in_val) * 1e6
-    err_white_ppm = float((1.0 / np.sqrt(np.sum(w_in))) * 1e6)
-    snr_white = depth_ppm / max(err_white_ppm, 1.0)
+def tpf_spatial_pass_recorded(candidate: dict) -> bool:
+    """True only when the record states explicitly that the TPF spatial check evaluated the peak and passed."""
+    value = candidate.get("tpf_spatial_pass")
+    if isinstance(value, (bool, np.bool_)):
+        return bool(value)
+    return _record_text(value).upper() in ("TRUE", "1", "1.0")
 
-    win_ph = min(0.20 * p_val, 3.0 * dur_days)
-    vis = np.abs(ph) <= win_ph
-    bins = np.linspace(-win_ph, win_ph, 35)
-    b_means, b_edges, _ = stats.binned_statistic(ph[vis], f[vis], statistic="mean", bins=bins)
-    b_cnt, _, _ = stats.binned_statistic(ph[vis], f[vis], statistic="count", bins=bins)
-    b_centers = 0.5 * (b_edges[:-1] + b_edges[1:])
-    oot_b = (np.abs(b_centers) > (0.70 * (dur_days + cadence_days))) & (b_cnt >= 3)
 
-    if np.sum(oot_b) >= 6:
-        oot_bin_std_ppm = float(np.nanstd(b_means[oot_b]) * 1e6)
-        bin_w = (2.0 * win_ph) / 34.0
-        n_bins_tr = max(1.0, eff_dur / bin_w)
-        err_red_ppm = oot_bin_std_ppm / np.sqrt(n_bins_tr)
-        beta_red = max(1.0, err_red_ppm / max(err_white_ppm, 1.0))
-        snr_red = depth_ppm / max(err_red_ppm, err_white_ppm, 1.0)
+def stage_3b_centroid_cap(candidate: dict, blend_check: str, blended_suspect: bool) -> tuple:
+    """Item 34.1 at Stage 3B. Returns (capped, centroid_state, spatial_check)."""
+    state = candidate_centroid_state(candidate)
+    if tpf_spatial_pass_recorded(candidate):
+        spatial = SPATIAL_TPF_PASS
+    elif blend_check == "EVALUATED" and not blended_suspect:
+        spatial = SPATIAL_BLEND_PASS
     else:
-        beta_red = 1.0
-        snr_red = snr_white
+        spatial = SPATIAL_NONE
+    # Any recorded state other than EVALUATED (CENTROID_NOT_EVALUATED or an unknown value) needs a spatial pass.
+    capped = state not in (CENTROID_EVALUATED, CENTROID_NOT_RECORDED) and spatial == SPATIAL_NONE
+    return capped, state, spatial
 
+
+def archival_decision_reason(res: dict) -> str:
+    """Audit text for one Stage 3B result; failed products are named, never dropped (C1g)."""
+    failed = res.get("products_failed") or []
+    if not failed or res.get("status") == "ARCHIVAL_ERROR":
+        reason = res["reason"]
+    else:
+        reason = f"{res['reason']}; {len(failed)} light curve product(s) not used"
+    if failed:
+        reason += ": " + "; ".join(f"S{f['sector']} {f['author'] or '?'} {f['stage']} ({f['reason']})" for f in failed)
+    return reason
+
+
+def stage_3b_audit_row(tic_id, res: dict) -> dict:
+    """Stage 3 audit row of one drilled target (C1g: failed products named in decision_reason)."""
     return {
-        "n_transits": n_unique_transits,
-        "n_cadences_in": n_pts_in,
-        "depth_ppm": round(depth_ppm, 1),
-        "err_white_ppm": round(err_white_ppm, 1),
-        "snr_white": round(snr_white, 2),
-        "snr_red": round(snr_red, 2),
-        "beta_red": round(beta_red, 2)
+        "tic_id": tic_id,
+        "stage_3a": "PASS",
+        "stage_3b_status": res["status"],
+        "decision_reason": archival_decision_reason(res),
+        "refined_period_days": res.get("p_ref", np.nan),
+        "snr_red": res.get("snr_red", np.nan),
+        "snr_white": res.get("snr_white", np.nan),
+        "depth_ppm": res.get("depth_ppm", np.nan),
+        "stack_author": res.get("stack_author", "N/A"),
+        "n_transits": res.get("n_transits", 0),
+        "blend_check": res.get("blend_check", "NOT_EVALUATED"),
+        "centroid_state": candidate_centroid_state(res.get("candidate") or {}),
+        "spatial_check": res.get("spatial_check", "NOT_EVALUATED"),
     }
 
 
@@ -952,7 +503,7 @@ def execute_archival_drill(
     p_init = float(candidate["period_d"])
     t0_init = float(candidate.get("t0_btjd", 3980.0))
     dur_hr = float(candidate.get("duration_hours", 2.0))
-    dur_days = dur_hr / 24.0
+    dur_days = hours_to_days(dur_hr)
 
     print(f"\n---> Archival Drill: TIC {tid} (P = {p_init:.6f} d | T0 = {t0_init:.5f} BTJD | Dur = {dur_hr:.2f} h)")
 
@@ -970,7 +521,9 @@ def execute_archival_drill(
     records = []
     seen_sec_author = set()
 
+    products_failed = []  # C1g: every product that could not be used, with its stage and reason
     for item in search_all:
+        sec_num, auth, stage = -1, "", "PRODUCT_METADATA"
         try:
             auth = str(item.author[0]).upper()
             if auth not in AUTHOR_PRIORITY:
@@ -983,13 +536,17 @@ def execute_archival_drill(
                 continue
             seen_sec_author.add(key)
 
+            stage = "DOWNLOAD"
             lc_dl = item.download()
-            extracted = extract_multi_author_lc(lc_dl, auth, edge_trim_days=0.08)
+            stage = "EXTRACTION"
+            extracted = extract_multi_author_lc(lc_dl, auth, edge_trim_days=0.08, raise_errors=True)
             if extracted is None:
+                products_failed.append(light_curve_product_failure(sec_num, auth, stage, EXTRACTION_TOO_FEW_POINTS))
                 continue
             t_s, f_s, ferr_s, cad_days = extracted
             obs_year = btjd_to_year(float(np.nanmedian(t_s)))
 
+            stage = "DETRENDING"
             f_pass1 = hybrid_tukey_savgol_detrend(t_s, f_s, cad_days, window_days=0.65, transit_mask=None)
 
             records.append({
@@ -1004,12 +561,22 @@ def execute_archival_drill(
                 "f_pass1": f_pass1,
                 "ferr": ferr_s
             })
-        except Exception:
+        except Exception as exc:
+            products_failed.append(light_curve_product_failure(sec_num, auth, stage, exc))
             continue
 
+    for failed in products_failed:
+        print(f"      [!] Product not used: Sector {failed['sector']} | Author: {failed['author'] or '?'} | "
+              f"{failed['stage']}: {failed['reason']}")
     if not records:
         print(f"      [!] Failed to extract valid light curves for TIC {tid}.")
-        return {"status": "ARCHIVAL_REJECT", "reason": "No valid light curves extracted", "candidate": candidate}
+        if products_failed:
+            # C1g (items 29 and 31.6): products exist but none could be read; nothing was evaluated.
+            return {"status": "ARCHIVAL_ERROR",
+                    "reason": f"All {len(products_failed)} light curve product(s) failed to download or prepare",
+                    "candidate": candidate, "products_failed": products_failed}
+        return {"status": "ARCHIVAL_REJECT", "reason": "No valid light curves extracted", "candidate": candidate,
+                "products_failed": products_failed}
 
     # Deduplicate: select 1 best light curve per sector for ephemeris locking
     records.sort(key=lambda r: (r["sector"], r["priority"]))
@@ -1080,19 +647,11 @@ def execute_archival_drill(
     spoc_snr_red = master_metrics["snr_red"]
     spoc_depth = master_metrics["depth_ppm"]
 
-    # Blending Diagnostic Check:
-    blended_suspect = False
-    blend_reason = ""
-    if "SPOC" in author_stats and ("QLP" in author_stats or "TGLC" in author_stats):
-        d_spoc = author_stats["SPOC"]["depth_ppm"]
-        d_alt = max(
-            author_stats.get("QLP", {}).get("depth_ppm", 0.0),
-            author_stats.get("TGLC", {}).get("depth_ppm", 0.0)
-        )
-        contam = float(candidate.get("contam_pct", 0.0))
-        if d_spoc > 2.5 * max(d_alt, 1.0) and contam > 5.0 and d_alt < 200.0:
-            blended_suspect = True
-            blend_reason = f"SPOC depth ({d_spoc:.0f} ppm) diluted > 2.5x in QLP/TGLC ({d_alt:.0f} ppm)"
+    # Blending Diagnostic Check (finite depths only; see assess_blend):
+    blended_suspect, blend_reason, blend_check = assess_blend(
+        author_stats, float(candidate.get("contam_pct", 0.0))
+    )
+    centroid_capped, centroid_state, spatial_check = stage_3b_centroid_cap(candidate, blend_check, blended_suspect)
 
     # Stage 3B Decision Gate
     if spoc_snr_red < min_spoc_snr_red and master_metrics["snr_white"] < (min_spoc_snr_red + 0.3):
@@ -1101,6 +660,10 @@ def execute_archival_drill(
     elif blended_suspect:
         status = "ARCHIVAL_REJECT"
         decision_reason = f"Aperture Dilution / Blended ({blend_reason})"
+    elif centroid_capped:
+        status = ARCHIVAL_REVIEW
+        decision_reason = (f"{CENTROID_NOT_EVALUATED}: no pixel-level spatial check passed (TPF pass not recorded; "
+                           f"Stage 3B blend check {blend_check}); capped at REVIEW, not packaged (item 34.1)")
     else:
         status = "ARCHIVAL_PASS"
         decision_reason = f"SNR_red={spoc_snr_red:.2f}s (SNR_white={master_metrics['snr_white']:.1f}s) on {stack_author} stack (N={master_metrics['n_transits']} transits across {n_sectors_stack} sectors)"
@@ -1115,12 +678,12 @@ def execute_archival_drill(
     out_png = os.path.join(archival_dir, f"antares_TIC_{tid}.png")
     try:
         fig, axes = plt.subplots(2, 2, figsize=(14, 10))
-        win_hrs = min(0.18 * p_ref, 2.5 * dur_days) * 24.0
+        win_hrs = days_to_hours(min(0.18 * p_ref, 2.5 * dur_days))
         bins_hrs = np.linspace(-win_hrs, win_hrs, 35)
         b_centers = 0.5 * (bins_hrs[:-1] + bins_hrs[1:])
 
         # Panel 1: Master Phase-Folded Transit
-        ph_hrs = (((t_master - t0_ref + 0.5 * p_ref) % p_ref) - 0.5 * p_ref) * 24.0
+        ph_hrs = days_to_hours(((t_master - t0_ref + 0.5 * p_ref) % p_ref) - 0.5 * p_ref)
         vis = np.abs(ph_hrs) <= win_hrs
         axes[0, 0].scatter(ph_hrs[vis], f_master[vis], s=2, color="silver", alpha=0.35, label=f"Cadences ({n_sectors_stack} Secs)")
         bm, _, _ = stats.binned_statistic(ph_hrs[vis], f_master[vis], statistic="mean", bins=bins_hrs)
@@ -1142,7 +705,7 @@ def execute_archival_drill(
             a_recs = [r for r in records if r["author"] == auth]
             t_a = np.concatenate([r["t"] for r in a_recs])
             f_a = np.concatenate([r["f_clean"] for r in a_recs])
-            ph_a_hrs = (((t_a - t0_ref + 0.5 * p_ref) % p_ref) - 0.5 * p_ref) * 24.0
+            ph_a_hrs = days_to_hours(((t_a - t0_ref + 0.5 * p_ref) % p_ref) - 0.5 * p_ref)
             vis_a = np.abs(ph_a_hrs) <= win_hrs
             if np.sum(vis_a) < 15:
                 continue
@@ -1217,13 +780,55 @@ def execute_archival_drill(
         "beta_red": master_metrics["beta_red"],
         "n_transits": master_metrics["n_transits"],
         "poster_path": out_png,
-        "author_stats": author_stats
+        "author_stats": author_stats,
+        "blend_check": blend_check,
+        "centroid_state": centroid_state,
+        "spatial_check": spatial_check,
+        "products_failed": products_failed,
     }
 
 
 # ==============================================================================
 # STAGE 3C: ASTROPHYSICAL PARAMETERS & CTOI PACKAGING
 # ==============================================================================
+
+# S2.5 (IMPROVE-QUICK 001): one header per Stage 3C table, whether or not a candidate is packaged.
+# The order is that of the ranking row built in run_stage_3c_packaging, with "rank" inserted first.
+ANTARES_RANKING_COLS = (
+    "rank", "tic_id", "depth_schema_version", "depth_kind", "depth_source", "radius_source",
+    "impact_parameter_source", "characterization_assumptions", "output_producer", "priority_score",
+    "disposition", "corr_risk_percent", "sectors", "archival_stack", "period_days", "t0_btjd",
+    "epoch_bjd", "duration_hours", "depth_ppm", "rp_earth", "snr_red", "snr_white", "n_transits",
+    "mp_ck17_earth", "mp_w16_earth", "rho_p_gcm3", "g_p_ms2", "rv_k_ck17_ms", "rv_k_w16_ms",
+    "tsm", "esm", "teq_k", "insolation_earth", "a_au", "a_over_rstar", "impact_param_b",
+    "r_star_sun", "m_star_sun", "teff_k", "Tmag", "Vmag", "Gmag", "Jmag", "Hmag", "Kmag",
+    "nir_phot_estimated", "flux_contam_percent", "neb_capable_neighbors", "rv_followup_priority",
+    "jwst_followup_priority", "exofop_url",
+)
+ANTARES_EXOFOP_COLS = (
+    "TIC ID", "Camera", "CCD", "Epoch BJD", "Period",
+    "Depth", "Duration", "Rp", "User Comments / Disposition",
+)
+
+
+def write_empty_tier3_outputs(results_dir: str) -> None:
+    """Write the four Tier 3 tables with headers and no rows (no candidate to package)."""
+    ranking_cols = list(ANTARES_RANKING_COLS)
+    exofop_cols = list(ANTARES_EXOFOP_COLS)
+    ranking_csv = os.path.join(results_dir, "antares_prioritized_targets_ranking.csv")
+    exofop_csv = os.path.join(results_dir, "antares_exofop_ctoi_upload.csv")
+    exofop_comma_csv = os.path.join(results_dir, "antares_exofop_ctoi_upload_comma.csv")
+    top3_csv = os.path.join(results_dir, "antares_exofop_ctoi_upload_top3.csv")
+    # Precheck every path before writing any zero-survivor table.
+    check_output_schema(ranking_csv, ranking_cols)
+    check_output_schema(exofop_csv, exofop_cols, "|")
+    check_output_schema(exofop_comma_csv, exofop_cols)
+    check_output_schema(top3_csv, exofop_cols)
+    pd.DataFrame(columns=ranking_cols).to_csv(ranking_csv, index=False)
+    pd.DataFrame(columns=exofop_cols).to_csv(exofop_csv, index=False, sep="|")
+    pd.DataFrame(columns=exofop_cols).to_csv(exofop_comma_csv, index=False)
+    pd.DataFrame(columns=exofop_cols).to_csv(top3_csv, index=False)
+
 
 def run_stage_3c_packaging(
     vetted_results: list[dict],
@@ -1238,8 +843,14 @@ def run_stage_3c_packaging(
     print("=" * 76)
 
     passing_cands = [r for r in vetted_results if r["status"] == "ARCHIVAL_PASS"]
+    # S3.13 (item 34.1): a result whose centroid cap holds is never packaged, whatever its status says.
+    capped = [r for r in passing_cands if stage_3b_centroid_cap(r["candidate"], r.get("blend_check"), False)[0]]
+    for r in capped:
+        print(f"[!] TIC {r['candidate']['tic_id']}: {CENTROID_NOT_EVALUATED} without a passed spatial check; not packaged.")
+    passing_cands = [r for r in passing_cands if not any(r is c for c in capped)]
     if not passing_cands:
         print("[!] No candidates passed Stage 3B archival vetting.")
+        write_empty_tier3_outputs(results_dir)
         return pd.DataFrame(), pd.DataFrame()
 
     tic_ids = [str(r["candidate"]["tic_id"]) for r in passing_cands]
@@ -1255,19 +866,25 @@ def run_stage_3c_packaging(
 
         p_days = r["p_ref"]
         t0_btjd = r["t0_ref"]
-        epoch_bjd = t0_btjd + BTJD_OFFSET
-        dur_hr = to_clean_float(cand.get("duration_hours"), 2.0)
+        epoch_bjd = btjd_to_bjd(t0_btjd, strict=True)
+        dur_hr = to_clean_float(cand.get("duration_hours"), np.nan)
         depth_ppm = r["depth_ppm"]
 
         # Stellar parameters
-        r_star = to_clean_float(t_meta.get("r_star"), to_clean_float(cand.get("r_star_sun"), 1.0))
-        m_star = to_clean_float(t_meta.get("m_star"), to_clean_float(cand.get("m_star_sun"), r_star ** 1.1))
-        teff = to_clean_float(t_meta.get("teff"), to_clean_float(cand.get("teff_k"), 5500.0))
+        r_star = to_clean_float(t_meta.get("r_star"), to_clean_float(cand.get("r_star_sun"), np.nan))
+        m_star = to_clean_float(t_meta.get("m_star"), to_clean_float(cand.get("m_star_sun"), np.nan))
+        teff = to_clean_float(t_meta.get("teff"), to_clean_float(cand.get("teff_k"), np.nan))
 
-        # Fitted planet radius: derived from SPOC depth
-        rp_rs = np.sqrt(max(1e-6, depth_ppm * 1e-6))
-        rp_earth = rp_rs * r_star * 109.076
-        b_imp = to_clean_float(cand.get("impact_param_b"), 0.30)
+        # Radius and box depth have different meanings; never derive k from the box.
+        try:
+            rp_earth, radius_source = geometric_radius(cand)
+            validate_observables(p_days, t0_btjd, dur_hr, depth_ppm, rp_earth)
+            if not all(np.isfinite(v) and v > 0 for v in (r_star, m_star, teff)):
+                raise ValueError("Missing measured host parameters")
+        except ValueError as exc:
+            logger.error("TIC %s not characterizable: %s", tid, exc)
+            continue
+        b_imp = to_clean_float(cand.get("impact_param_b"), np.nan)
 
         phot = estimate_missing_photometry(
             t_meta.get("Tmag", np.nan),
@@ -1296,7 +913,7 @@ def run_stage_3c_packaging(
         neb_cnt = int(cand.get("neb_count", 0))
         secs_str = str(cand.get("sectors_stitched") if pd.notna(cand.get("sectors_stitched")) and str(cand.get("sectors_stitched")) != "" else cand.get("sector", "N/A"))
 
-        # Composite Follow-Up Priority Score
+        # Composite Follow-Up Priority Score (uses uncalibrated heuristic VPS points, not a probability)
         clean_weight = max(0.1, (100.0 - corr_risk) / 100.0)
         priority_score = round(clean_weight * (0.65 * astro["tsm"] + 4.5 * astro["rv_k_ck17_ms"] + 1.5 * astro["esm"]), 2)
 
@@ -1304,6 +921,13 @@ def run_stage_3c_packaging(
 
         ranking_rows.append({
             "tic_id": tid,
+            "depth_schema_version": DEPTH_SCHEMA,
+            "depth_kind": "measured_box_photometric",
+            "depth_source": "antares_archive_inverse_variance_box",
+            "radius_source": radius_source,
+            "impact_parameter_source": "input_fit_or_legacy" if np.isfinite(b_imp) else "missing",
+            "characterization_assumptions": "legacy_model_b_default_0.3" if not np.isfinite(b_imp) else "legacy_characterization_model",
+            "output_producer": "antares_packager",
             "priority_score": priority_score,
             "disposition": "TIER-3 VETTED CANDIDATE",
             "corr_risk_percent": round(corr_risk, 1),
@@ -1352,8 +976,14 @@ def run_stage_3c_packaging(
             f"Aldebaran v8.0 / Pleiades v2.2 / Antares v3.0 Candidate (Sectors {secs_str}, N={r['n_transits']} transits, SNR_red={r['snr_red']:.1f}s). "
             f"Conditional Planetary Characterization: Teq={int(astro['teq_k'])}K, Mp_est={astro['mp_ck17_earth']:.1f} M_E, "
             f"RV K={astro['rv_k_ck17_ms']:.1f} m/s, TSM={astro['tsm']:.1f}, ESM={astro['esm']:.1f}. "
+            f"Depth=archival measured box; radius={radius_source}. "
+            f"Impact source={'input_fit_or_legacy' if np.isfinite(b_imp) else 'missing; characterization assumes b=0.3'}. "
             f"Gaia Contam={contam_pct:.1f}% ({neb_cnt} NEB neighbors). Disposition: PC (VPS heuristic points={corr_risk:.1f}/100; uncalibrated, not a probability)."
         )
+        # Item 34.1: a candidate without a usable centroid test keeps the label, with the spatial check that passed.
+        _cstate, _spatial = stage_3b_centroid_cap(cand, r.get("blend_check"), False)[1:]
+        if _cstate == CENTROID_NOT_EVALUATED:
+            comment_str += f" Centroid test: {CENTROID_NOT_EVALUATED} (spatial check passed: {_spatial})."
 
         exofop_rows.append({
             "TIC ID": tid,
@@ -1367,6 +997,8 @@ def run_stage_3c_packaging(
             "User Comments / Disposition": comment_str
         })
 
+    if not ranking_rows:
+        raise ValueError("No characterizable archival candidates; existing outputs untouched")
     df_rank = pd.DataFrame(ranking_rows)
     df_rank = df_rank.sort_values(
         by=["priority_score", "tsm", "rv_k_ck17_ms"],
@@ -1380,10 +1012,21 @@ def run_stage_3c_packaging(
     df_exofop = df_exofop.sort_values(by="sort_key").drop(columns=["sort_key"]).reset_index(drop=True)
 
     # Save to disk
-    ranking_csv = os.path.join(results_dir, "prioritized_targets_ranking.csv")
-    exofop_csv = os.path.join(results_dir, "exofop_ctoi_upload.csv")
-    exofop_comma_csv = os.path.join(results_dir, "exofop_ctoi_upload_comma.csv")
+    ranking_csv = os.path.join(results_dir, "antares_prioritized_targets_ranking.csv")
+    exofop_csv = os.path.join(results_dir, "antares_exofop_ctoi_upload.csv")
+    exofop_comma_csv = os.path.join(results_dir, "antares_exofop_ctoi_upload_comma.csv")
 
+    if list(df_rank.columns) != list(ANTARES_RANKING_COLS) or list(df_exofop.columns) != list(ANTARES_EXOFOP_COLS):
+        raise ValueError("Stage 3C table columns differ from ANTARES_RANKING_COLS / ANTARES_EXOFOP_COLS; "
+                         "existing outputs untouched")
+    check_output_schema(ranking_csv, df_rank.columns)
+    check_output_schema(exofop_csv, df_exofop.columns, "|")
+    check_output_schema(exofop_comma_csv, df_exofop.columns)
+    # S2.5: a non-empty run writes no top-3 table, so Tier-4 keeps reading the full ranking. A header-only
+    # top-3 table left by an earlier zero-survivor run would make merge_shards skip Tier-4; refuse it.
+    top3_csv = os.path.join(results_dir, "antares_exofop_ctoi_upload_top3.csv")
+    if os.path.exists(top3_csv):
+        raise ValueError("Refusing stale zero-survivor table at " + top3_csv + "; existing outputs untouched")
     df_rank.to_csv(ranking_csv, index=False)
     df_exofop.to_csv(exofop_csv, index=False, sep="|")
     df_exofop.to_csv(exofop_comma_csv, index=False)
@@ -1433,7 +1076,12 @@ def run_antares_packager(
     if target_tic is not None:
         target_tic = str(target_tic).strip()
         df_survivors = df_survivors[df_survivors["tic_id"] == target_tic]
-        if len(df_survivors) == 0:
+        fit_failed_tics = set(df_rejected["tic_id"][df_rejected["stage_3a_status"].notna()]) \
+            if "stage_3a_status" in df_rejected.columns else set()
+        if len(df_survivors) == 0 and target_tic in fit_failed_tics:
+            # S3.10 (item 39.1): a failed Pleiades fit is never drilled, not even on an explicit --tic.
+            print(f"[!] Target TIC {target_tic} has a failed Pleiades transit fit; it is not drilled.")
+        elif len(df_survivors) == 0:
             print(f"[!] Target TIC {target_tic} not found in surviving candidates. Searching in raw Tier-1...")
             df_raw = pd.read_csv(tier1_csv)
             df_raw["tic_id"] = df_raw["tic_id"].astype(str).str.strip()
@@ -1446,23 +1094,7 @@ def run_antares_packager(
 
     if len(df_survivors) == 0:
         print("[!] No candidates available for Stage 3B archival drilling (0 survivors).")
-        ranking_cols = [
-            "rank", "tic_id", "period_days", "t0_btjd", "duration_hours",
-            "depth_ppm", "rp_earth", "mp_ck17_earth", "rv_k_ck17_ms",
-            "tsm", "esm", "snr_red", "corr_risk_percent", "priority_score"
-        ]
-        exofop_cols = [
-            "TIC ID", "Camera", "CCD", "Epoch BJD", "Period",
-            "Depth", "Duration", "Rp", "User Comments / Disposition"
-        ]
-        ranking_csv = os.path.join(results_dir, "prioritized_targets_ranking.csv")
-        exofop_csv = os.path.join(results_dir, "exofop_ctoi_upload.csv")
-        exofop_comma_csv = os.path.join(results_dir, "exofop_ctoi_upload_comma.csv")
-        top3_csv = os.path.join(results_dir, "exofop_ctoi_upload_top3.csv")
-        pd.DataFrame(columns=ranking_cols).to_csv(ranking_csv, index=False)
-        pd.DataFrame(columns=exofop_cols).to_csv(exofop_csv, index=False, sep="|")
-        pd.DataFrame(columns=exofop_cols).to_csv(exofop_comma_csv, index=False)
-        pd.DataFrame(columns=exofop_cols).to_csv(top3_csv, index=False)
+        write_empty_tier3_outputs(results_dir)
         return
 
     # Step 2: Stage 3B Decoupled Archival Drill
@@ -1477,32 +1109,27 @@ def run_antares_packager(
             min_spoc_snr_red=min_snr
         )
         vetted_results.append(res)
-        audit_rows.append({
-            "tic_id": row["tic_id"],
-            "stage_3a": "PASS",
-            "stage_3b_status": res["status"],
-            "decision_reason": res["reason"],
-            "refined_period_days": res.get("p_ref", np.nan),
-            "snr_red": res.get("snr_red", np.nan),
-            "snr_white": res.get("snr_white", np.nan),
-            "depth_ppm": res.get("depth_ppm", np.nan),
-            "stack_author": res.get("stack_author", "N/A"),
-            "n_transits": res.get("n_transits", 0)
-        })
+        audit_rows.append(stage_3b_audit_row(row["tic_id"], res))
 
     # Record rejected targets in audit
     for _, r_row in df_rejected.iterrows():
+        fit_failed_status = r_row.get("stage_3a_status")
+        fit_failed_row = isinstance(fit_failed_status, str) and bool(fit_failed_status)
         audit_rows.append({
             "tic_id": r_row["tic_id"],
-            "stage_3a": "REJECT",
+            "stage_3a": fit_failed_status if fit_failed_row else "REJECT",
             "stage_3b_status": "SKIPPED",
-            "decision_reason": f"Stage 3A Filter (VPS heuristic points={r_row.get('corr_risk')}/100, DurRatio={r_row.get('dur_ratio')}%, NEB={r_row.get('neb_count')})",
+            "decision_reason": r_row["stage_3a_reason"] if fit_failed_row else
+            f"Stage 3A Filter (VPS heuristic points={r_row.get('corr_risk')}/100, DurRatio={r_row.get('dur_ratio')}%, NEB={r_row.get('neb_count')})",
             "refined_period_days": r_row.get("period_d", np.nan),
             "snr_red": np.nan,
             "snr_white": np.nan,
             "depth_ppm": np.nan,
             "stack_author": "N/A",
-            "n_transits": 0
+            "n_transits": 0,
+            "blend_check": "SKIPPED",
+            "centroid_state": candidate_centroid_state(r_row.to_dict()),
+            "spatial_check": "SKIPPED",
         })
 
     audit_csv = os.path.join(results_dir, "stage3_vetting_audit.csv")
@@ -1520,6 +1147,9 @@ def run_antares_packager(
     print(f"Total Tier-2 Candidates: {len(df_survivors) + len(df_rejected)}")
     print(f"Passing Stage 3A Gate:   {len(df_survivors)}")
     print(f"Passing Stage 3B Drill:  {len([r for r in vetted_results if r['status'] == 'ARCHIVAL_PASS'])}")
+    n_review = len([r for r in vetted_results if r["status"] == ARCHIVAL_REVIEW])
+    if n_review:
+        print(f"Stage 3B REVIEW (centroid cap): {n_review}")
     print(f"Packaged for NASA CTOI:  {len(df_exofop)}")
     print("=" * 76)
 

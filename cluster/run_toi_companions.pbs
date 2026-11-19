@@ -14,11 +14,26 @@ echo "Job ID: $PBS_JOBID"
 echo "Start time: $(date)"
 echo "======================================================================"
 
-REPO_DIR="$PBS_O_WORKDIR"
-if [ ! -f "$REPO_DIR/search_toi_companions.py" ] && [ -f "$REPO_DIR/../search_toi_companions.py" ]; then
+REPO_DIR="${PBS_O_WORKDIR:-}"
+if [ -n "$REPO_DIR" ] && [ ! -f "$REPO_DIR/search_toi_companions.py" ] && [ -f "$REPO_DIR/../search_toi_companions.py" ]; then
     REPO_DIR="$(cd "$REPO_DIR/.." && pwd)"
 fi
+if [ -z "$REPO_DIR" ] || [ ! -f "$REPO_DIR/search_toi_companions.py" ]; then
+    echo "ERROR: Invalid REPO_DIR '$REPO_DIR' or missing search_toi_companions.py!" >&2
+    exit 1
+fi
 cd "$REPO_DIR" || exit 1
+
+# Fail closed before any cache export or copy: an empty SCRATCHDIR would turn
+# "$SCRATCHDIR/" into "/" (same guard as cluster/run_aldebaran.pbs).
+if [ -z "${SCRATCHDIR:-}" ] || [ ! -d "$SCRATCHDIR" ]; then
+    echo "ERROR: SCRATCHDIR '${SCRATCHDIR:-}' is unset or does not exist!" >&2
+    exit 1
+fi
+if [ "$SCRATCHDIR" = "/" ] || [ "$SCRATCHDIR" = "${HOME:-}" ]; then
+    echo "ERROR: SCRATCHDIR points to unsafe path: '$SCRATCHDIR'!" >&2
+    exit 1
+fi
 
 module add python/3.11 2>/dev/null || module add python 2>/dev/null || true
 
@@ -32,6 +47,7 @@ mkdir -p "$XDG_CACHE_HOME" "$PIP_CACHE_DIR" "$LIGHTKURVE_CACHE_DIR" "$ASTROPY_CA
 # Copy code and existing cache to scratch
 cp "$REPO_DIR"/*.py "$SCRATCHDIR/"
 cp "$REPO_DIR"/requirements.txt "$SCRATCHDIR/" 2>/dev/null || true
+cp "$REPO_DIR"/constraints-linux-py311.txt "$SCRATCHDIR/" 2>/dev/null || true
 mkdir -p "$SCRATCHDIR/tess_results/toi_companions"
 if [ -d "$REPO_DIR/tess_results" ]; then
     cp -rf "$REPO_DIR/tess_results"/. "$SCRATCHDIR/tess_results/" 2>/dev/null || true
@@ -86,7 +102,12 @@ if ! python -m pip install --upgrade pip --no-cache-dir --quiet; then
 fi
 
 if [ -f requirements.txt ]; then
-    if ! python -m pip install --no-cache-dir --quiet -r requirements.txt certifi; then
+    # Pin to the saved Linux Python 3.11 freeze when the repository ships it.
+    PIP_CONSTRAINT_ARGS=()
+    if [ -f constraints-linux-py311.txt ]; then
+        PIP_CONSTRAINT_ARGS=(-c constraints-linux-py311.txt)
+    fi
+    if ! python -m pip install --no-cache-dir --quiet "${PIP_CONSTRAINT_ARGS[@]}" -r requirements.txt certifi; then
         echo "ERROR: Failed to install dependencies from requirements.txt!" >&2
         exit 3
     fi
@@ -136,11 +157,83 @@ sync_and_finalize() {
     return 0
 }
 
-# Run TOI companion search on sectors 106 down to 99 across 8 parallel workers
-EXIT_CODE=0
-python search_toi_companions.py --sectors 106 105 104 103 102 101 100 99 --workers 8 --output-dir "$SCRATCHDIR/tess_results/toi_companions" || EXIT_CODE=$?
+# Signal handling (walltime SIGTERM, interactive SIGINT): stop the workload
+# process tree within a bounded grace period, then copy the incrementally
+# flushed partial results back with sync_and_finalize and exit 143 or 130.
+# Scratch is retained because the exit code is non-zero.
+ACTIVE_CHILD_PID=""
+TOI_SIGNAL_GRACE_SECONDS="${TOI_SIGNAL_GRACE_SECONDS:-5}"
 
-# Sync results and diagnostics back to permanent repo storage
+stop_workload_tree() {
+    local root_pid="$1"
+    [ -n "$root_pid" ] || return 0
+    local tracked="$root_pid"
+    if command -v pgrep >/dev/null 2>&1; then
+        # Snapshot descendants first: after the root dies they are reparented.
+        local queue="$root_pid" next p c
+        while [ -n "$queue" ]; do
+            next=""
+            for p in $queue; do
+                for c in $(pgrep -P "$p" 2>/dev/null); do
+                    tracked="$tracked $c"
+                    next="$next $c"
+                done
+            done
+            queue="$next"
+        done
+    fi
+    for p in $tracked; do
+        kill -TERM "$p" 2>/dev/null || true
+    done
+    local waited=0 any_alive
+    while [ "$waited" -lt "$((TOI_SIGNAL_GRACE_SECONDS * 4))" ]; do
+        any_alive=0
+        for p in $tracked; do
+            if kill -0 "$p" 2>/dev/null; then
+                any_alive=1
+                break
+            fi
+        done
+        [ "$any_alive" -eq 0 ] && break
+        sleep 0.25
+        waited=$((waited + 1))
+    done
+    for p in $tracked; do
+        if kill -0 "$p" 2>/dev/null; then
+            echo "WARNING: Process $p survived the ${TOI_SIGNAL_GRACE_SECONDS}s grace period, sending KILL." >&2
+            kill -KILL "$p" 2>/dev/null || true
+        fi
+    done
+    wait "$root_pid" 2>/dev/null || true
+}
+
+handle_signal() {
+    local sig_rc="$1"
+    # Ignore repeated signals so the partial-result copy is not cut short.
+    trap '' TERM INT
+    echo "WARNING: Signal received (exit $sig_rc). Terminating the workload and syncing partial results..." >&2
+    stop_workload_tree "$ACTIVE_CHILD_PID"
+    ACTIVE_CHILD_PID=""
+    sync_and_finalize "$sig_rc" "$SCRATCHDIR" "$REPO_DIR" || true
+    exit "$sig_rc"
+}
+
+trap 'handle_signal 143' TERM
+trap 'handle_signal 130' INT
+
+# Run TOI companion search on sectors 106 down to 99 across 8 parallel workers.
+# The workload runs in the background so that the wrapper's wait is interrupted
+# by a trapped signal; the wrapper always forwards TERM (a background job of a
+# non-interactive shell ignores SIGINT).
+EXIT_CODE=0
+python search_toi_companions.py --sectors 106 105 104 103 102 101 100 99 --workers 8 --output-dir "$SCRATCHDIR/tess_results/toi_companions" &
+ACTIVE_CHILD_PID=$!
+wait "$ACTIVE_CHILD_PID" || EXIT_CODE=$?
+ACTIVE_CHILD_PID=""
+
+# Sync results and diagnostics back to permanent repo storage. A signal that
+# arrives now is ignored so the final copy completes.
+trap '' TERM INT
 sync_and_finalize "$EXIT_CODE" "$SCRATCHDIR" "$REPO_DIR"
 FINAL_RC=$?
 

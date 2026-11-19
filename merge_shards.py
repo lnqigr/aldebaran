@@ -23,6 +23,8 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 import numpy as np
 import pandas as pd
 
+import run_identity as ri
+
 # Exit codes
 EXIT_SUCCESS = 0
 EXIT_OUTPUT_DIR_EXISTS = 1
@@ -102,14 +104,13 @@ def compute_file_sha256(filepath: str) -> str:
 
 def write_run_status(output_dir: str, status_dict: Dict[str, Any]) -> bool:
     """
-    Safely writes run_status.json to output_dir.
+    Safely writes run_status.json to output_dir using atomic replacement.
     If writing fails, falls back to printing both errors to sys.stderr.
     """
     status_path = os.path.join(output_dir, "run_status.json")
     try:
         os.makedirs(output_dir, exist_ok=True)
-        with open(status_path, "w", encoding="utf-8") as f:
-            json.dump(status_dict, f, indent=2)
+        ri.atomic_write_json(status_path, status_dict)
         return True
     except Exception as exc:
         sys.stderr.write(
@@ -945,6 +946,516 @@ def save_stage_log(
         ) from exc
 
 
+def _run_pleiades_stage(df_consolidated, output_dir, cand_csv, vet_dir, python_exe, resume, stages_executed):
+    """Pleiades Tier-2 Deep Vetting. Moved unchanged from orchestrate_downstream_stages (C11)."""
+    print(f"\n[+] Launching Pleiades Tier-2 Deep Vetting on '{cand_csv}' -> '{vet_dir}'...")
+    os.makedirs(vet_dir, exist_ok=True)
+    stage_log = os.path.join(output_dir, "stage_pleiades.log")
+    cmd = [python_exe, "pleiades.py", "--input-csv", cand_csv, "--output-dir", vet_dir]
+    pleiades_started = any(
+        fn == "run_identity_pleiades.json"
+        or fn.startswith("pleiades_record_TIC_")
+        or fn == "scientific_dossier_summary.csv"
+        for fn in os.listdir(vet_dir)
+    )
+    if resume and pleiades_started:
+        cmd.append("--resume")
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+
+    save_stage_log("pleiades", stage_log, cmd, proc, stages_executed)
+
+    if proc.returncode != 0:
+        stages_executed.append({
+            "stage": "pleiades",
+            "status": "FAILED",
+            "returncode": proc.returncode,
+            "log_file": stage_log,
+            "stderr_tail": proc.stderr[-500:] if proc.stderr else ""
+        })
+        raise StageExecutionError("pleiades", proc.returncode, proc.stderr)
+
+    expected_dossier_csv = os.path.join(vet_dir, "scientific_dossier_summary.csv")
+    if not os.path.exists(expected_dossier_csv):
+        err_msg = f"Expected artifact '{expected_dossier_csv}' not generated."
+        stages_executed.append({
+            "stage": "pleiades",
+            "status": "FAILED",
+            "returncode": proc.returncode,
+            "log_file": stage_log,
+            "stderr_tail": err_msg
+        })
+        raise StageExecutionError("pleiades", proc.returncode, err_msg)
+
+    # Per-input operational status / target reconciliation (B3 & C1)
+    expected_tics = [str(x).strip() for x in df_consolidated["tic_id"]] if "tic_id" in df_consolidated.columns else []
+    try:
+        df_dossier = pd.read_csv(expected_dossier_csv)
+    except Exception as exc:
+        err_msg = f"Failed to read Pleiades dossier summary '{expected_dossier_csv}': {exc}"
+        stages_executed.append({
+            "stage": "pleiades",
+            "status": "FAILED",
+            "returncode": EXIT_EXECUTION_FAILURE,
+            "log_file": stage_log,
+            "stderr_tail": err_msg
+        })
+        raise StageExecutionError("pleiades", EXIT_EXECUTION_FAILURE, err_msg)
+
+    dossier_tics = [str(x).strip() for x in df_dossier["tic_id"]] if "tic_id" in df_dossier.columns else []
+        
+    # Check multiset agreement
+    missing_dossier_tics = set(expected_tics) - set(dossier_tics)
+    if missing_dossier_tics:
+        err_msg = (
+            f"Pleiades summary dossier failed to account for input candidate target(s): {sorted(missing_dossier_tics)}. "
+            f"Every candidate target must have an operational status/reconciliation record in scientific_dossier_summary.csv."
+        )
+        stages_executed.append({
+            "stage": "pleiades",
+            "status": "FAILED",
+            "returncode": EXIT_EXECUTION_FAILURE,
+            "log_file": stage_log,
+            "stderr_tail": err_msg
+        })
+        raise StageExecutionError("pleiades", EXIT_EXECUTION_FAILURE, err_msg)
+
+    extra_dossier_tics = set(dossier_tics) - set(expected_tics)
+    if extra_dossier_tics:
+        err_msg = f"Pleiades summary dossier contains unexpected/unrequested target(s): {sorted(extra_dossier_tics)}."
+        stages_executed.append({
+            "stage": "pleiades",
+            "status": "FAILED",
+            "returncode": EXIT_EXECUTION_FAILURE,
+            "log_file": stage_log,
+            "stderr_tail": err_msg
+        })
+        raise StageExecutionError("pleiades", EXIT_EXECUTION_FAILURE, err_msg)
+
+    if len(dossier_tics) != len(set(dossier_tics)) and len(expected_tics) == len(set(expected_tics)):
+        err_msg = "Pleiades summary dossier contains duplicate records for target(s)."
+        stages_executed.append({
+            "stage": "pleiades",
+            "status": "FAILED",
+            "returncode": EXIT_EXECUTION_FAILURE,
+            "log_file": stage_log,
+            "stderr_tail": err_msg
+        })
+        raise StageExecutionError("pleiades", EXIT_EXECUTION_FAILURE, err_msg)
+
+    # Check for target operational errors (C1 & D2)
+    failed_targets = []
+    for _, r in df_dossier.iterrows():
+        t_id = str(r.get("tic_id", "")).strip()
+        op_status = str(r.get("operational_status", "")).strip().upper() if "operational_status" in df_dossier.columns and pd.notna(r.get("operational_status")) else None
+        disp = str(r.get("disposition", "")).strip().upper() if "disposition" in df_dossier.columns and pd.notna(r.get("disposition")) else ""
+        raw_err = str(r.get("error_message", "")).strip() if "error_message" in df_dossier.columns and pd.notna(r.get("error_message")) else ""
+        has_error_message = bool(raw_err and raw_err.upper() not in ("", "NAN", "NONE"))
+
+        is_failed = False
+        failure_reason = ""
+
+        if has_error_message:
+            is_failed = True
+            failure_reason = f"error_message: {raw_err}"
+        elif not op_status:
+            is_failed = True
+            failure_reason = "missing operational_status"
+        elif op_status not in ("SUCCESS", "COMPLETED", "PASS", "PASSED"):
+            is_failed = True
+            failure_reason = f"operational_status: {op_status}"
+        elif disp in ("ERROR", "FAILED", "NO_LIGHTCURVE"):
+            is_failed = True
+            failure_reason = f"disposition: {disp}"
+
+        if is_failed:
+            failed_targets.append((t_id, op_status or "MISSING_STATUS", failure_reason))
+
+    if failed_targets:
+        err_msg = (
+            f"Pleiades deep vetting failed for target(s): {failed_targets}. "
+            f"Target operational errors cannot be converted to physical false positives or zero-survivor science. "
+            f"Downstream chain continuation is stopped."
+        )
+        stages_executed.append({
+            "stage": "pleiades",
+            "status": "FAILED",
+            "returncode": EXIT_EXECUTION_FAILURE,
+            "log_file": stage_log,
+            "failed_targets": [ft[0] for ft in failed_targets],
+            "stderr_tail": err_msg
+        })
+        raise StageExecutionError("pleiades", EXIT_EXECUTION_FAILURE, err_msg)
+
+    stages_executed.append({
+        "stage": "pleiades",
+        "status": "COMPLETED",
+        "output_csv": expected_dossier_csv,
+        "returncode": proc.returncode,
+        "log_file": stage_log,
+        "reconciled_targets": len(dossier_tics),
+        "stdout_tail": proc.stdout[-500:] if proc.stdout else "",
+        "stderr_tail": proc.stderr[-500:] if proc.stderr else ""
+    })
+
+
+def _run_antares_stage(output_dir, python_exe, stages_executed):
+    """Antares Tier-3 Packager & Archival Follow-Up. Moved unchanged from orchestrate_downstream_stages (C11)."""
+    print(f"\n[+] Launching Antares Tier-3 Packager on '{output_dir}'...")
+    stage_log = os.path.join(output_dir, "stage_antares.log")
+    cmd = [python_exe, "antares_packager.py", "--results-dir", output_dir]
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+
+    save_stage_log("antares", stage_log, cmd, proc, stages_executed)
+
+    if proc.returncode != 0:
+        stages_executed.append({
+            "stage": "antares",
+            "status": "FAILED",
+            "returncode": proc.returncode,
+            "log_file": stage_log,
+            "stderr_tail": proc.stderr[-500:] if proc.stderr else ""
+        })
+        raise StageExecutionError("antares", proc.returncode, proc.stderr)
+
+    expected_exofop_csv = os.path.join(output_dir, "antares_exofop_ctoi_upload.csv")
+    expected_ranking_csv = os.path.join(output_dir, "antares_prioritized_targets_ranking.csv")
+    if not os.path.exists(expected_exofop_csv):
+        err_msg = f"Expected artifact '{expected_exofop_csv}' not generated."
+        stages_executed.append({
+            "stage": "antares",
+            "status": "FAILED",
+            "returncode": EXIT_EXECUTION_FAILURE,
+            "log_file": stage_log,
+            "stderr_tail": err_msg
+        })
+        raise StageExecutionError("antares", EXIT_EXECUTION_FAILURE, err_msg)
+
+    stages_executed.append({
+        "stage": "antares",
+        "status": "COMPLETED",
+        "output_csv": expected_exofop_csv,
+        "ranking_csv": expected_ranking_csv if os.path.exists(expected_ranking_csv) else None,
+        "returncode": proc.returncode,
+        "log_file": stage_log,
+        "stdout_tail": proc.stdout[-500:] if proc.stdout else "",
+        "stderr_tail": proc.stderr[-500:] if proc.stderr else ""
+    })
+
+
+def _run_triceratops_stage(df_consolidated, output_dir, python_exe, resume, run_antares, stages_executed):
+    """TRICERATOPS Tier-4 Bayesian Statistical Validation. Moved unchanged from orchestrate_downstream_stages (C11)."""
+    # A requested Antares stage must never consume stale CTOI outputs.
+    producer_prefix = "antares_" if run_antares else ""
+    top3_csv = os.path.join(output_dir, producer_prefix + "exofop_ctoi_upload_top3.csv")
+    if not os.path.exists(top3_csv):
+        ranking_csv = os.path.join(output_dir, producer_prefix + "prioritized_targets_ranking.csv")
+        if os.path.exists(ranking_csv):
+            top3_csv = ranking_csv
+        else:
+            # If neither exists: check if consolidated candidates was empty
+            if len(df_consolidated) == 0:
+                print("[+] Candidate catalog has 0 candidates. Skipping TRICERATOPS validation.")
+                stages_executed.append({
+                    "stage": "triceratops",
+                    "status": "SKIPPED_ZERO_TARGETS",
+                    "reason": "Consolidated catalog has zero candidates."
+                })
+                return
+
+            # Non-empty candidates, but missing Tier-3 prerequisite artifacts -> Stage error (B3)
+            err_msg = (
+                "Missing Tier-3 dependency: neither 'exofop_ctoi_upload_top3.csv' nor 'prioritized_targets_ranking.csv' "
+                "found for TRICERATOPS validation. Prior stage did not produce required target table."
+            )
+            stages_executed.append({
+                "stage": "triceratops",
+                "status": "FAILED",
+                "returncode": EXIT_EXECUTION_FAILURE,
+                "stderr_tail": err_msg
+            })
+            raise StageExecutionError("triceratops", EXIT_EXECUTION_FAILURE, err_msg)
+
+    # Check delimiter and read top3 table
+    with open(top3_csv, "r", encoding="utf-8") as f:
+        first_line = f.readline()
+    top_sep = "|" if "|" in first_line else ","
+    try:
+        df_top = pd.read_csv(top3_csv, sep=top_sep)
+    except Exception as exc:
+        err_msg = f"Failed to read top candidates table '{top3_csv}': {exc}"
+        stages_executed.append({
+            "stage": "triceratops",
+            "status": "FAILED",
+            "returncode": EXIT_EXECUTION_FAILURE,
+            "stderr_tail": err_msg
+        })
+        raise StageExecutionError("triceratops", EXIT_EXECUTION_FAILURE, err_msg)
+
+    if len(df_top) == 0:
+        print("[+] Target table for TRICERATOPS is empty (0 rows). Skipping Bayesian validation.")
+        stages_executed.append({
+            "stage": "triceratops",
+            "status": "SKIPPED_ZERO_TARGETS",
+            "reason": "Top candidates table is empty (0 rows)."
+        })
+        return
+
+    # Producer schema normalization: handle TIC ID and tic_id (C2)
+    tic_cols = [c for c in df_top.columns if c.strip().lower() in ("tic_id", "tic id", "tic", "tid")]
+    if not tic_cols:
+        tic_cols = [c for c in df_top.columns if "TIC" in c.upper()]
+    if not tic_cols:
+        err_msg = f"Top candidates table '{top3_csv}' contains {len(df_top)} rows but no recognizable TIC ID column (found: {list(df_top.columns)})."
+        stages_executed.append({
+            "stage": "triceratops",
+            "status": "FAILED",
+            "returncode": EXIT_EXECUTION_FAILURE,
+            "stderr_tail": err_msg
+        })
+        raise StageExecutionError("triceratops", EXIT_EXECUTION_FAILURE, err_msg)
+
+    tic_col_name = tic_cols[0]
+
+    # Ephemeris column validation before expensive invocation (C2)
+    p_cols = [c for c in df_top.columns if "PERIOD" in c.upper()]
+    epoch_cols = [c for c in df_top.columns if "EPOCH" in c.upper() or "T0" in c.upper()]
+    depth_cols = [c for c in ("Depth", "measured_box_depth_ppm", "depth_ppm") if c in df_top.columns]
+    dur_cols = [c for c in df_top.columns if "DUR" in c.upper()]
+    if not (p_cols and epoch_cols and depth_cols and dur_cols):
+        missing_cols = []
+        if not p_cols: missing_cols.append("Period")
+        if not epoch_cols: missing_cols.append("Epoch/T0")
+        if not depth_cols: missing_cols.append("Depth")
+        if not dur_cols: missing_cols.append("Duration")
+        err_msg = (
+            f"Top candidates table '{top3_csv}' is missing required ephemeris columns for TRICERATOPS: {missing_cols}. "
+            f"Available columns: {list(df_top.columns)}."
+        )
+        stages_executed.append({
+            "stage": "triceratops",
+            "status": "FAILED",
+            "returncode": EXIT_EXECUTION_FAILURE,
+            "stderr_tail": err_msg
+        })
+        raise StageExecutionError("triceratops", EXIT_EXECUTION_FAILURE, err_msg)
+
+    expected_top_tics = [str(x).strip() for x in df_top[tic_col_name].dropna().unique() if str(x).strip()]
+    if len(expected_top_tics) == 0:
+        stages_executed.append({
+            "stage": "triceratops",
+            "status": "SKIPPED_ZERO_TARGETS",
+            "reason": "Top candidates table has no non-null TIC IDs."
+        })
+        return
+
+    print(f"\n[+] Launching Tier-4 TRICERATOPS Bayesian Validation on '{top3_csv}'...")
+    stage_log = os.path.join(output_dir, "stage_triceratops.log")
+    cmd = [python_exe, "validate_triceratops.py", "--auto", "--top-csv", top3_csv, "--results-dir", output_dir]
+    tric_dir = os.path.join(output_dir, "triceratops")
+    tric_started = os.path.isdir(tric_dir) and any(
+        fn == "run_identity_triceratops.json"
+        or fn.startswith(("triceratops_record_TIC_", "triceratops_probs_TIC_"))
+        for fn in os.listdir(tric_dir)
+    )
+    if resume and tric_started:
+        cmd.append("--resume")
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+
+    save_stage_log("triceratops", stage_log, cmd, proc, stages_executed)
+
+    if proc.returncode != 0:
+        stages_executed.append({
+            "stage": "triceratops",
+            "status": "FAILED",
+            "returncode": proc.returncode,
+            "log_file": stage_log,
+            "stderr_tail": proc.stderr[-500:] if proc.stderr else ""
+        })
+        raise StageExecutionError("triceratops", proc.returncode, proc.stderr)
+
+    # Validate that actual per-target probability artifacts were created and satisfy contract (B3 & C2)
+    tric_dir = os.path.join(output_dir, "triceratops")
+    if not os.path.exists(tric_dir):
+        err_msg = f"TRICERATOPS output directory '{tric_dir}' was not created."
+        stages_executed.append({
+            "stage": "triceratops",
+            "status": "FAILED",
+            "returncode": EXIT_EXECUTION_FAILURE,
+            "log_file": stage_log,
+            "stderr_tail": err_msg
+        })
+        raise StageExecutionError("triceratops", EXIT_EXECUTION_FAILURE, err_msg)
+
+    prob_files = []
+    target_hashes = {}
+    for tic in expected_top_tics:
+        target_prob_file = os.path.join(tric_dir, f"triceratops_probs_TIC_{tic}.csv")
+        if not os.path.exists(target_prob_file):
+            err_msg = f"Missing TRICERATOPS probability table for expected target TIC {tic} ('{target_prob_file}')."
+            stages_executed.append({
+                "stage": "triceratops",
+                "status": "FAILED",
+                "returncode": EXIT_EXECUTION_FAILURE,
+                "log_file": stage_log,
+                "stderr_tail": err_msg
+            })
+            raise StageExecutionError("triceratops", EXIT_EXECUTION_FAILURE, err_msg)
+        if os.path.getsize(target_prob_file) == 0:
+            err_msg = f"TRICERATOPS probability table for TIC {tic} is empty (0 bytes)."
+            stages_executed.append({
+                "stage": "triceratops",
+                "status": "FAILED",
+                "returncode": EXIT_EXECUTION_FAILURE,
+                "log_file": stage_log,
+                "stderr_tail": err_msg
+            })
+            raise StageExecutionError("triceratops", EXIT_EXECUTION_FAILURE, err_msg)
+
+        # Structural artifact contract validation: parse CSV and verify columns and finite numbers (C2)
+        try:
+            df_prob = pd.read_csv(target_prob_file)
+        except Exception as exc:
+            err_msg = f"TRICERATOPS probability table for TIC {tic} ('{target_prob_file}') is not a parseable CSV: {exc}"
+            stages_executed.append({
+                "stage": "triceratops",
+                "status": "FAILED",
+                "returncode": EXIT_EXECUTION_FAILURE,
+                "log_file": stage_log,
+                "stderr_tail": err_msg
+            })
+            raise StageExecutionError("triceratops", EXIT_EXECUTION_FAILURE, err_msg)
+
+        if len(df_prob) == 0:
+            err_msg = f"TRICERATOPS probability table for TIC {tic} contains 0 rows."
+            stages_executed.append({
+                "stage": "triceratops",
+                "status": "FAILED",
+                "returncode": EXIT_EXECUTION_FAILURE,
+                "log_file": stage_log,
+                "stderr_tail": err_msg
+            })
+            raise StageExecutionError("triceratops", EXIT_EXECUTION_FAILURE, err_msg)
+
+        # Scenario column requirement (D1)
+        scen_cols = [c for c in df_prob.columns if c.strip().lower() in ("scenario", "scenarios")]
+        if not scen_cols:
+            err_msg = (
+                f"TRICERATOPS probability table for TIC {tic} ('{target_prob_file}') is missing required "
+                f"'scenario' column. Found columns: {list(df_prob.columns)}."
+            )
+            stages_executed.append({
+                "stage": "triceratops",
+                "status": "FAILED",
+                "returncode": EXIT_EXECUTION_FAILURE,
+                "log_file": stage_log,
+                "stderr_tail": err_msg
+            })
+            raise StageExecutionError("triceratops", EXIT_EXECUTION_FAILURE, err_msg)
+
+        scen_col = scen_cols[0]
+        if df_prob[scen_col].dropna().astype(str).str.strip().eq("").all():
+            err_msg = f"TRICERATOPS probability table for TIC {tic} contains only empty scenario values."
+            stages_executed.append({
+                "stage": "triceratops",
+                "status": "FAILED",
+                "returncode": EXIT_EXECUTION_FAILURE,
+                "log_file": stage_log,
+                "stderr_tail": err_msg
+            })
+            raise StageExecutionError("triceratops", EXIT_EXECUTION_FAILURE, err_msg)
+
+        # Fractional probability column requirement: 'prob' or 'probability' (D1)
+        prob_cols = [c for c in df_prob.columns if c.strip().lower() in ("prob", "probability")]
+        if not prob_cols:
+            err_msg = (
+                f"TRICERATOPS probability table for TIC {tic} ('{target_prob_file}') is missing required "
+                f"fractional probability column ('prob' or 'probability'). Found columns: {list(df_prob.columns)}."
+            )
+            stages_executed.append({
+                "stage": "triceratops",
+                "status": "FAILED",
+                "returncode": EXIT_EXECUTION_FAILURE,
+                "log_file": stage_log,
+                "stderr_tail": err_msg
+            })
+            raise StageExecutionError("triceratops", EXIT_EXECUTION_FAILURE, err_msg)
+
+        prob_col = prob_cols[0]
+        numeric_vals = pd.to_numeric(df_prob[prob_col], errors="coerce")
+        if numeric_vals.isna().any() or (~np.isfinite(numeric_vals)).any():
+            err_msg = f"TRICERATOPS probability table for TIC {tic} contains non-numeric or non-finite values in column '{prob_col}'."
+            stages_executed.append({
+                "stage": "triceratops",
+                "status": "FAILED",
+                "returncode": EXIT_EXECUTION_FAILURE,
+                "log_file": stage_log,
+                "stderr_tail": err_msg
+            })
+            raise StageExecutionError("triceratops", EXIT_EXECUTION_FAILURE, err_msg)
+
+        # Fractional bounds [0.0, 1.0] (D1)
+        if (numeric_vals < 0.0).any() or (numeric_vals > 1.0).any():
+            err_msg = f"TRICERATOPS probability table for TIC {tic} contains values outside [0, 1] in column '{prob_col}'."
+            stages_executed.append({
+                "stage": "triceratops",
+                "status": "FAILED",
+                "returncode": EXIT_EXECUTION_FAILURE,
+                "log_file": stage_log,
+                "stderr_tail": err_msg
+            })
+            raise StageExecutionError("triceratops", EXIT_EXECUTION_FAILURE, err_msg)
+
+        # Target ID validation: target TIC must be present (nearby stars may also be present) (D1)
+        id_cols = [c for c in df_prob.columns if c.strip().lower() in ("id", "tic_id", "tic")]
+        if id_cols:
+            id_col = id_cols[0]
+            unique_ids = [str(x).strip() for x in df_prob[id_col].dropna().unique()]
+            if unique_ids and str(tic) not in unique_ids:
+                err_msg = (
+                    f"TRICERATOPS probability table '{target_prob_file}' contains ID(s) {unique_ids} "
+                    f"which do not include expected target TIC {tic}."
+                )
+                stages_executed.append({
+                    "stage": "triceratops",
+                    "status": "FAILED",
+                    "returncode": EXIT_EXECUTION_FAILURE,
+                    "log_file": stage_log,
+                    "stderr_tail": err_msg
+                })
+                raise StageExecutionError("triceratops", EXIT_EXECUTION_FAILURE, err_msg)
+
+        prob_files.append(f"triceratops_probs_TIC_{tic}.csv")
+        target_hashes[tic] = compute_file_sha256(target_prob_file)
+
+    # Check for unrequested extra probability files
+    all_prob_files = [f for f in os.listdir(tric_dir) if f.startswith("triceratops_probs_TIC_") and f.endswith(".csv")]
+    expected_prob_filenames = {f"triceratops_probs_TIC_{t}.csv" for t in expected_top_tics}
+    extra_prob_files = set(all_prob_files) - expected_prob_filenames
+    if extra_prob_files:
+        err_msg = f"TRICERATOPS directory contains unexpected probability files for unrequested targets: {sorted(extra_prob_files)}."
+        stages_executed.append({
+            "stage": "triceratops",
+            "status": "FAILED",
+            "returncode": EXIT_EXECUTION_FAILURE,
+            "log_file": stage_log,
+            "stderr_tail": err_msg
+        })
+        raise StageExecutionError("triceratops", EXIT_EXECUTION_FAILURE, err_msg)
+
+    stages_executed.append({
+        "stage": "triceratops",
+        "status": "COMPLETED",
+        "returncode": proc.returncode,
+        "log_file": stage_log,
+        "artifacts_dir": tric_dir,
+        "probability_tables": prob_files,
+        "target_hashes": target_hashes,
+        "validated_targets": len(expected_top_tics),
+        "stdout_tail": proc.stdout[-500:] if proc.stdout else "",
+        "stderr_tail": proc.stderr[-500:] if proc.stderr else ""
+    })
+
+
 def orchestrate_downstream_stages(
     df_consolidated: pd.DataFrame,
     output_dir: str,
@@ -952,7 +1463,8 @@ def orchestrate_downstream_stages(
     run_antares: bool = False,
     run_triceratops: bool = False,
     python_exe: str = sys.executable,
-    stages_executed: Optional[List[Dict[str, Any]]] = None
+    stages_executed: Optional[List[Dict[str, Any]]] = None,
+    resume: bool = False,
 ) -> List[Dict[str, Any]]:
     """
     Safely orchestrates downstream vetting and validation stages:
@@ -995,492 +1507,15 @@ def orchestrate_downstream_stages(
 
     # 1. Pleiades Tier-2 Deep Vetting
     if run_pleiades:
-        print(f"\n[+] Launching Pleiades Tier-2 Deep Vetting on '{cand_csv}' -> '{vet_dir}'...")
-        os.makedirs(vet_dir, exist_ok=True)
-        stage_log = os.path.join(output_dir, "stage_pleiades.log")
-        cmd = [python_exe, "pleiades.py", "--input-csv", cand_csv, "--output-dir", vet_dir]
-        proc = subprocess.run(cmd, capture_output=True, text=True)
-
-        save_stage_log("pleiades", stage_log, cmd, proc, stages_executed)
-
-        if proc.returncode != 0:
-            stages_executed.append({
-                "stage": "pleiades",
-                "status": "FAILED",
-                "returncode": proc.returncode,
-                "log_file": stage_log,
-                "stderr_tail": proc.stderr[-500:] if proc.stderr else ""
-            })
-            raise StageExecutionError("pleiades", proc.returncode, proc.stderr)
-
-        expected_dossier_csv = os.path.join(vet_dir, "scientific_dossier_summary.csv")
-        if not os.path.exists(expected_dossier_csv):
-            err_msg = f"Expected artifact '{expected_dossier_csv}' not generated."
-            stages_executed.append({
-                "stage": "pleiades",
-                "status": "FAILED",
-                "returncode": proc.returncode,
-                "log_file": stage_log,
-                "stderr_tail": err_msg
-            })
-            raise StageExecutionError("pleiades", proc.returncode, err_msg)
-
-        # Per-input operational status / target reconciliation (B3 & C1)
-        expected_tics = [str(x).strip() for x in df_consolidated["tic_id"]] if "tic_id" in df_consolidated.columns else []
-        try:
-            df_dossier = pd.read_csv(expected_dossier_csv)
-        except Exception as exc:
-            err_msg = f"Failed to read Pleiades dossier summary '{expected_dossier_csv}': {exc}"
-            stages_executed.append({
-                "stage": "pleiades",
-                "status": "FAILED",
-                "returncode": EXIT_EXECUTION_FAILURE,
-                "log_file": stage_log,
-                "stderr_tail": err_msg
-            })
-            raise StageExecutionError("pleiades", EXIT_EXECUTION_FAILURE, err_msg)
-
-        dossier_tics = [str(x).strip() for x in df_dossier["tic_id"]] if "tic_id" in df_dossier.columns else []
-        
-        # Check multiset agreement
-        missing_dossier_tics = set(expected_tics) - set(dossier_tics)
-        if missing_dossier_tics:
-            err_msg = (
-                f"Pleiades summary dossier failed to account for input candidate target(s): {sorted(missing_dossier_tics)}. "
-                f"Every candidate target must have an operational status/reconciliation record in scientific_dossier_summary.csv."
-            )
-            stages_executed.append({
-                "stage": "pleiades",
-                "status": "FAILED",
-                "returncode": EXIT_EXECUTION_FAILURE,
-                "log_file": stage_log,
-                "stderr_tail": err_msg
-            })
-            raise StageExecutionError("pleiades", EXIT_EXECUTION_FAILURE, err_msg)
-
-        extra_dossier_tics = set(dossier_tics) - set(expected_tics)
-        if extra_dossier_tics:
-            err_msg = f"Pleiades summary dossier contains unexpected/unrequested target(s): {sorted(extra_dossier_tics)}."
-            stages_executed.append({
-                "stage": "pleiades",
-                "status": "FAILED",
-                "returncode": EXIT_EXECUTION_FAILURE,
-                "log_file": stage_log,
-                "stderr_tail": err_msg
-            })
-            raise StageExecutionError("pleiades", EXIT_EXECUTION_FAILURE, err_msg)
-
-        if len(dossier_tics) != len(set(dossier_tics)) and len(expected_tics) == len(set(expected_tics)):
-            err_msg = "Pleiades summary dossier contains duplicate records for target(s)."
-            stages_executed.append({
-                "stage": "pleiades",
-                "status": "FAILED",
-                "returncode": EXIT_EXECUTION_FAILURE,
-                "log_file": stage_log,
-                "stderr_tail": err_msg
-            })
-            raise StageExecutionError("pleiades", EXIT_EXECUTION_FAILURE, err_msg)
-
-        # Check for target operational errors (C1 & D2)
-        failed_targets = []
-        for _, r in df_dossier.iterrows():
-            t_id = str(r.get("tic_id", "")).strip()
-            op_status = str(r.get("operational_status", "")).strip().upper() if "operational_status" in df_dossier.columns and pd.notna(r.get("operational_status")) else None
-            disp = str(r.get("disposition", "")).strip().upper() if "disposition" in df_dossier.columns and pd.notna(r.get("disposition")) else ""
-            raw_err = str(r.get("error_message", "")).strip() if "error_message" in df_dossier.columns and pd.notna(r.get("error_message")) else ""
-            has_error_message = bool(raw_err and raw_err.upper() not in ("", "NAN", "NONE"))
-
-            is_failed = False
-            failure_reason = ""
-
-            if has_error_message:
-                is_failed = True
-                failure_reason = f"error_message: {raw_err}"
-            elif not op_status:
-                is_failed = True
-                failure_reason = "missing operational_status"
-            elif op_status not in ("SUCCESS", "COMPLETED", "PASS", "PASSED"):
-                is_failed = True
-                failure_reason = f"operational_status: {op_status}"
-            elif disp in ("ERROR", "FAILED", "NO_LIGHTCURVE"):
-                is_failed = True
-                failure_reason = f"disposition: {disp}"
-
-            if is_failed:
-                failed_targets.append((t_id, op_status or "MISSING_STATUS", failure_reason))
-
-        if failed_targets:
-            err_msg = (
-                f"Pleiades deep vetting failed for target(s): {failed_targets}. "
-                f"Target operational errors cannot be converted to physical false positives or zero-survivor science. "
-                f"Downstream chain continuation is stopped."
-            )
-            stages_executed.append({
-                "stage": "pleiades",
-                "status": "FAILED",
-                "returncode": EXIT_EXECUTION_FAILURE,
-                "log_file": stage_log,
-                "failed_targets": [ft[0] for ft in failed_targets],
-                "stderr_tail": err_msg
-            })
-            raise StageExecutionError("pleiades", EXIT_EXECUTION_FAILURE, err_msg)
-
-        stages_executed.append({
-            "stage": "pleiades",
-            "status": "COMPLETED",
-            "output_csv": expected_dossier_csv,
-            "returncode": proc.returncode,
-            "log_file": stage_log,
-            "reconciled_targets": len(dossier_tics),
-            "stdout_tail": proc.stdout[-500:] if proc.stdout else "",
-            "stderr_tail": proc.stderr[-500:] if proc.stderr else ""
-        })
+        _run_pleiades_stage(df_consolidated, output_dir, cand_csv, vet_dir, python_exe, resume, stages_executed)
 
     # 2. Antares Tier-3 Packager & Archival Follow-Up
     if run_antares:
-        print(f"\n[+] Launching Antares Tier-3 Packager on '{output_dir}'...")
-        stage_log = os.path.join(output_dir, "stage_antares.log")
-        cmd = [python_exe, "antares_packager.py", "--results-dir", output_dir]
-        proc = subprocess.run(cmd, capture_output=True, text=True)
-
-        save_stage_log("antares", stage_log, cmd, proc, stages_executed)
-
-        if proc.returncode != 0:
-            stages_executed.append({
-                "stage": "antares",
-                "status": "FAILED",
-                "returncode": proc.returncode,
-                "log_file": stage_log,
-                "stderr_tail": proc.stderr[-500:] if proc.stderr else ""
-            })
-            raise StageExecutionError("antares", proc.returncode, proc.stderr)
-
-        expected_exofop_csv = os.path.join(output_dir, "exofop_ctoi_upload.csv")
-        expected_ranking_csv = os.path.join(output_dir, "prioritized_targets_ranking.csv")
-        if not os.path.exists(expected_exofop_csv):
-            err_msg = f"Expected artifact '{expected_exofop_csv}' not generated."
-            stages_executed.append({
-                "stage": "antares",
-                "status": "FAILED",
-                "returncode": EXIT_EXECUTION_FAILURE,
-                "log_file": stage_log,
-                "stderr_tail": err_msg
-            })
-            raise StageExecutionError("antares", EXIT_EXECUTION_FAILURE, err_msg)
-
-        stages_executed.append({
-            "stage": "antares",
-            "status": "COMPLETED",
-            "output_csv": expected_exofop_csv,
-            "ranking_csv": expected_ranking_csv if os.path.exists(expected_ranking_csv) else None,
-            "returncode": proc.returncode,
-            "log_file": stage_log,
-            "stdout_tail": proc.stdout[-500:] if proc.stdout else "",
-            "stderr_tail": proc.stderr[-500:] if proc.stderr else ""
-        })
+        _run_antares_stage(output_dir, python_exe, stages_executed)
 
     # 3. TRICERATOPS Tier-4 Bayesian Statistical Validation (Strict Opt-In)
     if run_triceratops:
-        top3_csv = os.path.join(output_dir, "exofop_ctoi_upload_top3.csv")
-        if not os.path.exists(top3_csv):
-            ranking_csv = os.path.join(output_dir, "prioritized_targets_ranking.csv")
-            if os.path.exists(ranking_csv):
-                top3_csv = ranking_csv
-            else:
-                # If neither exists: check if consolidated candidates was empty
-                if len(df_consolidated) == 0:
-                    print("[+] Candidate catalog has 0 candidates. Skipping TRICERATOPS validation.")
-                    stages_executed.append({
-                        "stage": "triceratops",
-                        "status": "SKIPPED_ZERO_TARGETS",
-                        "reason": "Consolidated catalog has zero candidates."
-                    })
-                    return stages_executed
-
-                # Non-empty candidates, but missing Tier-3 prerequisite artifacts -> Stage error (B3)
-                err_msg = (
-                    "Missing Tier-3 dependency: neither 'exofop_ctoi_upload_top3.csv' nor 'prioritized_targets_ranking.csv' "
-                    "found for TRICERATOPS validation. Prior stage did not produce required target table."
-                )
-                stages_executed.append({
-                    "stage": "triceratops",
-                    "status": "FAILED",
-                    "returncode": EXIT_EXECUTION_FAILURE,
-                    "stderr_tail": err_msg
-                })
-                raise StageExecutionError("triceratops", EXIT_EXECUTION_FAILURE, err_msg)
-
-        # Check delimiter and read top3 table
-        with open(top3_csv, "r", encoding="utf-8") as f:
-            first_line = f.readline()
-        top_sep = "|" if "|" in first_line else ","
-        try:
-            df_top = pd.read_csv(top3_csv, sep=top_sep)
-        except Exception as exc:
-            err_msg = f"Failed to read top candidates table '{top3_csv}': {exc}"
-            stages_executed.append({
-                "stage": "triceratops",
-                "status": "FAILED",
-                "returncode": EXIT_EXECUTION_FAILURE,
-                "stderr_tail": err_msg
-            })
-            raise StageExecutionError("triceratops", EXIT_EXECUTION_FAILURE, err_msg)
-
-        if len(df_top) == 0:
-            print("[+] Target table for TRICERATOPS is empty (0 rows). Skipping Bayesian validation.")
-            stages_executed.append({
-                "stage": "triceratops",
-                "status": "SKIPPED_ZERO_TARGETS",
-                "reason": "Top candidates table is empty (0 rows)."
-            })
-            return stages_executed
-
-        # Producer schema normalization: handle TIC ID and tic_id (C2)
-        tic_cols = [c for c in df_top.columns if c.strip().lower() in ("tic_id", "tic id", "tic", "tid")]
-        if not tic_cols:
-            tic_cols = [c for c in df_top.columns if "TIC" in c.upper()]
-        if not tic_cols:
-            err_msg = f"Top candidates table '{top3_csv}' contains {len(df_top)} rows but no recognizable TIC ID column (found: {list(df_top.columns)})."
-            stages_executed.append({
-                "stage": "triceratops",
-                "status": "FAILED",
-                "returncode": EXIT_EXECUTION_FAILURE,
-                "stderr_tail": err_msg
-            })
-            raise StageExecutionError("triceratops", EXIT_EXECUTION_FAILURE, err_msg)
-
-        tic_col_name = tic_cols[0]
-
-        # Ephemeris column validation before expensive invocation (C2)
-        p_cols = [c for c in df_top.columns if "PERIOD" in c.upper()]
-        epoch_cols = [c for c in df_top.columns if "EPOCH" in c.upper() or "T0" in c.upper()]
-        depth_cols = [c for c in df_top.columns if "DEPTH" in c.upper()]
-        dur_cols = [c for c in df_top.columns if "DUR" in c.upper()]
-        if not (p_cols and epoch_cols and depth_cols and dur_cols):
-            missing_cols = []
-            if not p_cols: missing_cols.append("Period")
-            if not epoch_cols: missing_cols.append("Epoch/T0")
-            if not depth_cols: missing_cols.append("Depth")
-            if not dur_cols: missing_cols.append("Duration")
-            err_msg = (
-                f"Top candidates table '{top3_csv}' is missing required ephemeris columns for TRICERATOPS: {missing_cols}. "
-                f"Available columns: {list(df_top.columns)}."
-            )
-            stages_executed.append({
-                "stage": "triceratops",
-                "status": "FAILED",
-                "returncode": EXIT_EXECUTION_FAILURE,
-                "stderr_tail": err_msg
-            })
-            raise StageExecutionError("triceratops", EXIT_EXECUTION_FAILURE, err_msg)
-
-        expected_top_tics = [str(x).strip() for x in df_top[tic_col_name].dropna().unique() if str(x).strip()]
-        if len(expected_top_tics) == 0:
-            stages_executed.append({
-                "stage": "triceratops",
-                "status": "SKIPPED_ZERO_TARGETS",
-                "reason": "Top candidates table has no non-null TIC IDs."
-            })
-            return stages_executed
-
-        print(f"\n[+] Launching Tier-4 TRICERATOPS Bayesian Validation on '{top3_csv}'...")
-        stage_log = os.path.join(output_dir, "stage_triceratops.log")
-        cmd = [python_exe, "validate_triceratops.py", "--auto", "--top-csv", top3_csv, "--results-dir", output_dir]
-        proc = subprocess.run(cmd, capture_output=True, text=True)
-
-        save_stage_log("triceratops", stage_log, cmd, proc, stages_executed)
-
-        if proc.returncode != 0:
-            stages_executed.append({
-                "stage": "triceratops",
-                "status": "FAILED",
-                "returncode": proc.returncode,
-                "log_file": stage_log,
-                "stderr_tail": proc.stderr[-500:] if proc.stderr else ""
-            })
-            raise StageExecutionError("triceratops", proc.returncode, proc.stderr)
-
-        # Validate that actual per-target probability artifacts were created and satisfy contract (B3 & C2)
-        tric_dir = os.path.join(output_dir, "triceratops")
-        if not os.path.exists(tric_dir):
-            err_msg = f"TRICERATOPS output directory '{tric_dir}' was not created."
-            stages_executed.append({
-                "stage": "triceratops",
-                "status": "FAILED",
-                "returncode": EXIT_EXECUTION_FAILURE,
-                "log_file": stage_log,
-                "stderr_tail": err_msg
-            })
-            raise StageExecutionError("triceratops", EXIT_EXECUTION_FAILURE, err_msg)
-
-        prob_files = []
-        target_hashes = {}
-        for tic in expected_top_tics:
-            target_prob_file = os.path.join(tric_dir, f"triceratops_probs_TIC_{tic}.csv")
-            if not os.path.exists(target_prob_file):
-                err_msg = f"Missing TRICERATOPS probability table for expected target TIC {tic} ('{target_prob_file}')."
-                stages_executed.append({
-                    "stage": "triceratops",
-                    "status": "FAILED",
-                    "returncode": EXIT_EXECUTION_FAILURE,
-                    "log_file": stage_log,
-                    "stderr_tail": err_msg
-                })
-                raise StageExecutionError("triceratops", EXIT_EXECUTION_FAILURE, err_msg)
-            if os.path.getsize(target_prob_file) == 0:
-                err_msg = f"TRICERATOPS probability table for TIC {tic} is empty (0 bytes)."
-                stages_executed.append({
-                    "stage": "triceratops",
-                    "status": "FAILED",
-                    "returncode": EXIT_EXECUTION_FAILURE,
-                    "log_file": stage_log,
-                    "stderr_tail": err_msg
-                })
-                raise StageExecutionError("triceratops", EXIT_EXECUTION_FAILURE, err_msg)
-
-            # Structural artifact contract validation: parse CSV and verify columns and finite numbers (C2)
-            try:
-                df_prob = pd.read_csv(target_prob_file)
-            except Exception as exc:
-                err_msg = f"TRICERATOPS probability table for TIC {tic} ('{target_prob_file}') is not a parseable CSV: {exc}"
-                stages_executed.append({
-                    "stage": "triceratops",
-                    "status": "FAILED",
-                    "returncode": EXIT_EXECUTION_FAILURE,
-                    "log_file": stage_log,
-                    "stderr_tail": err_msg
-                })
-                raise StageExecutionError("triceratops", EXIT_EXECUTION_FAILURE, err_msg)
-
-            if len(df_prob) == 0:
-                err_msg = f"TRICERATOPS probability table for TIC {tic} contains 0 rows."
-                stages_executed.append({
-                    "stage": "triceratops",
-                    "status": "FAILED",
-                    "returncode": EXIT_EXECUTION_FAILURE,
-                    "log_file": stage_log,
-                    "stderr_tail": err_msg
-                })
-                raise StageExecutionError("triceratops", EXIT_EXECUTION_FAILURE, err_msg)
-
-            # Scenario column requirement (D1)
-            scen_cols = [c for c in df_prob.columns if c.strip().lower() in ("scenario", "scenarios")]
-            if not scen_cols:
-                err_msg = (
-                    f"TRICERATOPS probability table for TIC {tic} ('{target_prob_file}') is missing required "
-                    f"'scenario' column. Found columns: {list(df_prob.columns)}."
-                )
-                stages_executed.append({
-                    "stage": "triceratops",
-                    "status": "FAILED",
-                    "returncode": EXIT_EXECUTION_FAILURE,
-                    "log_file": stage_log,
-                    "stderr_tail": err_msg
-                })
-                raise StageExecutionError("triceratops", EXIT_EXECUTION_FAILURE, err_msg)
-
-            scen_col = scen_cols[0]
-            if df_prob[scen_col].dropna().astype(str).str.strip().eq("").all():
-                err_msg = f"TRICERATOPS probability table for TIC {tic} contains only empty scenario values."
-                stages_executed.append({
-                    "stage": "triceratops",
-                    "status": "FAILED",
-                    "returncode": EXIT_EXECUTION_FAILURE,
-                    "log_file": stage_log,
-                    "stderr_tail": err_msg
-                })
-                raise StageExecutionError("triceratops", EXIT_EXECUTION_FAILURE, err_msg)
-
-            # Fractional probability column requirement: 'prob' or 'probability' (D1)
-            prob_cols = [c for c in df_prob.columns if c.strip().lower() in ("prob", "probability")]
-            if not prob_cols:
-                err_msg = (
-                    f"TRICERATOPS probability table for TIC {tic} ('{target_prob_file}') is missing required "
-                    f"fractional probability column ('prob' or 'probability'). Found columns: {list(df_prob.columns)}."
-                )
-                stages_executed.append({
-                    "stage": "triceratops",
-                    "status": "FAILED",
-                    "returncode": EXIT_EXECUTION_FAILURE,
-                    "log_file": stage_log,
-                    "stderr_tail": err_msg
-                })
-                raise StageExecutionError("triceratops", EXIT_EXECUTION_FAILURE, err_msg)
-
-            prob_col = prob_cols[0]
-            numeric_vals = pd.to_numeric(df_prob[prob_col], errors="coerce")
-            if numeric_vals.isna().any() or (~np.isfinite(numeric_vals)).any():
-                err_msg = f"TRICERATOPS probability table for TIC {tic} contains non-numeric or non-finite values in column '{prob_col}'."
-                stages_executed.append({
-                    "stage": "triceratops",
-                    "status": "FAILED",
-                    "returncode": EXIT_EXECUTION_FAILURE,
-                    "log_file": stage_log,
-                    "stderr_tail": err_msg
-                })
-                raise StageExecutionError("triceratops", EXIT_EXECUTION_FAILURE, err_msg)
-
-            # Fractional bounds [0.0, 1.0] (D1)
-            if (numeric_vals < 0.0).any() or (numeric_vals > 1.0).any():
-                err_msg = f"TRICERATOPS probability table for TIC {tic} contains values outside [0, 1] in column '{prob_col}'."
-                stages_executed.append({
-                    "stage": "triceratops",
-                    "status": "FAILED",
-                    "returncode": EXIT_EXECUTION_FAILURE,
-                    "log_file": stage_log,
-                    "stderr_tail": err_msg
-                })
-                raise StageExecutionError("triceratops", EXIT_EXECUTION_FAILURE, err_msg)
-
-            # Target ID validation: target TIC must be present (nearby stars may also be present) (D1)
-            id_cols = [c for c in df_prob.columns if c.strip().lower() in ("id", "tic_id", "tic")]
-            if id_cols:
-                id_col = id_cols[0]
-                unique_ids = [str(x).strip() for x in df_prob[id_col].dropna().unique()]
-                if unique_ids and str(tic) not in unique_ids:
-                    err_msg = (
-                        f"TRICERATOPS probability table '{target_prob_file}' contains ID(s) {unique_ids} "
-                        f"which do not include expected target TIC {tic}."
-                    )
-                    stages_executed.append({
-                        "stage": "triceratops",
-                        "status": "FAILED",
-                        "returncode": EXIT_EXECUTION_FAILURE,
-                        "log_file": stage_log,
-                        "stderr_tail": err_msg
-                    })
-                    raise StageExecutionError("triceratops", EXIT_EXECUTION_FAILURE, err_msg)
-
-            prob_files.append(f"triceratops_probs_TIC_{tic}.csv")
-            target_hashes[tic] = compute_file_sha256(target_prob_file)
-
-        # Check for unrequested extra probability files
-        all_prob_files = [f for f in os.listdir(tric_dir) if f.startswith("triceratops_probs_TIC_") and f.endswith(".csv")]
-        expected_prob_filenames = {f"triceratops_probs_TIC_{t}.csv" for t in expected_top_tics}
-        extra_prob_files = set(all_prob_files) - expected_prob_filenames
-        if extra_prob_files:
-            err_msg = f"TRICERATOPS directory contains unexpected probability files for unrequested targets: {sorted(extra_prob_files)}."
-            stages_executed.append({
-                "stage": "triceratops",
-                "status": "FAILED",
-                "returncode": EXIT_EXECUTION_FAILURE,
-                "log_file": stage_log,
-                "stderr_tail": err_msg
-            })
-            raise StageExecutionError("triceratops", EXIT_EXECUTION_FAILURE, err_msg)
-
-        stages_executed.append({
-            "stage": "triceratops",
-            "status": "COMPLETED",
-            "returncode": proc.returncode,
-            "log_file": stage_log,
-            "artifacts_dir": tric_dir,
-            "probability_tables": prob_files,
-            "target_hashes": target_hashes,
-            "validated_targets": len(expected_top_tics),
-            "stdout_tail": proc.stdout[-500:] if proc.stdout else "",
-            "stderr_tail": proc.stderr[-500:] if proc.stderr else ""
-        })
+        _run_triceratops_stage(df_consolidated, output_dir, python_exe, resume, run_antares, stages_executed)
 
     return stages_executed
 
@@ -1493,6 +1528,7 @@ def run_merge_shards(
     run_antares: bool = False,
     run_triceratops: bool = False,
     allow_partial: bool = False,
+    resume: bool = False,
     _inject_write_failure: bool = False
 ) -> int:
     """
@@ -1503,11 +1539,15 @@ def run_merge_shards(
     current_stage = "preflight_check"
     stages_executed: List[Dict[str, Any]] = []
     acquired_fresh_dir = False
+    bound_run: Optional[ri.BoundRun] = None
 
     try:
         # Preflight check: refuse occupied output or manifest aliasing before any writes (B1)
-        check_and_prepare_output_dir(output_dir, manifest_path=manifest_path)
-        acquired_fresh_dir = True
+        if not resume:
+            check_and_prepare_output_dir(output_dir, manifest_path=manifest_path)
+            acquired_fresh_dir = True
+        else:
+            os.makedirs(output_dir, exist_ok=True)
 
         current_stage = "manifest_validation"
         manifest_data, manifest_dir, effective_survey_mode, is_run_partial, partial_caveats = validate_and_load_manifest(
@@ -1540,6 +1580,59 @@ def run_merge_shards(
         else:
             run_id = manifest_run_id
 
+        here_dir = os.path.dirname(os.path.abspath(__file__))
+        shard_input_paths: List[str] = [manifest_path]
+        for s in manifest_data.get("shards", []):
+            for art_key in ("candidate_artifact", "history_artifact"):
+                art = s.get(art_key)
+                if isinstance(art, dict) and art.get("resolved_path"):
+                    shard_input_paths.append(art["resolved_path"])
+
+        identity_record_path = os.path.join(output_dir, f"run_identity_{run_id}.json")
+        merge_code_names = ["merge_shards.py"]
+        if run_pleiades:
+            merge_code_names.append("pleiades.py")
+        if run_antares:
+            merge_code_names.append("antares_packager.py")
+        if run_triceratops:
+            merge_code_names.append("validate_triceratops.py")
+        has_prior_outputs = any(
+            fn in (
+                "candidates_consolidated.csv",
+                "candidates_report.csv",
+                "manifest.json",
+                "deep_vetting",
+                "triceratops",
+            )
+            for fn in os.listdir(output_dir)
+        )
+        try:
+            bound_run = ri.BoundRun.open_or_resume(
+                identity_record_path,
+                run_id=run_id,
+                runner="merge_shards",
+                code_files=ri.discover_local_code_dependencies(here_dir, merge_code_names),
+                config={
+                    "run_pleiades": bool(run_pleiades),
+                    "run_antares": bool(run_antares),
+                    "run_triceratops": bool(run_triceratops),
+                    "allow_partial": bool(allow_partial),
+                    "survey_mode": effective_survey_mode,
+                },
+                input_paths=shard_input_paths,
+                input_spec={"manifest_run_id": manifest_run_id},
+                repo_dir=here_dir,
+                resume=bool(resume),
+                require_existing=bool(resume and has_prior_outputs),
+                resume_reason="merge_resume" if resume else "fresh_start",
+            )
+        except ri.RunIdentityError as exc:
+            raise ShardReductionError(
+                str(exc),
+                stage="run_identity_validation",
+                exit_code=EXIT_VALIDATION_ERROR,
+            ) from exc
+
         # Phase 1: Load and validate all candidate shards in memory (R2)
         current_stage = "candidate_validation"
         all_cand_rows, cand_recon_rows, total_cand_shards, df_consolidated, df_recon = load_and_validate_candidate_shards(manifest_data)
@@ -1556,14 +1649,13 @@ def run_merge_shards(
         out_history_file = os.path.join(output_dir, "scanned_tics.txt")
         out_history_recon_csv = os.path.join(output_dir, "history_reconciliation.csv")
 
-        df_consolidated.to_csv(out_consolidated_csv, index=False)
-        df_consolidated.to_csv(out_legacy_csv, index=False)
-        df_recon.to_csv(out_recon_csv, index=False)
+        ri.atomic_write_csv(out_consolidated_csv, df_consolidated, index=False)
+        ri.atomic_write_csv(out_legacy_csv, df_consolidated, index=False)
+        ri.atomic_write_csv(out_recon_csv, df_recon, index=False)
 
-        with open(out_history_file, "w", encoding="utf-8") as f:
-            for tic in sorted(union_scanned_tics, key=lambda x: int(x)):
-                f.write(f"{tic}\n")
-        df_hist_recon.to_csv(out_history_recon_csv, index=False)
+        history_lines = "".join(f"{tic}\n" for tic in sorted(union_scanned_tics, key=lambda x: int(x)))
+        ri.atomic_write_text(out_history_file, history_lines)
+        ri.atomic_write_csv(out_history_recon_csv, df_hist_recon, index=False)
 
         # Phase 4: Downstream Orchestration (Opt-In)
         current_stage = "downstream_orchestration"
@@ -1573,7 +1665,8 @@ def run_merge_shards(
             run_pleiades=run_pleiades,
             run_antares=run_antares,
             run_triceratops=run_triceratops,
-            stages_executed=stages_executed
+            stages_executed=stages_executed,
+            resume=bool(resume),
         )
 
         current_stage = "finalizing_manifest"
@@ -1582,6 +1675,12 @@ def run_merge_shards(
 
         # Copy input manifest into output directory
         shutil.copy2(manifest_path, os.path.join(output_dir, "input_manifest_copy.json"))
+
+        final_status = "SUCCESS" if not is_run_partial else "SUCCESS_PARTIAL_SURVEY"
+        bound_run.record_completion(
+            status=final_status,
+            extra={"stages_executed": [s["stage"] for s in stages_executed]},
+        )
 
         # Inventory generated artifacts
         output_artifacts: Dict[str, Dict[str, Any]] = {}
@@ -1607,15 +1706,15 @@ def run_merge_shards(
             "unique_tics": int(df_consolidated["tic_id"].nunique()) if len(df_consolidated) > 0 else 0,
             "scanned_targets": len(union_scanned_tics),
             "stages_executed": [s["stage"] for s in stages_executed],
+            "identity": bound_run.identity,
+            "environment": bound_run.environment,
             "artifacts": output_artifacts
         }
 
-        with open(os.path.join(output_dir, "manifest.json"), "w", encoding="utf-8") as f:
-            json.dump(out_manifest, f, indent=2)
+        ri.atomic_write_json(os.path.join(output_dir, "manifest.json"), out_manifest)
 
         # Phase 5: Write final run status (R4)
         current_stage = "finalizing_status"
-        final_status = "SUCCESS" if not is_run_partial else "SUCCESS_PARTIAL_SURVEY"
         run_status_dict = {
             "run_id": run_id,
             "status": final_status,
@@ -1626,6 +1725,8 @@ def run_merge_shards(
             "unique_tics": int(df_consolidated["tic_id"].nunique()) if len(df_consolidated) > 0 else 0,
             "scanned_targets": len(union_scanned_tics),
             "stages_executed": stages_executed,
+            "identity": bound_run.identity,
+            "environment": bound_run.environment,
             "start_time": start_time,
             "completion_time": datetime.now(timezone.utc).isoformat()
         }
@@ -1659,6 +1760,12 @@ def run_merge_shards(
 
         return EXIT_SUCCESS
 
+    except KeyboardInterrupt:
+        if bound_run is not None:
+            bound_run.record_interruption("KeyboardInterrupt", completed_count=len(stages_executed))
+        sys.stderr.write(f"\nERROR: Shard reduction interrupted during stage '{current_stage}'.\n")
+        sys.stderr.flush()
+        return EXIT_EXECUTION_FAILURE
     except Exception as exc:
         exit_code = getattr(exc, "exit_code", EXIT_EXECUTION_FAILURE)
         stage_name = getattr(exc, "stage", current_stage)
@@ -1702,6 +1809,7 @@ def main():
     parser.add_argument("--run-antares", action="store_true", help="Opt-in: execute Antares Tier-3 packaging")
     parser.add_argument("--run-triceratops", action="store_true", help="Opt-in: execute TRICERATOPS Tier-4 validation")
     parser.add_argument("--allow-partial", action="store_true", help="Explicitly allow reduction over partial/missing shards")
+    parser.add_argument("--resume", action="store_true", help="Resume an interrupted merge run only when run identity matches")
 
     # Fast validation for no-arg legacy invocation
     if len(sys.argv) <= 1:
@@ -1717,7 +1825,8 @@ def main():
         run_pleiades=args.run_pleiades,
         run_antares=args.run_antares,
         run_triceratops=args.run_triceratops,
-        allow_partial=args.allow_partial
+        allow_partial=args.allow_partial,
+        resume=args.resume
     )
     sys.exit(exit_code)
 

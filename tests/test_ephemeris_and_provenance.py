@@ -43,6 +43,28 @@ import aldebaran as ald
 import search_toi_companions as stc
 
 
+# S3.3 (legacy path retired): the archival gate is the Cp gate (ARGON_DECISIONS items 12, 18 and 19). Fixtures that need
+# a fixed archival ephemeris patch the item 18 refinement (vr_refine_p3) instead of the retired legacy BLS refinement.
+def fixed_refinement(period, t0):
+    return patch.object(ald, "vr_refine_p3", return_value=dict(period=period, t0=t0, n_req=1, n_grid=60, stages=1))
+
+
+def archival_secondary_reject(t, *args, **kwargs):
+    """Cp secondary scan stand-in: the discovery-sector call passes, the combined archival call (which contains the
+    BTJD 2458000 archival sector) rejects, so the archival veto is a Cp multi-sector secondary eclipse."""
+    if np.nanmin(t) < 2458500.0:
+        return (True, 12.0, 400.0, 0.5, 3.5)
+    return (False, 0.0, 0.0, 0.5, 3.0)
+
+
+def with_discovery_transit(t, period, t0, dur, depth=0.0010):
+    """Flux with a box transit inside 0.45 x dur, as needed by the Cp item 19 (P4) refinement check."""
+    f = np.ones_like(t, dtype=float)
+    ph = ((t - t0 + 0.5 * period) % period) - 0.5 * period
+    f[np.abs(ph) < 0.45 * dur] -= depth
+    return f
+
+
 class TestEphemerisSerializationAndCoherence(unittest.TestCase):
     """Test coherent ephemeris serialization, discovery preservation, and timing accuracy."""
 
@@ -113,8 +135,8 @@ class TestEphemerisSerializationAndCoherence(unittest.TestCase):
              patch.object(ald, "verify_multi_epoch", return_value=(True, "Confirmed_in_Sectors_80,85", mock_arch_info)), \
              patch.object(ald, "BoxLeastSquares") as mock_bls_cls, \
              patch.object(ald, "get_stellar_and_gaia_params", return_value={"has_params": True, "r_star": 1.0, "e_r_star": 0.05, "m_star": 1.0, "e_m_star": 0.05, "teff": 5800, "ruwe": 1.05}), \
-             patch.object(ald, "scan_full_orbit_secondary_eclipse", return_value=(False, 0.0, 0.0, 0.5, 3.0)), \
-             patch.object(ald, "verify_and_filter_tpf", return_value=(True, "OK", np.ones((5, 5)), np.ones((5, 5), dtype=bool))):
+             patch.object(ald, "_scan_full_orbit_secondary_eclipse_cp", return_value=(False, 0.0, 0.0, 0.5, 3.0)), \
+             patch.object(ald, "_verify_and_filter_tpf_cp", return_value=(True, "OK", np.ones((5, 5)), np.ones((5, 5), dtype=bool))):
 
             mock_bls = MagicMock()
             mock_bls_cls.return_value = mock_bls
@@ -300,8 +322,8 @@ class TestEphemerisSerializationAndCoherence(unittest.TestCase):
              patch.object(ald, "verify_multi_epoch", return_value=(True, "Confirmed_in_Sectors_105", mock_strict_info)), \
              patch.object(ald, "BoxLeastSquares") as mock_bls_cls, \
              patch.object(ald, "get_stellar_and_gaia_params", return_value={"has_params": True, "r_star": 1.0, "e_r_star": 0.05, "m_star": 1.0, "e_m_star": 0.05, "teff": 5800, "ruwe": 1.05}), \
-             patch.object(ald, "scan_full_orbit_secondary_eclipse", return_value=(False, 0.0, 0.0, 0.5, 3.0)), \
-             patch.object(ald, "verify_and_filter_tpf", return_value=(True, "OK", np.ones((5, 5)), np.ones((5, 5), dtype=bool))):
+             patch.object(ald, "_scan_full_orbit_secondary_eclipse_cp", return_value=(False, 0.0, 0.0, 0.5, 3.0)), \
+             patch.object(ald, "_verify_and_filter_tpf_cp", return_value=(True, "OK", np.ones((5, 5)), np.ones((5, 5), dtype=bool))):
 
             mock_bls = MagicMock()
             mock_bls_cls.return_value = mock_bls
@@ -342,8 +364,8 @@ class TestEphemerisSerializationAndCoherence(unittest.TestCase):
              patch.object(ald, "verify_multi_epoch", return_value=(True, "Confirmed_in_Sectors_105", mock_nan_info)), \
              patch.object(ald, "BoxLeastSquares") as mock_bls_cls, \
              patch.object(ald, "get_stellar_and_gaia_params", return_value={"has_params": True, "r_star": 1.0, "e_r_star": 0.05, "m_star": 1.0, "e_m_star": 0.05, "teff": 5800, "ruwe": 1.05}), \
-             patch.object(ald, "scan_full_orbit_secondary_eclipse", return_value=(False, 0.0, 0.0, 0.5, 3.0)), \
-             patch.object(ald, "verify_and_filter_tpf", return_value=(True, "OK", np.ones((5, 5)), np.ones((5, 5), dtype=bool))):
+             patch.object(ald, "_scan_full_orbit_secondary_eclipse_cp", return_value=(False, 0.0, 0.0, 0.5, 3.0)), \
+             patch.object(ald, "_verify_and_filter_tpf_cp", return_value=(True, "OK", np.ones((5, 5)), np.ones((5, 5), dtype=bool))):
 
             mock_bls = MagicMock()
             mock_bls_cls.return_value = mock_bls
@@ -384,8 +406,8 @@ class TestEphemerisSerializationAndCoherence(unittest.TestCase):
              patch.object(ald, "verify_multi_epoch", return_value=(True, "Confirmed_in_Sectors_105", mock_incomplete_info)), \
              patch.object(ald, "BoxLeastSquares") as mock_bls_cls, \
              patch.object(ald, "get_stellar_and_gaia_params", return_value={"has_params": True, "r_star": 1.0, "e_r_star": 0.05, "m_star": 1.0, "e_m_star": 0.05, "teff": 5800, "ruwe": 1.05}), \
-             patch.object(ald, "scan_full_orbit_secondary_eclipse", return_value=(False, 0.0, 0.0, 0.5, 3.0)), \
-             patch.object(ald, "verify_and_filter_tpf", return_value=(True, "OK", np.ones((5, 5)), np.ones((5, 5), dtype=bool))):
+             patch.object(ald, "_scan_full_orbit_secondary_eclipse_cp", return_value=(False, 0.0, 0.0, 0.5, 3.0)), \
+             patch.object(ald, "_verify_and_filter_tpf_cp", return_value=(True, "OK", np.ones((5, 5)), np.ones((5, 5), dtype=bool))):
 
             mock_bls = MagicMock()
             mock_bls_cls.return_value = mock_bls
@@ -410,6 +432,104 @@ class TestEphemerisSerializationAndCoherence(unittest.TestCase):
 class TestTruthfulArchivalProvenance(unittest.TestCase):
     """Test archival provenance accounting in verify_multi_epoch across various failure modes."""
 
+    def _run_control_phase_fixture(self, control_phase: float, shift_periods: int = 0):
+        """Run the production archival gate on deterministic transit/control dips."""
+        period = 4.0
+        t0 = 2000.0 + shift_periods * period
+        best_dur = 0.15
+        t_arch = np.arange(1600.0, 1628.0, 0.01) + shift_periods * period
+        phase = ((t_arch - t0 + 0.5 * period) % period) - 0.5 * period
+        transit = np.abs(phase) < 0.045
+        control_distance = np.abs(
+            ((phase - control_phase * period + 0.5 * period) % period) - 0.5 * period
+        )
+        control = control_distance < 0.045
+        f_arch = np.ones_like(t_arch)
+        f_arch[transit] -= 0.001
+        f_arch[control] -= 0.002
+
+        t_curr = np.arange(2000.0, 2028.0, 0.01) + shift_periods * period
+        phase_curr = ((t_curr - t0 + 0.5 * period) % period) - 0.5 * period
+        f_curr = np.ones_like(t_curr)
+        f_curr[np.abs(phase_curr) < 0.045] -= 0.001
+        ferr_curr = np.full_like(t_curr, 0.0001)
+
+        mock_row = MagicMock()
+        mock_row.mission = ["TESS Sector 80"]
+        mock_row.obsid = "TESS_s0080_control_phase"
+
+        class FixedEphemerisBLS:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def power(self, periods, durations):
+                return MagicMock(
+                    power=np.array([1.0]),
+                    period=np.array([period]),
+                    transit_time=np.array([t0]),
+                )
+
+        with patch("lightkurve.search_lightcurve", return_value=[mock_row]), \
+             patch.object(ald, "safe_download", return_value=MagicMock()), \
+             patch.object(ald, "extract_and_stitch_arrays", return_value=(
+                 t_arch, f_arch, np.full_like(t_arch, 0.0001), np.zeros_like(t_arch),
+                 np.zeros_like(t_arch), 0.95
+             )), \
+             patch.object(ald, "clip_upper_outliers", side_effect=lambda t, f, e: (t, f, e)), \
+             patch.object(ald, "piecewise_savgol_detrend", side_effect=lambda t, f, **kw: np.ones_like(f)), \
+             fixed_refinement(period, t0), \
+             patch.object(ald, "_scan_full_orbit_secondary_eclipse_cp", return_value=(False, 0.0, 0.0, 0.5, 3.0)):
+            result = ald.verify_multi_epoch(
+                "34567890", 106, t_curr, f_curr, ferr_curr,
+                best_p=period, best_t0=t0, best_dur=best_dur,
+                depth_ppm_curr=1000.0, sde_curr=20.0,
+            )
+
+        # Independent recomputation from the exact frozen input arrays and selected ephemeris.
+        in_transit = np.abs(phase) < (0.45 * best_dur)
+        out_transit = np.abs(phase) > (0.65 * best_dur)
+        baseline = float(np.nanmedian(f_arch[out_transit]))
+        err_ppm = float(np.nanstd(f_arch[out_transit]) / np.sqrt(np.sum(in_transit)) * 1e6)
+        transit_snr = float((baseline - np.nanmean(f_arch[in_transit])) * 1e6 / max(err_ppm, 1.0))
+        control_mean = float(np.nanmean(f_arch[control]))
+        control_snr = float((baseline - control_mean) * 1e6 / max(err_ppm, 1.0))
+        return result, {
+            "n_control": int(np.sum(control)),
+            "n_transit": int(np.sum(in_transit)),
+            "transit_snr": transit_snr,
+            "control_snr": control_snr,
+            "t0": t0,
+        }
+
+    def test_all_eight_control_centers_reject_control_dominant_signal(self):
+        """Each declared control center must be reachable through verify_multi_epoch."""
+        for center in (0.15, 0.20, 0.25, 0.30, 0.70, 0.75, 0.80, 0.85):
+            with self.subTest(control_center=center):
+                (ok, status, diag), expected = self._run_control_phase_fixture(center)
+                self.assertGreater(expected["n_control"], 0)
+                self.assertGreater(expected["n_transit"], 0)
+                self.assertGreater(expected["control_snr"], expected["transit_snr"] + 1.5)
+                self.assertAlmostEqual(diag["archival_snr"], expected["transit_snr"], places=10)
+                self.assertFalse(diag["is_projected_strict"])
+                self.assertFalse(ok)
+                self.assertIn("control phase null test", status)
+
+    def test_wrapped_control_gate_is_invariant_under_integer_period_shifts(self):
+        """A control at phase 0.70 remains the same decision after common kP shifts."""
+        outcomes = []
+        for shift in (-250, 1, 500):
+            (ok, status, diag), expected = self._run_control_phase_fixture(0.70, shift)
+            self.assertGreater(expected["n_control"], 0)
+            self.assertFalse(diag["is_projected_strict"])
+            self.assertFalse(ok)
+            self.assertIn("control phase null test", status)
+            outcomes.append((ok, diag["archival_snr"], expected["control_snr"]))
+
+        self.assertEqual([item[0] for item in outcomes], [False, False, False])
+        for outcome in outcomes[1:]:
+            self.assertAlmostEqual(outcome[1], outcomes[0][1], places=10)
+            self.assertAlmostEqual(outcome[2], outcomes[0][2], places=10)
+
     def test_partial_success_and_failure_stages(self):
         """
         Verify that when 3 products are requested across prior sectors:
@@ -422,12 +542,11 @@ class TestTruthfulArchivalProvenance(unittest.TestCase):
         tic_id = "34567890"
         curr_sec = 106
         t_curr = np.linspace(2459000, 2459027, 2000)
-        f_curr = np.ones(2000)
-        ferr_curr = np.full(2000, 0.0001)
-
         best_p = 3.5
         best_t0 = 2459001.0
         best_dur = 0.15
+        f_curr = with_discovery_transit(t_curr, best_p, best_t0, best_dur)
+        ferr_curr = np.full(2000, 0.0001)
 
         # Lightcurve for Sector 80 with injected transit dip
         t_arch_80 = np.linspace(2458000, 2458027, 2000)
@@ -471,7 +590,8 @@ class TestTruthfulArchivalProvenance(unittest.TestCase):
              patch.object(ald, "extract_and_stitch_arrays", side_effect=dynamic_extract), \
              patch.object(ald, "clip_upper_outliers", side_effect=lambda t, f, e: (t, f, e)), \
              patch.object(ald, "piecewise_savgol_detrend", side_effect=lambda t, f, **kw: np.ones_like(f)), \
-             patch.object(ald, "scan_full_orbit_secondary_eclipse", return_value=(False, 0.0, 0.0, 0.5, 3.0)):
+             patch.object(ald, "_scan_full_orbit_secondary_eclipse_cp", return_value=(False, 0.0, 0.0, 0.5, 3.0)), \
+             fixed_refinement(best_p, best_t0):
 
             ok, status_msg, arch_info = ald.verify_multi_epoch(
                 tic_id, curr_sec, t_curr, f_curr, ferr_curr,
@@ -518,12 +638,11 @@ class TestTruthfulArchivalProvenance(unittest.TestCase):
         tic_id = "45678901"
         curr_sec = 106
         t_curr = np.linspace(2459000, 2459027, 2000)
-        f_curr = np.ones(2000)
-        ferr_curr = np.full(2000, 0.0001)
-
         best_p = 3.5
         best_t0 = 2459001.0
         best_dur = 0.15
+        f_curr = with_discovery_transit(t_curr, best_p, best_t0, best_dur)
+        ferr_curr = np.full(2000, 0.0001)
 
         # 2 products both from Sector 80
         t_arch_80a = np.linspace(2458000, 2458013, 1000)
@@ -557,7 +676,8 @@ class TestTruthfulArchivalProvenance(unittest.TestCase):
              patch.object(ald, "extract_and_stitch_arrays", side_effect=dynamic_extract_2), \
              patch.object(ald, "clip_upper_outliers", side_effect=lambda t, f, e: (t, f, e)), \
              patch.object(ald, "piecewise_savgol_detrend", side_effect=lambda t, f, **kw: np.ones_like(f)), \
-             patch.object(ald, "scan_full_orbit_secondary_eclipse", return_value=(False, 0.0, 0.0, 0.5, 3.0)):
+             patch.object(ald, "_scan_full_orbit_secondary_eclipse_cp", return_value=(False, 0.0, 0.0, 0.5, 3.0)), \
+             fixed_refinement(best_p, best_t0):
 
             ok, status_msg, arch_info = ald.verify_multi_epoch(
                 tic_id, curr_sec, t_curr, f_curr, ferr_curr,
@@ -586,7 +706,7 @@ class TestTruthfulArchivalProvenance(unittest.TestCase):
         tic_id = "67890123"
         curr_sec = 106
         t_curr = np.linspace(2459000, 2459027, 2000)
-        f_curr = np.ones(2000)
+        f_curr = with_discovery_transit(t_curr, 3.5, 2459001.0, 0.15)
         ferr_curr = np.full(2000, 0.0001)
 
         # Sector 80 has flat light curve (no transit dip -> non-detection)
@@ -610,14 +730,17 @@ class TestTruthfulArchivalProvenance(unittest.TestCase):
              patch.object(ald, "safe_download", side_effect=mock_download), \
              patch.object(ald, "extract_and_stitch_arrays", return_value=(t_arch_80, f_arch_80, np.full(2000, 0.0001), np.zeros(2000), np.zeros(2000), 0.95)), \
              patch.object(ald, "clip_upper_outliers", side_effect=lambda t, f, e: (t, f, e)), \
-             patch.object(ald, "piecewise_savgol_detrend", side_effect=lambda t, f, **kw: np.ones_like(f)):
+             patch.object(ald, "piecewise_savgol_detrend", side_effect=lambda t, f, **kw: np.ones_like(f)), \
+             fixed_refinement(3.5, 2459001.0):
 
             ok, status_msg, arch_info = ald.verify_multi_epoch(
                 tic_id, curr_sec, t_curr, f_curr, ferr_curr,
                 best_p=3.5, best_t0=2459001.0, best_dur=0.15, depth_ppm_curr=1000.0, sde_curr=8.0
             )
 
-            self.assertFalse(ok)
+            # Cp item 12: a Mode 2 archival non-detection is a REVIEW hold, not a rejection.
+            self.assertTrue(ok)
+            self.assertTrue(status_msg.startswith("REVIEW_ARCHIVAL_NONDETECTION: "))
             # Rejection message must cite used sector 80, NOT requested 80, 85!
             self.assertIn("Archival non-detection in sectors 80", status_msg)
             self.assertNotIn("85", status_msg)
@@ -644,8 +767,10 @@ class TestTruthfulArchivalProvenance(unittest.TestCase):
                 tic_id, curr_sec, t_curr, f_curr, ferr_curr,
                 best_p=3.5, best_t0=2459001.0, best_dur=0.1, depth_ppm_curr=500.0, sde_curr=7.0
             )
-            self.assertTrue(ok)  # Passes via single-sector fallback since sde >= 6.5
-            self.assertIn("Archival Download Failed", status_msg)
+            # S3.1 (ARGON_DECISIONS item 31.6): products exist but none could be read -> INCOMPLETE at every SDE.
+            self.assertIsNone(ok)
+            self.assertIn("failed to download or prepare", status_msg)
+            self.assertEqual(arch_info["archival_failure_state"], "INCOMPLETE_ARCHIVAL_UNAVAILABLE")
             self.assertEqual(arch_info["n_archival_sectors"], 0)
             self.assertEqual(arch_info["archival_sectors_used"], [])
             self.assertEqual(arch_info["archival_products_used"], [])
@@ -659,8 +784,10 @@ class TestTruthfulArchivalProvenance(unittest.TestCase):
                 tic_id, curr_sec, t_curr, f_curr, ferr_curr,
                 best_p=3.5, best_t0=2459001.0, best_dur=0.1, depth_ppm_curr=500.0, sde_curr=7.0
             )
-            self.assertTrue(ok_q)
-            self.assertIn("Archival Query Error", status_msg_q)
+            # S3.1 (item 31.6): a failed query confirms nothing -> INCOMPLETE_ARCHIVAL_UNAVAILABLE.
+            self.assertIsNone(ok_q)
+            self.assertIn("archival query failed (ConnectionError)", status_msg_q)
+            self.assertEqual(arch_info_q["archival_failure_state"], "INCOMPLETE_ARCHIVAL_UNAVAILABLE")
             self.assertEqual(arch_info_q["n_archival_sectors"], 0)
             self.assertEqual(arch_info_q["ephemeris_source"], "DISCOVERY_SINGLE_SECTOR")
             self.assertIn("ARCHIVAL_QUERY_FAILED: ConnectionError", arch_info_q["ephemeris_fallback_reason"])
@@ -732,15 +859,17 @@ class TestTruthfulArchivalProvenance(unittest.TestCase):
              patch.object(ald, "extract_and_stitch_arrays", return_value=(t, f, e, None, None, 0.99)), \
              patch.object(ald, "clip_upper_outliers", side_effect=lambda t, f, e: (t, f, e)), \
              patch.object(ald, "piecewise_savgol_detrend", side_effect=lambda t, f, **kw: np.ones_like(f)), \
-             patch.object(ald, "BoxLeastSquares", side_effect=RuntimeError("injected refinement failure")):
+             patch.object(ald, "vr_refine_p3", side_effect=RuntimeError("injected refinement failure")):
 
             ok, msg, info = ald.verify_multi_epoch(
                 tic_id, curr_sec, t + 800, f, e,
                 best_p=3.0, best_t0=1801.0, best_dur=0.1, depth_ppm_curr=1000.0, sde_curr=8.0
             )
 
-            self.assertTrue(ok)
-            self.assertIn("Archival Refinement Error", msg)
+            # S3.1 (item 31.6): an exception after the archival data are loaded ends ERROR.
+            self.assertIsNone(ok)
+            self.assertIn("archival evaluation failed (REFINEMENT: RuntimeError", msg)
+            self.assertEqual(info["archival_failure_state"], "ERROR")
             self.assertIsNotNone(info)
             self.assertEqual(info["archival_products_attempted"], ["archive-product-80"])
             self.assertEqual(info["archival_products_used"], ["archive-product-80"])
@@ -765,13 +894,14 @@ class TestTruthfulArchivalProvenance(unittest.TestCase):
              patch.object(ald, "extract_and_stitch_arrays", return_value=(t, f, e, None, None, 0.99)), \
              patch.object(ald, "clip_upper_outliers", side_effect=lambda t, f, e: (t, f, e)), \
              patch.object(ald, "piecewise_savgol_detrend", side_effect=lambda t, f, **kw: np.ones_like(f)), \
-             patch.object(ald, "BoxLeastSquares", side_effect=RuntimeError("injected refinement failure")):
+             patch.object(ald, "vr_refine_p3", side_effect=RuntimeError("injected refinement failure")):
 
             ok_low, msg_low, info_low = ald.verify_multi_epoch(
                 tic_id, curr_sec, t + 800, f, e,
                 best_p=3.0, best_t0=1801.0, best_dur=0.1, depth_ppm_curr=1000.0, sde_curr=6.0
             )
-            self.assertFalse(ok_low)
+            self.assertIsNone(ok_low)  # S3.1 (item 31.6): ERROR at every SDE, not a low-SDE reject
+            self.assertEqual(info_low["archival_failure_state"], "ERROR")
             self.assertIsNotNone(info_low)
             self.assertEqual(info_low["archival_products_attempted"], ["archive-product-80"])
             self.assertEqual(info_low["archival_products_used"], ["archive-product-80"])
@@ -824,10 +954,11 @@ class TestTruthfulArchivalProvenance(unittest.TestCase):
                      patch.object(ald, "compute_whitened_kovacs_sde", return_value=(np.full(9000, 8.5), None)), \
                      patch.object(ald, "get_top_distinct_bls_peaks", return_value=[0]), \
                      patch.object(ald, "get_stellar_and_gaia_params", return_value={"has_params": True, "r_star": 1.0, "e_r_star": 0.05, "m_star": 1.0, "e_m_star": 0.05, "teff": 5800, "ruwe": 1.05}), \
-                     patch.object(ald, "scan_full_orbit_secondary_eclipse", return_value=(False, 0.0, 0.0, 0.5, 3.0)), \
-                     patch.object(ald, "verify_and_filter_tpf", return_value=(True, "OK", np.ones((5, 5)), np.ones((5, 5), dtype=bool))):
+                     patch.object(ald, "_scan_full_orbit_secondary_eclipse_cp", return_value=(False, 0.0, 0.0, 0.5, 3.0)), \
+                     patch.object(ald, "_verify_and_filter_tpf_cp", return_value=(True, "OK", np.ones((5, 5)), np.ones((5, 5), dtype=bool))), \
+                     patch.object(ald, "vr_refine_p3", side_effect=RuntimeError("injected refinement failure")):
 
-                    # First BoxLeastSquares is discovery BLS; second BoxLeastSquares is refinement BLS which raises RuntimeError
+                    # The Cp archival refinement is vr_refine_p3 (patched to raise); the BLS factory serves discovery
                     call_count = {"cnt": 0}
                     def mock_bls_factory(*args, **kwargs):
                         call_count["cnt"] += 1
@@ -848,38 +979,22 @@ class TestTruthfulArchivalProvenance(unittest.TestCase):
                         res = ald.analyze_single_target(tic_id, sector)
                         ret_tic, status, msg, cand_data = res
 
-                        self.assertEqual(status, "CANDIDATE")
-                        self.assertIsNotNone(cand_data)
-
-                        # Coherent discovery fallback verification
-                        self.assertEqual(cand_data["period_days"], discovery_p)
-                        self.assertEqual(cand_data["t0_btjd"], discovery_t0)
-                        self.assertEqual(cand_data["discovery_period_days"], discovery_p)
-                        self.assertEqual(cand_data["discovery_t0_btjd"], discovery_t0)
-                        self.assertTrue(np.isnan(float(cand_data["refined_period_days"])))
-                        self.assertTrue(np.isnan(float(cand_data["refined_t0_btjd"])))
-                        self.assertEqual(cand_data["ephemeris_source"], "DISCOVERY_SINGLE_SECTOR")
-                        self.assertEqual(cand_data["ephemeris_status"], "FALLBACK_DISCOVERY")
-                        self.assertEqual(cand_data["ephemeris_fallback_reason"], "ARCHIVAL_REFINEMENT_FAILED: RuntimeError")
-
-                        # Reconciled sector count and provenance
-                        self.assertEqual(cand_data["n_archival_sectors"], 1)
-                        self.assertEqual(cand_data["archival_sectors"], "80")
-                        self.assertEqual(json.loads(cand_data["archival_sectors_used"]), [80])
-                        self.assertEqual(json.loads(cand_data["archival_products_used"]), ["archive-product-80"])
-                        self.assertEqual(cand_data["est_multi_sde_proxy"], 8.5)
-
-                        # Save to report and verify CSV row matches
-                        rep_file = os.path.join(tmp_dir, "candidates_report.csv")
-                        ald.save_candidates_to_report(rep_file, [cand_data])
-                        df_saved = pd.read_csv(rep_file)
-                        self.assertEqual(len(df_saved), 1)
-                        saved_row = df_saved.iloc[0].to_dict()
-                        self.assertEqual(saved_row["period_days"], discovery_p)
-                        self.assertEqual(saved_row["t0_btjd"], discovery_t0)
-                        self.assertEqual(saved_row["n_archival_sectors"], 1)
-                        self.assertEqual(str(saved_row["archival_sectors"]), "80")
-                        self.assertEqual(saved_row["ephemeris_status"], "FALLBACK_DISCOVERY")
+                        # S3.1 (ARGON_DECISIONS item 31.6): an archival refinement exception after data load ends
+                        # the host ERROR (was a Single-Sector_Only CANDIDATE). The persisted archival diagnostic
+                        # keeps the full provenance of the failed attempt.
+                        self.assertEqual(status, "ERROR")
+                        self.assertIsNone(cand_data)
+                        self.assertIn("archival evaluation failed (REFINEMENT: RuntimeError", msg)
+                        diag = ald.get_latest_archival_diagnostic(tic_id, sector, output_dir=tmp_dir)
+                        self.assertIsNotNone(diag)
+                        self.assertIsNone(diag["arch_ok"])  # not evaluated, S3.1 review P2-2
+                        self.assertEqual(diag["archival_failure_state"], "ERROR")
+                        self.assertEqual(diag["ephemeris_source"], "DISCOVERY_SINGLE_SECTOR")
+                        self.assertEqual(diag["ephemeris_status"], "FALLBACK_DISCOVERY")
+                        self.assertEqual(diag["ephemeris_fallback_reason"], "ARCHIVAL_REFINEMENT_FAILED: RuntimeError")
+                        self.assertEqual(diag["archival_sectors_used"], [80])
+                        self.assertEqual(diag["archival_products_used"], ["archive-product-80"])
+                        self.assertEqual(diag["archival_products_failed"][0]["stage"], "REFINEMENT")
             finally:
                 ald.configure_environment(output_dir="output", run_id="run_default")
 
@@ -912,8 +1027,8 @@ class TestTruthfulArchivalProvenance(unittest.TestCase):
                 tic_id, curr_sec, t + 800, f, e,
                 best_p=3.0, best_t0=1801.0, best_dur=0.1, depth_ppm_curr=1000.0, sde_curr=8.0
             )
-            self.assertTrue(ok)
-            self.assertIn("Archival Detrending Error", msg)
+            self.assertIsNone(ok)  # S3.1 (item 31.6): ERROR
+            self.assertIn("archival evaluation failed (DETRENDING", msg)
             self.assertEqual(info["archival_products_failed"][0]["stage"], "DETRENDING")
             self.assertEqual(info["ephemeris_fallback_reason"], "ARCHIVAL_DETRENDING_FAILED: RuntimeError")
 
@@ -928,14 +1043,15 @@ class TestTruthfulArchivalProvenance(unittest.TestCase):
              patch.object(ald, "extract_and_stitch_arrays", return_value=(t, f_eval_arch, e, None, None, 0.99)), \
              patch.object(ald, "clip_upper_outliers", side_effect=lambda t, f, e: (t, f, e)), \
              patch.object(ald, "piecewise_savgol_detrend", side_effect=lambda t, f, **kw: np.ones_like(f)), \
-             patch.object(ald, "scan_full_orbit_secondary_eclipse", side_effect=ValueError("injected secondary eclipse scan error")):
+             patch.object(ald, "_scan_full_orbit_secondary_eclipse_cp", side_effect=ValueError("injected secondary eclipse scan error")), \
+             fixed_refinement(3.0, 1801.0):
 
             ok_eval, msg_eval, info_eval = ald.verify_multi_epoch(
-                tic_id, curr_sec, t + 800, f, e,
+                tic_id, curr_sec, t + 800, with_discovery_transit(t + 800, 3.0, 1801.0, 0.1), e,
                 best_p=3.0, best_t0=1801.0, best_dur=0.1, depth_ppm_curr=1000.0, sde_curr=8.0
             )
-            self.assertTrue(ok_eval)
-            self.assertIn("Archival Evaluation Error", msg_eval)
+            self.assertIsNone(ok_eval)  # S3.1 (item 31.6): ERROR
+            self.assertIn("archival evaluation failed (EVALUATION", msg_eval)
             self.assertEqual(info_eval["archival_products_failed"][0]["stage"], "EVALUATION")
             self.assertEqual(info_eval["ephemeris_fallback_reason"], "ARCHIVAL_EVALUATION_FAILED: ValueError")
 
@@ -961,7 +1077,9 @@ class TestTruthfulArchivalProvenance(unittest.TestCase):
         f_arr[np.abs(ph) < 0.04] -= 0.0010
 
         t_arch = np.linspace(2458000.0, 2458027.0, n_pts)
-        f_arch = np.ones(n_pts)  # Flat prior -> non-detection veto
+        # Archival transit present: the Cp archival veto here is the multi-sector secondary eclipse (S3.3; a Mode 2
+        # non-detection is a REVIEW hold under item 12, no longer a rejection).
+        f_arch = with_discovery_transit(t_arch, discovery_p, discovery_t0, 0.08)
         mock_row = MagicMock()
         mock_row.mission = ["TESS Sector 80"]
         mock_row.obsid = "archive-product-80"
@@ -984,7 +1102,9 @@ class TestTruthfulArchivalProvenance(unittest.TestCase):
                      patch.object(ald, "compute_whitened_kovacs_sde", return_value=(np.full(9000, 8.5), None)), \
                      patch.object(ald, "get_top_distinct_bls_peaks", return_value=[0]), \
                      patch.object(ald, "get_stellar_and_gaia_params", return_value={"has_params": True, "r_star": 1.0, "e_r_star": 0.05, "m_star": 1.0, "e_m_star": 0.05, "teff": 5800, "ruwe": 1.05}), \
-                     patch.object(ald, "verify_and_filter_tpf", return_value=(True, "OK", np.ones((5, 5)), np.ones((5, 5), dtype=bool))):
+                     patch.object(ald, "_verify_and_filter_tpf_cp", return_value=(True, "OK", np.ones((5, 5)), np.ones((5, 5), dtype=bool))), \
+                     patch.object(ald, "_scan_full_orbit_secondary_eclipse_cp", side_effect=archival_secondary_reject), \
+                     fixed_refinement(discovery_p, discovery_t0):
 
                     mock_bls = MagicMock()
                     mock_bls.power.return_value = MagicMock(
@@ -1048,13 +1168,18 @@ class TestTruthfulArchivalProvenance(unittest.TestCase):
                          patch.object(ald, "compute_whitened_kovacs_sde", return_value=(np.full(9000, 8.5), None)), \
                          patch.object(ald, "get_top_distinct_bls_peaks", return_value=[0]), \
                          patch.object(ald, "get_stellar_and_gaia_params", return_value={"has_params": True, "r_star": 1.0, "e_r_star": 0.05, "m_star": 1.0, "e_m_star": 0.05, "teff": 5800, "ruwe": 1.05}), \
-                         patch.object(ald, "verify_and_filter_tpf", return_value=(True, "OK", np.ones((5, 5)), np.ones((5, 5), dtype=bool))), \
+                         patch.object(ald, "_verify_and_filter_tpf_cp", return_value=(True, "OK", np.ones((5, 5)), np.ones((5, 5), dtype=bool))), \
                          patch.object(ald, "BoxLeastSquares", return_value=mock_bls), \
                          patch.object(ald, "verify_multi_epoch", return_value=(False, "Archival non-detection", {"archival_products_attempted": ["p1"]})):
 
-                        err_tic, err_status, err_msg, err_cand = ald.analyze_single_target(tic_id, sector)
-                        self.assertEqual(err_status, "ERROR")
-                        self.assertIn("Failed to persist archival vetting diagnostic", err_msg)
+                        # S3.3: on the Cp path the ERROR result's own evidence sink (experimental_v2_vetting.jsonl)
+                        # also writes through open(), so the persistence failure surfaces as a raised OSError
+                        # chained to the original archival-diagnostic failure; it is still never swallowed.
+                        with self.assertRaises(OSError) as raised:
+                            ald.analyze_single_target(tic_id, sector)
+                        context = raised.exception.__context__
+                        self.assertIsInstance(context, RuntimeError)
+                        self.assertIn("Failed to persist archival vetting diagnostic", str(context))
             finally:
                 ald.configure_environment(output_dir="output", run_id="run_default")
 
@@ -1068,7 +1193,7 @@ class TestTruthfulArchivalProvenance(unittest.TestCase):
         tic_id = "77788899"
         curr_sec = 106
         t_curr = np.linspace(2459000, 2459027, 2000)
-        f_curr = np.ones(2000)
+        f_curr = with_discovery_transit(t_curr, 3.5, 2459001.0, 0.1)
         ferr_curr = np.full(2000, 0.0001)
 
         t_arch = np.linspace(2458000, 2458027, 2000)
@@ -1082,14 +1207,17 @@ class TestTruthfulArchivalProvenance(unittest.TestCase):
              patch.object(ald, "safe_download", return_value=MagicMock()), \
              patch.object(ald, "extract_and_stitch_arrays", return_value=(t_arch, f_arch, np.full(2000, 0.0001), None, None, 0.95)), \
              patch.object(ald, "clip_upper_outliers", side_effect=lambda t, f, e: (t, f, e)), \
-             patch.object(ald, "piecewise_savgol_detrend", side_effect=lambda t, f, **kw: np.ones_like(f)):
+             patch.object(ald, "piecewise_savgol_detrend", side_effect=lambda t, f, **kw: np.ones_like(f)), \
+             fixed_refinement(3.5, 2459001.0):
 
             ok, msg, diag = ald.verify_multi_epoch(
                 tic_id, curr_sec, t_curr, f_curr, ferr_curr,
                 best_p=3.5, best_t0=2459001.0, best_dur=0.1, depth_ppm_curr=1000.0, sde_curr=8.0
             )
 
-            self.assertFalse(ok)
+            # Cp item 12: a Mode 2 archival non-detection is a REVIEW hold that keeps its diagnostics.
+            self.assertTrue(ok)
+            self.assertTrue(msg.startswith("REVIEW_ARCHIVAL_NONDETECTION: "))
             self.assertIsNotNone(diag)
             self.assertEqual(diag["archival_sectors_used"], [80])
             self.assertEqual(diag["archival_products_used"], ["prod_vetting_test_80"])
@@ -1191,11 +1319,11 @@ class TestPersistenceAndSchemaCompatibility(unittest.TestCase):
             "exofop_url": "https://exofop.ipac.caltech.edu/tess/target.php?id=99990001"
         }
 
-        df_cand = pd.DataFrame([mock_candidate], columns=stc.CANDIDATE_COLUMNS)
+        df_cand = pd.DataFrame([mock_candidate], columns=stc.CANDIDATE_OUTPUT_COLUMNS)
         stc._append_candidate_dedup(report_file, df_cand, tic="99990001", sector=106, run_id="test_persist_run")
 
         df_saved = pd.read_csv(report_file)
-        self.assertEqual(list(df_saved.columns), stc.CANDIDATE_COLUMNS)
+        self.assertEqual(list(df_saved.columns), stc.CANDIDATE_OUTPUT_COLUMNS)
         self.assertEqual(len(df_saved), 1)
 
         row = df_saved.iloc[0]
@@ -1616,7 +1744,9 @@ class TestDiagnosticAttemptIsolationAndStaleAttributionPrevention(unittest.TestC
         f_arr[np.abs(ph) < 0.04] -= 0.0010
 
         t_arch = np.linspace(2458000.0, 2458027.0, n_pts)
-        f_arch = np.ones(n_pts)  # Flat prior -> non-detection veto
+        # Archival transit present: the Cp archival veto here is the multi-sector secondary eclipse (S3.3; a Mode 2
+        # non-detection is a REVIEW hold under item 12, no longer a rejection).
+        f_arch = with_discovery_transit(t_arch, discovery_p, discovery_t0, 0.08)
         mock_row = MagicMock()
         mock_row.mission = ["TESS Sector 80"]
         mock_row.obsid = "current-attempt-product-80"
@@ -1635,7 +1765,9 @@ class TestDiagnosticAttemptIsolationAndStaleAttributionPrevention(unittest.TestC
              patch.object(ald, "compute_whitened_kovacs_sde", return_value=(np.full(9000, 8.5), None)), \
              patch.object(ald, "get_top_distinct_bls_peaks", return_value=[0]), \
              patch.object(ald, "get_stellar_and_gaia_params", return_value={"has_params": True, "r_star": 1.0, "e_r_star": 0.05, "m_star": 1.0, "e_m_star": 0.05, "teff": 5800, "ruwe": 1.05}), \
-             patch.object(ald, "verify_and_filter_tpf", return_value=(True, "OK", np.ones((5, 5)), np.ones((5, 5), dtype=bool))):
+             patch.object(ald, "_verify_and_filter_tpf_cp", return_value=(True, "OK", np.ones((5, 5)), np.ones((5, 5), dtype=bool))), \
+             patch.object(ald, "_scan_full_orbit_secondary_eclipse_cp", side_effect=archival_secondary_reject), \
+             fixed_refinement(discovery_p, discovery_t0):
 
             mock_bls = MagicMock()
             mock_bls.power.return_value = MagicMock(
