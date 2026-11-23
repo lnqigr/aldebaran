@@ -1,4 +1,4 @@
-# MetaCentrum HPC Guide for Aldebaran TESS Pipeline (v9.1.0)
+# MetaCentrum HPC Guide for Aldebaran TESS Pipeline (0.9.1)
 
 This guide explains how to deploy and execute the **Aldebaran** exoplanet search pipeline on the Czech National Grid Organization (**MetaCentrum** / CESNET e-INFRA CZ) using PBS Pro.
 

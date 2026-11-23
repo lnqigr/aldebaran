@@ -1,10 +1,10 @@
-# Aldebaran: TESS Transit-Candidate Search and Vetting Pipeline (v9.2)
+# Aldebaran: TESS Transit-Candidate Search and Vetting Pipeline (0.9.2)
 
 **Aldebaran** is an automated, high-throughput digital signal processing (DSP) pipeline designed to search archival and newly released sectors of the NASA TESS Extended Mission (2-minute SPOC cadence) for low-SNR transit candidates and route them through follow-up checks.
 
-**Aldebaran's output is a preliminary transit candidate list that needs external secondary-eclipse or RV vetting.** In the v9.2 release measurement, 25 of 150 known eclipsing binaries and false positives (16.7 %) still ended as candidates (one-sided 95 % upper bound 22.5 %).
+**Aldebaran's output is a preliminary transit candidate list that needs external secondary-eclipse or RV vetting.** In the 0.9.2 release measurement, 25 of 150 known eclipsing binaries and false positives (16.7 %) still ended as candidates (one-sided 95 % upper bound 22.5 %).
 
-The search threshold is SDE $\ge 6.0$, so peaks in the detection grey zone ($6.0 \le \text{SDE} \le 7.5$) pass the search stage. The v9.2 measurement tested whether this zone adds useful sensitivity, and **the grey-zone claim is withdrawn**:
+The search threshold is SDE $\ge 6.0$, so peaks in the detection grey zone ($6.0 \le \text{SDE} \le 7.5$) pass the search stage. The 0.9.2 measurement tested whether this zone adds useful sensitivity, and **the grey-zone claim is withdrawn**:
 - For injected SNR 5 to 9, completeness rose by 5.9 percentage points (34 of 580 injections) from SDE $\ge 7.5$ to SDE $\ge 6.0$, above the required 5.0.
 - The false-alarm condition failed. On 500 sectors of quiet stars whose light curves were scrambled in time (the first orbit reversed, the second kept forward, segments swapped and archival sectors reversed and shifted, so no real periodic signal survives but the star's noise does), 10 ended as final candidates at SDE $\ge 6.0$ (2.0 %). The one-sided 95 % upper bound is 3.4 %, above the required 1.5 %.
 
@@ -51,7 +51,7 @@ Version 9.2 is the measured code: it is identical to release candidate RC2 (comm
                                       │
                                       ▼
 ┌───────────────────────────────────────────────────────────────────────────┐
-│           TIER 1: High-Throughput Screening (aldebaran.py v9.2)           │
+│           TIER 1: High-Throughput Screening (aldebaran.py 0.9.2)          │
 ├───────────────────────────────────────────────────────────────────────────┤
 │  • Catalog Cross-Match (ExoFOP, TOIs, CTOIs, Confirmed Planets, EBs)      │
 │  • Multi-Planet Companion Search: 8,036 TOI Ephemeris Ingestion (TAP)     │
@@ -87,7 +87,7 @@ Version 9.2 is the measured code: it is identical to release candidate RC2 (comm
                                       │ candidates_report.csv
                                       ▼
 ┌───────────────────────────────────────────────────────────────────────────┐
-│              MULTI-NODE SHARD REDUCER (merge_shards.py v9.0)              │
+│              MULTI-NODE SHARD REDUCER (merge_shards.py 0.9.0)             │
 ├───────────────────────────────────────────────────────────────────────────┤
 │  • Loads explicit manifest-declared, integrity-checked shard inputs       │
 │  • Preserves signal identities and provenance across sector inputs        │
@@ -125,7 +125,7 @@ Version 9.2 is the measured code: it is identical to release candidate RC2 (comm
                                       │ prioritized_targets_ranking.csv
                                       ▼
 ┌───────────────────────────────────────────────────────────────────────────┐
-│               TIER 4: Blend-Scenario and Timing Tools (v9.0)              │
+│               TIER 4: Blend-Scenario and Timing Tools (0.9.0)             │
 ├───────────────────────────────────────────────────────────────────────────┤
 │  • TRICERATOPS Blend-Scenario Analysis (validate_triceratops.py)          │
 │     - 18 astrophysical blend scenarios (Giacalone et al. 2021)            │
@@ -140,7 +140,7 @@ Version 9.2 is the measured code: it is identical to release candidate RC2 (comm
 
 ---
 
-## Key Features in v9.0
+## Key Features in 0.9.0
 
 1. **Multi-Planet Search Engine via Known-Transit Masking (`aldebaran.py`)**:
    Automatically queries and caches 8,036 official NASA TOI planet ephemerides from TAP (`tess_results/toi_ephemerides_cache.json`). When `SEARCH_TOI_COMPANIONS=True`, TOI host stars are prioritized in the discovery queue. Known planet transits are masked ($\pm 1.0\,T_{\text{dur}}$, a duration-dependent buffer, not a guaranteed TTV bound) with **mandatory linear interpolation across masked intervals before Savitzky-Golay filtering**, intended to reduce boundary ringing; masking losses and residual artifacts require calibration. BLS searches residual flux for possible sibling companions; sensitivity to shallow sub-Earth signals has not been established. The implementation applies heuristic fractional harmonic vetoes ($m/n \in \{1, 1/2, 2, 1/3, 3, 2/3, 3/2, 1/4, 4\}$). The separate `search_toi_companions.py` CLI defaults to sectors 106, 105, 104, 103, 102, 101, 100, and 99; these defaults do not change the Tier-1 PBS array mapping documented below.
@@ -153,9 +153,9 @@ Version 9.2 is the measured code: it is identical to release candidate RC2 (comm
    * **Single archival gate (S3.3)**: the legacy archival gate and the legacy odd/even path were retired; `verify_multi_epoch` is the accepted Cp gate (PORT-CP-01: item 12 timing modes, item 18 refinement grid, item 13 Sidak penalty, item 19 refinement check). `odd_even_method` accepts only `v2`. Ranks after the first CANDIDATE are still evaluated and logged to `all_ranks_journal.jsonl` (one record per rank exit plus a host_end record); a later peak whose events coincide with an earlier CANDIDATE becomes REVIEW, and an exception after a CANDIDATE ends the host as ERROR.
    * **Mode 2 label (Argon 31.10)**: an archival pass that needed the period refinement (Mode 2, not a strict forward projection) is labelled `Multi-Epoch_Refined (Conditional on Archival Period Search)` in the candidate metadata (`archival_confirmation_label`). It is conditional on the archival period search and is not independent confirmation; no sector split or extra trials penalty is applied. Mode 2 archival diagnostics also report the circular-secondary SNR at the reference period, plus and minus one refinement grid step and plus and minus sigma_P (SCI-74), as diagnostics only.
 3. **Synthetic False-Alarm Demonstration (`tests/benchmark_false_alarm_rate.py`)**:
-   The reported **0.55%** is the fraction of 2,000 synthetic Gumbel draws exceeding a threshold, not a benchmark processing 2,000 real quiet TESS stars. It establishes neither empirical survey FAR nor 99.45% real-data specificity. Script labels identify the Gumbel sample and its threshold fractions as synthetic demonstrations. The rate measured in v9.2 on 500 time-scrambled sectors of real quiet stars is 2.0 % at SDE $\ge$ 6.0 (10 of 500, one-sided 95 % upper bound 3.4 %; no false-alarm rate is claimed at SDE $\ge$ 6.0; see Scientific status and limits).
+   The reported **0.55%** is the fraction of 2,000 synthetic Gumbel draws exceeding a threshold, not a benchmark processing 2,000 real quiet TESS stars. It establishes neither empirical survey FAR nor 99.45% real-data specificity. Script labels identify the Gumbel sample and its threshold fractions as synthetic demonstrations. The rate measured in 0.9.2 on 500 time-scrambled sectors of real quiet stars is 2.0 % at SDE $\ge$ 6.0 (10 of 500, one-sided 95 % upper bound 3.4 %; no false-alarm rate is claimed at SDE $\ge$ 6.0; see Scientific status and limits).
 4. **Numerical Integrator and Synthetic Injection Benchmark**:
-   The integrator has comparison tests, but the historical **3.09 ppm** number is not a validated universal error bound. `tests/test_mandel_agol_batman.py` uses batman when available and a related annulus reference otherwise; the latter is not independent validation. `tests/benchmark_injection.py` defaults to **288 trials (36 cells × 8)** on a synthetic baseline and a BLS-focused path, not the full production cascade on real TESS curves. Historical **100% recovery** cells describe only those synthetic trials, not population completeness; results were not rerun for this documentation correction. Completeness measured in v9.2 on planets injected into real light curves through the full Tier 1 cascade is given in Scientific status and limits.
+   The integrator has comparison tests, but the historical **3.09 ppm** number is not a validated universal error bound. `tests/test_mandel_agol_batman.py` uses batman when available and a related annulus reference otherwise; the latter is not independent validation. `tests/benchmark_injection.py` defaults to **288 trials (36 cells × 8)** on a synthetic baseline and a BLS-focused path, not the full production cascade on real TESS curves. Historical **100% recovery** cells describe only those synthetic trials, not population completeness; results were not rerun for this documentation correction. Completeness measured in 0.9.2 on planets injected into real light curves through the full Tier 1 cascade is given in Scientific status and limits.
 5. **Synthetic VPS ROC Demonstration (`tests/benchmark_vps_roc.py`)**:
    The reported **AUC 0.988**, TPR 94%, FPR 2% and VPS cutoff 23.4 describe artificially generated scores/parameters for 50 synthetic TOI-like and 50 synthetic EB/blend-like controls. They do not establish an optimal production threshold or independent performance on real planets/EBs.
 6. **Production Configuration for MetaCentrum HPC (Sectors 108, 107, 98–93)**:

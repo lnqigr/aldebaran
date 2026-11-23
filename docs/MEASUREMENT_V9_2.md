@@ -1,6 +1,6 @@
-# Aldebaran v9.2: release measurement
+# Aldebaran 0.9.2: release measurement
 
-This document reports the one measurement on which the v9.2 claims rest (internal ID M-RUN-RC2-01, run on MetaCentrum on 18 and 19 November 2026). It covers Tier 1 (`aldebaran.py`) at commit e474c65c2c with its default switches (A2, ARCHIVAL_COVERAGE, V_SHAPE_FLAG, DEPTH_UPPER). Tier 2 to 4 were not measured.
+This document reports the one measurement on which the 0.9.2 claims rest (internal ID M-RUN-RC2-01, run on MetaCentrum on 18 and 19 November 2026). It covers Tier 1 (`aldebaran.py`) at commit e474c65c2c with its default switches (A2, ARCHIVAL_COVERAGE, V_SHAPE_FLAG, DEPTH_UPPER). Tier 2 to 4 were not measured.
 
 ## How it was measured
 
